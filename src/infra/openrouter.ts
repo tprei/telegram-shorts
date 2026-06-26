@@ -55,6 +55,7 @@ export class OpenRouterClient {
       system: [
         'Você converte pedidos do diretor em ações seguras para revisão de shorts.',
         'Ações permitidas: retitle, caption_cleanup, trim_start, trim_end, extend_start, extend_end, insert_span, reorder_candidate, set_speed, enable_preview_end_card, disable_preview_end_card.',
+        'Para pedidos como incluir conclusão, fechar melhor, terminar menos abrupto, use extend_end com segundos ou insert_span com uma query de conclusão/payoff já falado no vídeo.',
         'Não invente ações fora dessa lista.',
         'Se o texto for ambíguo, escolha a interpretação mais conservadora.',
         'Retorne apenas JSON válido com actions e summary.',
@@ -227,10 +228,64 @@ function normalizeRevisionPayload(raw: unknown): unknown {
     return raw;
   }
   const record = raw as Record<string, unknown>;
+  const rawActions = Array.isArray(record.actions) ? record.actions : Array.isArray(record.edits) ? record.edits : [];
   return {
-    actions: Array.isArray(record.actions) ? record.actions : Array.isArray(record.edits) ? record.edits : [],
+    actions: rawActions.map(normalizeRevisionAction).filter(Boolean),
     summary: stringValue(record.summary) ?? stringValue(record.reason) ?? 'Revisão aplicada',
   };
+}
+
+function normalizeRevisionAction(raw: unknown): Record<string, unknown> | null {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+  const record = raw as Record<string, unknown>;
+  const rawKind = stringValue(record.kind) ?? stringValue(record.action) ?? stringValue(record.type) ?? '';
+  const kind = rawKind.toLowerCase().replace(/[-\s]+/g, '_');
+  const seconds = positiveNumber(record.seconds) ?? positiveNumber(record.duration_seconds) ?? positiveNumber(record.amount_seconds);
+  if (kind === 'retitle' || kind === 'change_title' || kind === 'rename') {
+    return { kind: 'retitle', title: stringValue(record.title) ?? stringValue(record.value) ?? 'Novo título' };
+  }
+  if (kind === 'caption_cleanup' || kind === 'cleanup_caption' || kind === 'clean_caption') {
+    return { kind: 'caption_cleanup' };
+  }
+  if (kind === 'trim_start' || kind === 'shorten_start') {
+    return { kind: 'trim_start', seconds: seconds ?? 5 };
+  }
+  if (kind === 'trim_end' || kind === 'shorten_end') {
+    return { kind: 'trim_end', seconds: seconds ?? 5 };
+  }
+  if (kind === 'extend_start' || kind === 'add_start' || kind === 'include_setup') {
+    return { kind: 'extend_start', seconds: seconds ?? 20 };
+  }
+  if (kind === 'extend_end' || kind === 'add_end' || kind === 'extend_conclusion' || kind === 'include_conclusion' || kind === 'add_conclusion' || kind === 'conclusion' || kind === 'extend_payoff' || kind === 'add_payoff' || kind === 'close_better') {
+    return { kind: 'extend_end', seconds: seconds ?? 30 };
+  }
+  if (kind === 'insert_span' || kind === 'insert' || kind === 'include_span' || kind === 'add_span') {
+    return { kind: 'insert_span', query: stringValue(record.query) ?? stringValue(record.text) ?? stringValue(record.description) ?? 'conclusão ou payoff do argumento' };
+  }
+  if (kind === 'reorder_candidate' || kind === 'reorder') {
+    return { kind: 'reorder_candidate', rank: Math.max(1, Math.min(5, Math.round(positiveNumber(record.rank) ?? 1))) };
+  }
+  if (kind === 'set_speed' || kind === 'speed' || kind === 'playback_speed') {
+    return { kind: 'set_speed', speed: Math.max(0.1, Math.min(1.5, positiveNumber(record.speed) ?? positiveNumber(record.value) ?? 1.15)) };
+  }
+  if (kind === 'enable_preview_end_card' || kind === 'add_end_card' || kind === 'enable_end_card') {
+    return { kind: 'enable_preview_end_card' };
+  }
+  if (kind === 'disable_preview_end_card' || kind === 'remove_end_card' || kind === 'disable_end_card') {
+    return { kind: 'disable_preview_end_card' };
+  }
+  const freeText = [rawKind, stringValue(record.query), stringValue(record.text), stringValue(record.description), stringValue(record.reason)].filter(Boolean).join(' ').toLowerCase();
+  if (/conclus|fech|payoff|final/.test(freeText)) {
+    return { kind: 'extend_end', seconds: seconds ?? 30 };
+  }
+  return null;
+}
+
+function positiveNumber(value: unknown): number | null {
+  const numeric = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
 }
 
 function normalizeLocatePayload(raw: unknown): unknown {

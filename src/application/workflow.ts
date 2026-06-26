@@ -190,7 +190,10 @@ export class ShortsWorkflow {
       return;
     }
     const pending = this.store.getPendingReply(chatId);
-    if (pending && message.reply_to_message?.message_id === pending.anchorMessageId) {
+    const isCommand = text.startsWith('/');
+    const matchesPendingAnchor = pending && message.reply_to_message?.message_id === pending.anchorMessageId;
+    const acceptsPendingText = pending && !isCommand;
+    if (pending && (matchesPendingAnchor || acceptsPendingText)) {
       const job = this.store.getJob(pending.jobId);
       if (!job || job.currentCandidateVersionId !== pending.candidateVersionId || (job.status !== 'awaiting_review' && job.status !== 'rendering_drafts')) {
         this.store.clearPendingReply(chatId);
