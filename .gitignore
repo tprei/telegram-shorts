@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+work/
+*.tsbuildinfo
+*.mp4
+*.m4a
+*.srt

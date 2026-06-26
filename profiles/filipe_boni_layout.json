@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "creatorId": "filipe_boni",
+  "layoutId": "source-left-host-right-stack-v1",
+  "regions": [
+    {
+      "id": "source-top",
+      "sourceRect": { "x": 0.0, "y": 0.0, "w": 0.65, "h": 1.0 },
+      "canvasRect": { "x": 0.0, "y": 0.0, "w": 1.0, "h": 0.58 },
+      "fit": "contain"
+    },
+    {
+      "id": "host-bottom",
+      "sourceRect": { "x": 0.65, "y": 0.0, "w": 0.35, "h": 1.0 },
+      "canvasRect": { "x": 0.0, "y": 0.58, "w": 1.0, "h": 0.42 },
+      "fit": "cover"
+    }
+  ],
+  "subtitleSafeArea": { "x": 0.08, "y": 0.74, "w": 0.84, "h": 0.16 }
+}
