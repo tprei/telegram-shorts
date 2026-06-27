@@ -210,6 +210,7 @@ async function createPreviewEndCard(input: { sourcePath: string; sourceStartSeco
     '-pix_fmt', 'yuv420p',
     '-c:a', 'aac',
     '-b:a', '96k',
+    '-shortest',
     '-movflags', '+faststart',
     input.outputPath,
   ], { capture: false });
