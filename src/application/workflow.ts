@@ -415,7 +415,11 @@ export class ShortsWorkflow {
     this.store.updateJob(job);
     await this.syncOverview(job);
     const workDir = await this.ensureJobDir(job.id);
-    const source = await downloadSource(workDir, job.sourceUrl);
+    const source = await downloadSource(workDir, job.sourceUrl, {
+      cookiesPath: this.config.TELEGRAM_SHORTS_YTDLP_COOKIES_PATH ? resolve(this.config.rootDir, this.config.TELEGRAM_SHORTS_YTDLP_COOKIES_PATH) : undefined,
+      cookiesFromBrowser: this.config.TELEGRAM_SHORTS_YTDLP_COOKIES_FROM_BROWSER,
+      jsRuntime: this.config.TELEGRAM_SHORTS_YTDLP_JS_RUNTIME,
+    });
     job.status = 'transcribing';
     job.sourceTitle = source.title;
     job.sourceVideoPath = source.sourceVideoPath;

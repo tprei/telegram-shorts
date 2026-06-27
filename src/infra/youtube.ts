@@ -11,6 +11,12 @@ export interface DownloadedSource {
   durationSeconds: number;
 }
 
+export interface YouTubeDownloadOptions {
+  cookiesPath?: string;
+  cookiesFromBrowser?: string;
+  jsRuntime?: string;
+}
+
 export function assertPublicYouTubeUrl(url: string): void {
   const parsed = new URL(url);
   if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
@@ -22,20 +28,13 @@ export function assertPublicYouTubeUrl(url: string): void {
   }
 }
 
-export async function downloadSource(outDir: string, url: string): Promise<DownloadedSource> {
+export async function downloadSource(outDir: string, url: string, options: YouTubeDownloadOptions = {}): Promise<DownloadedSource> {
   assertPublicYouTubeUrl(url);
   const sourceBase = join(resolve(outDir), 'source');
   const infoPath = `${sourceBase}.info.json`;
   const sourceVideoPattern = `${sourceBase}.%(ext)s`;
   await ensureParent(sourceBase);
-  await runProcess('yt-dlp', [
-    '--no-playlist',
-    '--merge-output-format', 'mp4',
-    '--format', 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/best[ext=mp4]/best',
-    '--write-info-json',
-    '--output', sourceVideoPattern,
-    url,
-  ], { capture: false });
+  await runProcess('yt-dlp', buildYtDlpArgs(sourceVideoPattern, url, options), { capture: false });
   const rawInfo = JSON.parse(await readFile(infoPath, 'utf-8')) as { title?: string; duration?: number; thumbnail?: string };
   const initialVideoPath = `${sourceBase}.mp4`;
   const normalizedVideoPath = join(resolve(outDir), 'source.mp4');
@@ -57,6 +56,26 @@ export async function downloadSource(outDir: string, url: string): Promise<Downl
     title: rawInfo.title ?? null,
     durationSeconds,
   };
+}
+
+export function buildYtDlpArgs(sourceVideoPattern: string, url: string, options: YouTubeDownloadOptions = {}): string[] {
+  const args = [
+    '--no-playlist',
+    '--merge-output-format', 'mp4',
+    '--format', 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/best[ext=mp4]/best',
+    '--write-info-json',
+    '--output', sourceVideoPattern,
+  ];
+  if (options.cookiesPath) {
+    args.push('--cookies', options.cookiesPath);
+  } else if (options.cookiesFromBrowser) {
+    args.push('--cookies-from-browser', options.cookiesFromBrowser);
+  }
+  if (options.jsRuntime) {
+    args.push('--js-runtimes', options.jsRuntime);
+  }
+  args.push(url);
+  return args;
 }
 
 async function downloadThumbnail(url: string, path: string): Promise<string | null> {

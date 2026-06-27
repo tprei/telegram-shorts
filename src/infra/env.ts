@@ -21,6 +21,9 @@ const EnvSchema = z.object({
   TELEGRAM_SHORTS_MAX_FILE_BYTES: z.coerce.number().int().positive().default(45_000_000),
   TELEGRAM_SHORTS_STATIC_LAYOUT_PATH: OptionalStringSchema,
   TELEGRAM_SHORTS_RENDER_TIER: z.enum(['dev', 'prod']).default('dev'),
+  TELEGRAM_SHORTS_YTDLP_COOKIES_PATH: OptionalStringSchema,
+  TELEGRAM_SHORTS_YTDLP_COOKIES_FROM_BROWSER: OptionalStringSchema,
+  TELEGRAM_SHORTS_YTDLP_JS_RUNTIME: OptionalStringSchema,
 });
 
 export type AppConfig = z.infer<typeof EnvSchema> & {
