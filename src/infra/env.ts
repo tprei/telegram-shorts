@@ -12,6 +12,8 @@ const EnvSchema = z.object({
   TELEGRAM_SHORTS_TRANSCRIPT_PROVIDER: z.enum(['deepgram', 'scribe']).default('deepgram'),
   DEEPGRAM_API_KEY: OptionalStringSchema,
   ELEVENLABS_API_KEY: OptionalStringSchema,
+  MALLARY_AI_API_TOKEN: OptionalStringSchema,
+  MALLARY_PROFILE_ID: OptionalStringSchema,
   TELEGRAM_SHORTS_DB_PATH: z.string().default('work/telegram-shorts/shorts.sqlite'),
   TELEGRAM_SHORTS_ARTIFACTS_DIR: z.string().default('work/telegram-shorts/artifacts'),
   TELEGRAM_SHORTS_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(1500),

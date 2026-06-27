@@ -16,6 +16,7 @@ export interface TelegramGateway {
   getUpdates(offset: number, timeoutSeconds: number): Promise<unknown[]>;
   sendMessage(chatId: string | number, text: string, replyMarkup?: Record<string, unknown>): Promise<TelegramMessage>;
   editMessageText(chatId: string | number, messageId: number, text: string, replyMarkup?: Record<string, unknown>): Promise<void>;
+  deleteMessage(chatId: string | number, messageId: number): Promise<void>;
   sendVideo(chatId: string | number, path: string, caption: string, replyMarkup?: Record<string, unknown>): Promise<TelegramMessage>;
   sendDocument(chatId: string | number, path: string, caption: string, replyMarkup?: Record<string, unknown>): Promise<TelegramMessage>;
   answerCallbackQuery(input: TelegramCallbackAnswer): Promise<void>;
@@ -65,6 +66,16 @@ export class TelegramApi implements TelegramGateway {
         text,
         reply_markup: replyMarkup,
         disable_web_page_preview: true,
+      }),
+    });
+  }
+
+  async deleteMessage(chatId: string | number, messageId: number): Promise<void> {
+    await this.callJson('deleteMessage', {
+      method: 'POST',
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageId,
       }),
     });
   }

@@ -19,7 +19,8 @@ export type QueueTaskKind =
   | 'plan_candidates'
   | 'render_draft'
   | 'apply_revision'
-  | 'render_final';
+  | 'render_final'
+  | 'publish_instagram';
 
 export type TranscriptProvider = 'deepgram' | 'scribe';
 
@@ -203,21 +204,35 @@ export const PlannedCandidateStepSchema = z.strictObject({
   block_ids: z.array(z.string().min(1)).min(1),
 });
 
+const PlannedCandidateLikeSchema = z.strictObject({
+  opportunity_id: z.string().min(1).optional(),
+  title: z.string().min(1),
+  summary: z.string().min(1),
+  hook: z.string().min(1),
+  payoff: z.string().min(1),
+  rationale: z.string().min(1),
+  thesis: z.string().min(1),
+  risk: z.enum(['low', 'medium', 'high']),
+  block_ids: z.array(z.string().min(1)).min(2),
+  steps: z.array(PlannedCandidateStepSchema).min(2),
+});
+
 export const PlannedCandidateResponseSchema = z.strictObject({
-  candidates: z.array(z.strictObject({
-    title: z.string().min(1),
-    summary: z.string().min(1),
-    hook: z.string().min(1),
-    payoff: z.string().min(1),
-    rationale: z.string().min(1),
-    thesis: z.string().min(1),
-    risk: z.enum(['low', 'medium', 'high']),
-    block_ids: z.array(z.string().min(1)).min(2),
-    steps: z.array(PlannedCandidateStepSchema).min(2),
-  })).max(5),
+  candidates: z.array(PlannedCandidateLikeSchema).max(5),
 });
 
 export type PlannedCandidateResponse = z.infer<typeof PlannedCandidateResponseSchema>;
+
+export const OpportunityPlanResponseSchema = z.strictObject({
+  opportunities: z.array(PlannedCandidateLikeSchema.extend({
+    id: z.string().min(1),
+    viewer_promise: z.string().min(1),
+    tension: z.string().min(1),
+    why_this_short: z.string().min(1),
+  })).min(1).max(8),
+});
+
+export type OpportunityPlanResponse = z.infer<typeof OpportunityPlanResponseSchema>;
 
 export const RevisionIntentSchema = z.strictObject({
   actions: z.array(z.discriminatedUnion('kind', [
@@ -245,6 +260,14 @@ export const TranscriptSpanLocateSchema = z.strictObject({
 });
 
 export type TranscriptSpanLocate = z.infer<typeof TranscriptSpanLocateSchema>;
+
+export const InstagramReelCopySchema = z.strictObject({
+  line_1: z.string().min(1).max(180),
+  line_2: z.string().min(1).max(180),
+  hashtags: z.array(z.string().min(2).max(40)).min(3).max(6),
+});
+
+export type InstagramReelCopy = z.infer<typeof InstagramReelCopySchema>;
 
 export interface LayoutRegion {
   id: string;

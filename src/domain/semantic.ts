@@ -1,4 +1,4 @@
-import { Candidate, CandidateArc, CandidateArcStep, CandidateSegment, CandidateVersion, PlannedCandidateResponse, SemanticBlock, SemanticBlockKind, SemanticBlockResponseSet, TranscriptSentence } from './model.js';
+import { Candidate, CandidateArc, CandidateArcStep, CandidateSegment, CandidateVersion, OpportunityPlanResponse, PlannedCandidateResponse, SemanticBlock, SemanticBlockKind, SemanticBlockResponseSet, TranscriptSentence } from './model.js';
 import { createId, nowIso } from '../infra/util.js';
 
 const MIN_DURATION_SECONDS = 40;
@@ -88,6 +88,34 @@ export function semanticBlocksAreUsable(blocks: SemanticBlock[]): boolean {
   return kinds.size >= 3 && longBlocks <= Math.floor(blocks.length / 4);
 }
 
+export function opportunityPlanToCandidatePlan(plan: OpportunityPlanResponse): PlannedCandidateResponse {
+  return {
+    candidates: plan.opportunities.map((opportunity) => ({
+      title: opportunity.title,
+      summary: opportunity.summary,
+      hook: opportunity.hook,
+      payoff: opportunity.payoff,
+      rationale: opportunity.rationale,
+      thesis: opportunity.thesis,
+      risk: opportunity.risk,
+      block_ids: opportunity.block_ids,
+      steps: opportunity.steps,
+    })),
+  };
+}
+
+export interface CandidatePlanDiagnostic {
+  index: number;
+  title: string;
+  blockIds: string[];
+  durationSeconds: number | null;
+  reasons: string[];
+}
+
+export function diagnoseCandidatePlan(sentences: TranscriptSentence[], blocks: SemanticBlock[], plan: PlannedCandidateResponse): CandidatePlanDiagnostic[] {
+  return plan.candidates.map((candidate, index) => diagnoseCandidateFromBlocks(sentences, blocks, candidate, index));
+}
+
 export function buildCandidateVersionFromBlocks(jobId: string, versionNumber: number, parentId: string | null, source: 'initial' | 'revision', sentences: TranscriptSentence[], blocks: SemanticBlock[], plan: PlannedCandidateResponse): CandidateVersion {
   const candidates: Candidate[] = [];
   const seen = new Set<string>();
@@ -117,29 +145,65 @@ export function buildCandidateVersionFromBlocks(jobId: string, versionNumber: nu
   };
 }
 
-export function validateCandidateFromBlocks(sentences: TranscriptSentence[], blocks: SemanticBlock[], raw: PlannedCandidateResponse['candidates'][number], rank: number): Candidate | null {
+function diagnoseCandidateFromBlocks(sentences: TranscriptSentence[], blocks: SemanticBlock[], raw: PlannedCandidateResponse['candidates'][number], index: number): CandidatePlanDiagnostic {
   const byBlockId = new Map(blocks.map((block) => [block.id, block]));
-  const dedupedBlockIds = raw.block_ids.filter((id, index, values) => values.indexOf(id) === index);
+  const reasons: string[] = [];
+  const missingBlockIds = raw.block_ids.filter((id) => !byBlockId.has(id));
+  const dedupedBlockIds = raw.block_ids.filter((id, blockIndex, values) => values.indexOf(id) === blockIndex);
+  if (raw.block_ids.length < 2) {
+    reasons.push('uses fewer than 2 blocks');
+  }
+  if (missingBlockIds.length > 0) {
+    reasons.push(`references missing blocks: ${missingBlockIds.join(', ')}`);
+  }
+  if (dedupedBlockIds.length !== raw.block_ids.length) {
+    reasons.push('references duplicate blocks');
+  }
   const selectedBlocks = dedupedBlockIds.map((id) => byBlockId.get(id)).filter((value): value is SemanticBlock => Boolean(value));
-  if (selectedBlocks.length < 2 || dedupedBlockIds.length !== raw.block_ids.length) {
-    return null;
+  if (selectedBlocks.length < 2) {
+    reasons.push('fewer than 2 valid blocks after resolving IDs');
   }
   const orderedBlocks = selectedBlocks.slice().sort((left, right) => left.startSeconds - right.startSeconds);
   if (!sameOrder(selectedBlocks, orderedBlocks)) {
-    return null;
+    reasons.push('blocks are not in chronological order');
   }
   const segments = mergeBlocksIntoSegments(orderedBlocks, sentences);
   if (segments.length === 0) {
+    reasons.push('blocks could not be converted into renderable segments');
+  }
+  const durationSeconds = segments.length > 0 ? roundSeconds(segments.reduce((sum, segment) => sum + (segment.endSeconds - segment.startSeconds), 0)) : null;
+  if (durationSeconds !== null && durationSeconds < MIN_DURATION_SECONDS) {
+    reasons.push(`duration ${durationSeconds}s is below minimum ${MIN_DURATION_SECONDS}s`);
+  }
+  if (durationSeconds !== null && durationSeconds > MAX_DURATION_SECONDS) {
+    reasons.push(`duration ${durationSeconds}s exceeds maximum ${MAX_DURATION_SECONDS}s`);
+  }
+  if (selectedBlocks.length >= 2) {
+    const resolvedSteps = resolveCandidateArcSteps(orderedBlocks, raw.steps);
+    const structure = evaluateAuthoredShortStructure(resolvedSteps.length > 0 ? resolvedSteps : deriveArcFromBlocks(orderedBlocks), orderedBlocks);
+    reasons.push(...structure.reasons);
+  }
+  return {
+    index,
+    title: raw.title,
+    blockIds: raw.block_ids,
+    durationSeconds,
+    reasons,
+  };
+}
+
+export function validateCandidateFromBlocks(sentences: TranscriptSentence[], blocks: SemanticBlock[], raw: PlannedCandidateResponse['candidates'][number], rank: number): Candidate | null {
+  const diagnostic = diagnoseCandidateFromBlocks(sentences, blocks, raw, rank - 1);
+  if (diagnostic.reasons.length > 0) {
     return null;
   }
+  const byBlockId = new Map(blocks.map((block) => [block.id, block]));
+  const dedupedBlockIds = raw.block_ids.filter((id, index, values) => values.indexOf(id) === index);
+  const selectedBlocks = dedupedBlockIds.map((id) => byBlockId.get(id)).filter((value): value is SemanticBlock => Boolean(value));
+  const orderedBlocks = selectedBlocks.slice().sort((left, right) => left.startSeconds - right.startSeconds);
+  const segments = mergeBlocksIntoSegments(orderedBlocks, sentences);
   const durationSeconds = roundSeconds(segments.reduce((sum, segment) => sum + (segment.endSeconds - segment.startSeconds), 0));
-  if (durationSeconds < MIN_DURATION_SECONDS || durationSeconds > MAX_DURATION_SECONDS) {
-    return null;
-  }
   const arc = buildCandidateArc(raw.thesis, orderedBlocks, raw.steps);
-  if (!hasArcCore(arc.steps)) {
-    return null;
-  }
   return {
     id: createId('cand'),
     rank,
@@ -189,6 +253,12 @@ export function buildArcPreviewSvg(candidate: Candidate): string {
 }
 
 function buildCandidateArc(thesis: string, blocks: SemanticBlock[], steps: PlannedCandidateResponse['candidates'][number]['steps']): CandidateArc {
+  const resolvedSteps = resolveCandidateArcSteps(blocks, steps);
+  const normalizedSteps = evaluateAuthoredShortStructure(resolvedSteps, blocks).reasons.length === 0 ? resolvedSteps : deriveArcFromBlocks(blocks);
+  return { thesis, steps: normalizedSteps };
+}
+
+function resolveCandidateArcSteps(blocks: SemanticBlock[], steps: PlannedCandidateResponse['candidates'][number]['steps']): CandidateArcStep[] {
   const byId = new Map(blocks.map((block) => [block.id, block]));
   const resolvedSteps: CandidateArcStep[] = [];
   for (const step of steps) {
@@ -205,13 +275,28 @@ function buildCandidateArc(thesis: string, blocks: SemanticBlock[], steps: Plann
       endSeconds: ordered[ordered.length - 1]!.endSeconds,
     });
   }
-  const normalizedSteps = hasArcCore(resolvedSteps) ? resolvedSteps : deriveArcFromBlocks(blocks);
-  return { thesis, steps: normalizedSteps };
+  return resolvedSteps;
 }
 
-function hasArcCore(steps: CandidateArcStep[]): boolean {
-  const kinds = new Set(steps.map((step) => step.kind));
-  return (kinds.has('hook') || kinds.has('setup')) && kinds.has('turn') && (kinds.has('explain') || kinds.has('evidence')) && kinds.has('payoff');
+function evaluateAuthoredShortStructure(steps: CandidateArcStep[], blocks: SemanticBlock[]): { reasons: string[] } {
+  const reasons: string[] = [];
+  const stepKinds = new Set(steps.map((step) => step.kind));
+  const blockKinds = new Set(blocks.map((block) => block.kind));
+  const firstBlock = blocks[0] ?? null;
+  const lastBlock = blocks[blocks.length - 1] ?? null;
+  const hasOpening = stepKinds.has('hook') || stepKinds.has('setup') || firstBlock?.kind === 'hook' || firstBlock?.kind === 'setup' || firstBlock?.kind === 'turn';
+  const hasDevelopment = stepKinds.has('turn') || stepKinds.has('explain') || stepKinds.has('evidence') || blockKinds.has('turn') || blockKinds.has('explain') || blockKinds.has('evidence') || blocks.length >= 3;
+  const hasEnding = stepKinds.has('payoff') || blockKinds.has('payoff') || Boolean(lastBlock && lastBlock.kind !== 'hook' && lastBlock.kind !== 'setup' && endsStrongly(lastBlock.text) && !looksLikeOutro(lastBlock.text));
+  if (!hasOpening) {
+    reasons.push('short lacks a usable opening/hook');
+  }
+  if (!hasDevelopment) {
+    reasons.push('short lacks enough development to sustain the thesis');
+  }
+  if (!hasEnding) {
+    reasons.push('short does not land on a usable payoff/conclusion');
+  }
+  return { reasons };
 }
 
 function mergeBlocksIntoSegments(blocks: SemanticBlock[], sentences: TranscriptSentence[]): CandidateSegment[] {
@@ -355,6 +440,16 @@ function startsTurn(text: string): boolean {
 function endsStrongly(text: string): boolean {
   const value = text.trim();
   return value.endsWith('.') || value.endsWith('!') || value.endsWith('?') || value.endsWith('…');
+}
+
+function looksLikeOutro(text: string): boolean {
+  const value = text.trim().toLowerCase();
+  return value.includes('deixa o like')
+    || value.includes('se inscrever no canal')
+    || value.includes('próximo vídeo')
+    || value.includes('área de membros')
+    || value.includes('considere se tornar membro')
+    || value.includes('grande abraço');
 }
 
 function summarize(text: string, maxLength: number): string {

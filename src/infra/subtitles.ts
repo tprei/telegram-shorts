@@ -7,22 +7,16 @@ interface CueWord {
   speakerId: string;
 }
 
-interface CueLineToken extends CueWord {
-  lineIndex: number;
-  occurrenceIndex: number;
-}
-
 interface Cue {
   startSeconds: number;
   endSeconds: number;
-  tokens: CueLineToken[];
   lines: string[];
 }
 
-const DRAFT_FONT_SIZE = 24;
-const FINAL_FONT_SIZE = 30;
+const DRAFT_FONT_SIZE = 32;
+const FINAL_FONT_SIZE = 40;
 const MAX_LINES = 2;
-const MAX_LINE_CHARS = 14;
+const MAX_LINE_CHARS = 20;
 const MAX_CUE_SECONDS = 2.8;
 const MAX_GAP_SECONDS = 0.7;
 
@@ -57,7 +51,7 @@ Style: Highlight,Arial,${fontSize},&H0038D9FF,&H00000000,&H00101010,&HCC111827,-
 [Events]
 Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
 `;
-  const lines = cues.flatMap((cue) => buildCueEvents(cue));
+  const lines = buildCueEvents(cues);
   return `${header}${lines.join('')}`;
 }
 
@@ -90,7 +84,7 @@ function buildCues(words: CueWord[]): Cue[] {
       return;
     }
     const laidOut = layoutCue(current);
-    if (laidOut.tokens.length > 0) {
+    if (laidOut.lines.length > 0) {
       cues.push(laidOut);
     }
     current = [];
@@ -112,7 +106,6 @@ function buildCues(words: CueWord[]): Cue[] {
 
 function layoutCue(words: CueWord[]): Cue {
   const lines: string[] = [];
-  const tokens: CueLineToken[] = [];
   let currentLine = '';
   let currentLineWords: CueWord[] = [];
   const pushLine = () => {
@@ -120,13 +113,6 @@ function layoutCue(words: CueWord[]): Cue {
       return;
     }
     lines.push(currentLine.trim());
-    const lineIndex = lines.length - 1;
-    const counts = new Map<string, number>();
-    for (const word of currentLineWords) {
-      const seen = counts.get(word.text) ?? 0;
-      counts.set(word.text, seen + 1);
-      tokens.push({ ...word, lineIndex, occurrenceIndex: seen });
-    }
     currentLine = '';
     currentLineWords = [];
   };
@@ -142,41 +128,23 @@ function layoutCue(words: CueWord[]): Cue {
   if (lines.length > MAX_LINES) {
     lines.splice(MAX_LINES);
   }
-  const visibleTokens = tokens.filter((token) => token.lineIndex < MAX_LINES);
   return {
-    startSeconds: visibleTokens[0]!.startSeconds,
-    endSeconds: visibleTokens[visibleTokens.length - 1]!.endSeconds,
-    tokens: visibleTokens,
-    lines,
+    startSeconds: words[0]!.startSeconds,
+    endSeconds: words[words.length - 1]!.endSeconds,
+    lines: lines.slice(0, MAX_LINES),
   };
 }
 
-function buildCueEvents(cue: Cue): string[] {
-  const events: string[] = [];
-  for (const token of cue.tokens) {
-    const text = cue.lines
-      .map((line, lineIndex) => lineIndex === token.lineIndex ? highlightWordInLine(line, token.text, token.occurrenceIndex) : line)
-      .join('\\N');
-    events.push(`Dialogue: 0,${formatAssTime(token.startSeconds)},${formatAssTime(token.endSeconds)},Default,,0,0,0,,${text}\n`);
-  }
-  return events;
-}
-
-function highlightWordInLine(line: string, word: string, occurrenceIndex: number): string {
-  const pieces = line.split(' ');
-  let seen = 0;
-  const rendered = pieces.map((piece) => {
-    if (piece !== word) {
-      return escapeAss(piece);
+function buildCueEvents(cues: Cue[]): string[] {
+  return cues.flatMap((cue, index) => {
+    const nextCue = cues[index + 1];
+    const endSeconds = nextCue ? Math.min(cue.endSeconds, Math.max(cue.startSeconds + 0.05, nextCue.startSeconds - 0.03)) : cue.endSeconds;
+    if (endSeconds <= cue.startSeconds + 0.01) {
+      return [];
     }
-    if (seen === occurrenceIndex) {
-      seen += 1;
-      return `{\\rHighlight}${escapeAss(piece)}{\\rDefault}`;
-    }
-    seen += 1;
-    return escapeAss(piece);
+    const text = cue.lines.map(escapeAss).join('\\N');
+    return [`Dialogue: 0,${formatAssTime(cue.startSeconds)},${formatAssTime(endSeconds)},Default,,0,0,0,,${text}\n`];
   });
-  return rendered.join(' ');
 }
 
 function wouldOverflow(words: CueWord[]): boolean {

@@ -28,8 +28,9 @@ export async function renderCandidate(input: {
   chosenSpeakerId?: string | null;
   layoutProfile?: LayoutProfile | null;
   artifactsDir: string;
+  renderTier?: 'dev' | 'prod';
 }): Promise<Omit<RenderArtifact, 'telegramMessageId' | 'status' | 'createdAt' | 'id'>> {
-  const profile = renderProfile(input.kind);
+  const profile = renderProfile(input.kind, input.renderTier);
   const baseDir = resolve(input.artifactsDir, input.jobId, input.candidateVersionId, input.candidate.id, input.kind);
   const clipsDir = join(baseDir, 'clips');
   const listPath = join(baseDir, 'clips.txt');
@@ -157,11 +158,10 @@ async function createClip(input: {
 }
 
 async function burnSubtitles(input: { sourcePath: string; subtitlePath: string; outputPath: string; profile: RenderProfileSettings }): Promise<void> {
-  const subtitleArg = `${input.subtitlePath}`;
   await runProcess('ffmpeg', [
     '-y',
     '-i', input.sourcePath,
-    '-vf', `subtitles=${subtitleArg}`,
+    '-vf', buildSubtitlesFilterArg(input.subtitlePath),
     '-c:v', 'libx264',
     '-preset', input.profile.preset,
     '-crf', input.profile.crf,
@@ -238,12 +238,27 @@ function escapeDrawtext(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, "\\'").replace(/\n/g, '\\\\n');
 }
 
+export function buildSubtitlesFilterArg(path: string): string {
+  return `subtitles=filename='${escapeFilterValue(path)}'`;
+}
+
+function escapeFilterValue(value: string): string {
+  return value
+    .replaceAll('\\', '\\\\')
+    .replaceAll("'", "\\'")
+    .replaceAll(':', '\\:')
+    .replaceAll(',', '\\,')
+    .replaceAll(';', '\\;')
+    .replaceAll('[', '\\[')
+    .replaceAll(']', '\\]');
+}
+
 function fallbackVisualFilter(width: number, height: number): string {
   return `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black`;
 }
 
-function renderProfile(kind: 'draft' | 'final'): RenderProfileSettings {
-  const tier = process.env.TELEGRAM_SHORTS_RENDER_TIER === 'prod' ? 'prod' : 'dev';
+function renderProfile(kind: 'draft' | 'final', tierOverride?: 'dev' | 'prod'): RenderProfileSettings {
+  const tier = tierOverride ?? (process.env.TELEGRAM_SHORTS_RENDER_TIER === 'prod' ? 'prod' : 'dev');
   if (tier === 'dev') {
     return kind === 'draft'
       ? {

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { TranscriptSentence } from '../src/domain/model.js';
-import { buildCandidateVersionFromBlocks, fallbackSemanticBlocks, materializeSemanticBlocks } from '../src/domain/semantic.js';
+import { buildCandidateVersionFromBlocks, diagnoseCandidatePlan, fallbackSemanticBlocks, materializeSemanticBlocks, opportunityPlanToCandidatePlan } from '../src/domain/semantic.js';
 
 const sentences: TranscriptSentence[] = [
   sentence('s_0001', 0, 0, 8, 'Todo mundo acha que isso é só um caso isolado.'),
@@ -32,6 +32,87 @@ test('materialized semantic blocks fall back when invalid ordering is returned',
   });
   assert.ok(blocks.length >= 2);
   assert.equal(blocks[0]?.startSentenceId, 's_0001');
+});
+
+test('candidate diagnostics explain validator rejection reasons', () => {
+  const blocks = materializeSemanticBlocks(sentences, {
+    blocks: [
+      { id: 'b_001', kind: 'hook', summary: 'setup', start_sentence_id: 's_0001', end_sentence_id: 's_0001' },
+      { id: 'b_002', kind: 'turn', summary: 'turn', start_sentence_id: 's_0002', end_sentence_id: 's_0002' },
+    ],
+  });
+  const diagnostics = diagnoseCandidatePlan(sentences, blocks, {
+    candidates: [{
+      title: 'Curto demais',
+      summary: 'x',
+      hook: 'x',
+      payoff: 'x',
+      rationale: 'x',
+      thesis: 'x',
+      risk: 'medium',
+      block_ids: ['b_001', 'b_missing', 'b_001'],
+      steps: [
+        { kind: 'hook', label: 'setup', block_ids: ['b_001'] },
+        { kind: 'turn', label: 'turn', block_ids: ['b_001'] },
+      ],
+    }],
+  });
+  assert.equal(diagnostics.length, 1);
+  assert.ok(diagnostics[0]?.reasons.some((reason) => reason.includes('missing blocks')));
+  assert.ok(diagnostics[0]?.reasons.some((reason) => reason.includes('duplicate')));
+});
+
+test('opportunity plans map cleanly into candidate plans', () => {
+  const plan = opportunityPlanToCandidatePlan({
+    opportunities: [{
+      id: 'opp_001',
+      title: 'Título',
+      summary: 'Resumo',
+      hook: 'Hook',
+      payoff: 'Payoff',
+      rationale: 'Racional',
+      thesis: 'Tese',
+      viewer_promise: 'Promessa',
+      tension: 'Tensão',
+      why_this_short: 'Por que esse short',
+      risk: 'medium',
+      block_ids: ['b_001', 'b_002'],
+      steps: [
+        { kind: 'hook', label: 'setup', block_ids: ['b_001'] },
+        { kind: 'payoff', label: 'payoff', block_ids: ['b_002'] },
+      ],
+    }],
+  });
+  assert.deepEqual(plan.candidates[0]?.block_ids, ['b_001', 'b_002']);
+  assert.equal(plan.candidates[0]?.title, 'Título');
+});
+
+test('terminal authored short can validate without explicit payoff block label', () => {
+  const blocks = materializeSemanticBlocks(sentences, {
+    blocks: [
+      { id: 'b_001', kind: 'hook', summary: 'setup', start_sentence_id: 's_0001', end_sentence_id: 's_0001' },
+      { id: 'b_002', kind: 'turn', summary: 'turn', start_sentence_id: 's_0002', end_sentence_id: 's_0002' },
+      { id: 'b_003', kind: 'explain', summary: 'evidence', start_sentence_id: 's_0003', end_sentence_id: 's_0005' },
+    ],
+  });
+  const version = buildCandidateVersionFromBlocks('job_1', 1, null, 'initial', sentences, blocks, {
+    candidates: [{
+      title: 'Ideia principal',
+      summary: 'x',
+      hook: 'x',
+      payoff: 'x',
+      rationale: 'x',
+      thesis: 'x',
+      risk: 'medium',
+      block_ids: ['b_001', 'b_002', 'b_003'],
+      steps: [
+        { kind: 'hook', label: 'setup', block_ids: ['b_001'] },
+        { kind: 'turn', label: 'virada', block_ids: ['b_002'] },
+        { kind: 'explain', label: 'fechamento conceitual', block_ids: ['b_003'] },
+      ],
+    }],
+  });
+  assert.equal(version.candidates.length, 1);
 });
 
 test('candidate version from semantic blocks prefers argument arc over chapter slice', () => {

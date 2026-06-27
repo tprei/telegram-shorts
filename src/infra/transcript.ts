@@ -1,6 +1,7 @@
 import { extname } from 'node:path';
-import { readFile } from 'node:fs/promises';
+import { readFile, unlink } from 'node:fs/promises';
 import { AppConfig } from './env.js';
+import { runProcess } from './process.js';
 import { TranscriptProvider, TranscriptWord } from '../domain/model.js';
 
 export async function transcribeSource(config: AppConfig, audioPath: string): Promise<TranscriptWord[]> {
@@ -14,7 +15,20 @@ export async function transcribeSource(config: AppConfig, audioPath: string): Pr
   if (!config.DEEPGRAM_API_KEY) {
     throw new Error('DEEPGRAM_API_KEY is required for Deepgram transcription.');
   }
-  return transcribeWithDeepgram(config.DEEPGRAM_API_KEY, audioPath);
+  try {
+    return await transcribeWithDeepgram(config.DEEPGRAM_API_KEY, audioPath);
+  } catch (error) {
+    if (!isDeepgramSlowUploadError(error)) {
+      throw error;
+    }
+    const retryPath = buildDeepgramRetryAudioPath(audioPath);
+    await runProcess('ffmpeg', ['-y', '-i', audioPath, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '24k', retryPath], { capture: false });
+    try {
+      return await transcribeWithDeepgram(config.DEEPGRAM_API_KEY, retryPath);
+    } finally {
+      await unlink(retryPath).catch(() => undefined);
+    }
+  }
 }
 
 async function transcribeWithDeepgram(apiKey: string, audioPath: string): Promise<TranscriptWord[]> {
@@ -118,6 +132,16 @@ async function transcribeWithScribe(apiKey: string, audioPath: string): Promise<
     throw new Error('ElevenLabs Scribe returned no usable words.');
   }
   return words;
+}
+
+export function isDeepgramSlowUploadError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes('Deepgram transcription failed: 408') || message.includes('SLOW_UPLOAD') || message.includes('Request upload timeout');
+}
+
+function buildDeepgramRetryAudioPath(path: string): string {
+  const extension = extname(path).toLowerCase();
+  return extension.length > 0 ? `${path.slice(0, -extension.length)}.deepgram-retry.mp3` : `${path}.deepgram-retry.mp3`;
 }
 
 function mimeType(path: string): string {

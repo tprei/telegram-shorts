@@ -2,12 +2,13 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { Candidate, CandidateVersion, JobRecord, PendingReplyContext, QueueTask, RenderArtifact, TelegramUpdateEnvelope } from '../domain/model.js';
 import { applyResolvedInsert, applyRevision, buildSentences, detectStrongSpeakers, markDraftReady, rejectCandidate } from '../domain/policies.js';
-import { buildCandidateVersionFromBlocks, fallbackSemanticBlocks, materializeSemanticBlocks, semanticBlocksAreUsable } from '../domain/semantic.js';
+import { buildCandidateVersionFromBlocks, diagnoseCandidatePlan, fallbackSemanticBlocks, materializeSemanticBlocks, semanticBlocksAreUsable } from '../domain/semantic.js';
 import { ShortsStore } from '../infra/db.js';
 import { AppConfig } from '../infra/env.js';
 import { loadLayoutProfile } from '../infra/layout.js';
 import { OpenRouterClient } from '../infra/openrouter.js';
 import { writeArcPreview } from '../infra/arc-preview.js';
+import { buildInstagramReelDescription, createInstagramCoverImage, MallaryClient } from '../infra/mallary.js';
 import { renderCandidate } from '../infra/render.js';
 import { type TelegramGateway } from '../infra/telegram.js';
 import { transcribeSource } from '../infra/transcript.js';
@@ -54,13 +55,23 @@ export class ShortsWorkflow {
         await this.applyRevisionTask(task);
       } else if (task.kind === 'render_final') {
         await this.renderFinal(task);
+      } else if (task.kind === 'publish_instagram') {
+        await this.publishInstagram(task);
       }
       this.store.completeTask(task);
       return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await this.failJob(task.jobId, message);
       this.store.failTask(task, message);
+      if (task.kind === 'publish_instagram') {
+        const job = this.store.getJob(task.jobId);
+        if (job) {
+          this.store.appendAction(job.id, 'instagram_publish_failed', { error: message, payload: task.payload });
+          await this.safeSendMessage(job.operatorChatId, `Falha ao publicar Reel no Instagram: ${message}`);
+        }
+        return true;
+      }
+      await this.failJob(task.jobId, message);
       if (this.telegram) {
         const job = this.store.getJob(task.jobId);
         if (job) {
@@ -246,30 +257,30 @@ export class ShortsWorkflow {
     }
     const callbackUserId = String(callback.from?.id ?? '');
     if (this.config.TELEGRAM_SHORTS_ALLOWED_USER_ID && callbackUserId !== this.config.TELEGRAM_SHORTS_ALLOWED_USER_ID) {
-      await this.telegram?.answerCallbackQuery({ callback_query_id: callback.id, text: 'Usuário não autorizado.', show_alert: true });
+      await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Usuário não autorizado.', show_alert: true });
       this.store.markProcessedCallback(callback.id);
       return;
     }
     if (this.store.hasProcessedCallback(callback.id)) {
-      await this.telegram?.answerCallbackQuery({ callback_query_id: callback.id, text: 'Já processado.' });
+      await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Já processado.' });
       return;
     }
     const token = String(callback.data ?? '');
     const payload = this.store.getCallbackToken(token);
     if (!payload) {
-      await this.telegram?.answerCallbackQuery({ callback_query_id: callback.id, text: 'Ação expirada.', show_alert: true });
+      await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Ação expirada.', show_alert: true });
       this.store.markProcessedCallback(callback.id);
       return;
     }
     const job = this.store.getJob(payload.jobId);
     if (!job) {
-      await this.telegram?.answerCallbackQuery({ callback_query_id: callback.id, text: 'Job não encontrado.', show_alert: true });
+      await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Job não encontrado.', show_alert: true });
       this.store.markProcessedCallback(callback.id);
       return;
     }
     if (payload.kind === 'pick_speaker') {
       if (job.status !== 'awaiting_speaker_confirmation' || !payload.speakerId) {
-        await this.telegram?.answerCallbackQuery({ callback_query_id: callback.id, text: 'Confirmação inválida.', show_alert: true });
+        await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Confirmação inválida.', show_alert: true });
         this.store.markProcessedCallback(callback.id);
         return;
       }
@@ -280,15 +291,15 @@ export class ShortsWorkflow {
       this.store.updateJob(job);
       this.store.enqueueTask(job.id, 'plan_candidates', {});
       this.store.appendAction(job.id, 'speaker_confirmed', { speakerId: payload.speakerId });
-      await this.telegram?.answerCallbackQuery({ callback_query_id: callback.id, text: 'Segmentos confirmados.' });
+      await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Segmentos confirmados.' });
       if (job.messages.speakerPromptMessageId) {
         await this.safeEditMessage(job.operatorChatId, job.messages.speakerPromptMessageId, 'Segmentos do apresentador confirmados. Vou planejar os shorts agora.');
       }
       this.store.markProcessedCallback(callback.id);
       return;
     }
-    if (payload.candidateVersionId && job.currentCandidateVersionId !== payload.candidateVersionId) {
-      await this.telegram?.answerCallbackQuery({ callback_query_id: callback.id, text: 'Essa versão está desatualizada.', show_alert: true });
+    if (payload.kind !== 'publish_instagram' && payload.candidateVersionId && job.currentCandidateVersionId !== payload.candidateVersionId) {
+      await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Essa versão está desatualizada.', show_alert: true });
       this.store.markProcessedCallback(callback.id);
       return;
     }
@@ -303,38 +314,34 @@ export class ShortsWorkflow {
         kind: 'revision',
       };
       this.store.setPendingReply(pending);
-      await this.telegram?.answerCallbackQuery({ callback_query_id: callback.id, text: 'Envie a revisão em resposta.' });
+      await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Envie a revisão em resposta.' });
       this.store.markProcessedCallback(callback.id);
       return;
     }
     if (payload.kind === 'approve_draft' && payload.candidateId && payload.renderId) {
       const render = this.store.getRender(payload.renderId);
       if (!render || render.candidateVersionId !== job.currentCandidateVersionId) {
-        await this.telegram?.answerCallbackQuery({ callback_query_id: callback.id, text: 'Draft desatualizado.', show_alert: true });
-        this.store.markProcessedCallback(callback.id);
-        return;
-      }
-      if (job.status === 'rendering_final' || job.status === 'final_uploading' || job.status === 'completed') {
-        await this.telegram?.answerCallbackQuery({ callback_query_id: callback.id, text: 'Final já está em andamento.' });
+        await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Draft desatualizado.', show_alert: true });
         this.store.markProcessedCallback(callback.id);
         return;
       }
       job.approvedRenderId = payload.renderId;
-      job.status = 'rendering_final';
       job.updatedAt = nowIso();
       this.store.updateJob(job);
       this.store.enqueueTask(job.id, 'render_final', { candidateId: payload.candidateId, candidateVersionId: payload.candidateVersionId, renderId: payload.renderId });
-      await this.telegram?.answerCallbackQuery({ callback_query_id: callback.id, text: 'Gerando final.' });
+      await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Gerando final.' });
+      await this.safeDeleteDraftMessage(job.operatorChatId, render.telegramMessageId);
       this.store.markProcessedCallback(callback.id);
       return;
     }
     if (payload.kind === 'reject_candidate' && payload.candidateId && payload.candidateVersionId) {
       const version = this.store.getCandidateVersion(payload.candidateVersionId);
       if (!version) {
-        await this.telegram?.answerCallbackQuery({ callback_query_id: callback.id, text: 'Versão não encontrada.', show_alert: true });
+        await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Versão não encontrada.', show_alert: true });
         this.store.markProcessedCallback(callback.id);
         return;
       }
+      await this.deleteDraftMessagesForVersion(job, version.id);
       const next = rejectCandidate(version, payload.candidateId);
       this.store.saveCandidateVersion(next);
       for (const candidate of next.candidates) {
@@ -354,7 +361,7 @@ export class ShortsWorkflow {
         job.error = 'All candidates were rejected.';
         job.updatedAt = nowIso();
         this.store.updateJob(job);
-        await this.telegram?.answerCallbackQuery({ callback_query_id: callback.id, text: 'Todos os candidatos foram rejeitados.', show_alert: true });
+        await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Todos os candidatos foram rejeitados.', show_alert: true });
         this.store.markProcessedCallback(callback.id);
         return;
       }
@@ -364,17 +371,40 @@ export class ShortsWorkflow {
       for (const candidate of remaining.slice(0, 3)) {
         this.store.enqueueTask(job.id, 'render_draft', { candidateId: candidate.id, candidateVersionId: next.id });
       }
-      await this.telegram?.answerCallbackQuery({ callback_query_id: callback.id, text: 'Candidato rejeitado. Vou atualizar os drafts.' });
+      await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Candidato rejeitado. Vou atualizar os drafts.' });
       this.store.markProcessedCallback(callback.id);
       return;
     }
     if (payload.kind === 'render_candidate' && payload.candidateId && payload.candidateVersionId) {
       this.store.enqueueTask(job.id, 'render_draft', { candidateId: payload.candidateId, candidateVersionId: payload.candidateVersionId });
-      await this.telegram?.answerCallbackQuery({ callback_query_id: callback.id, text: 'Renderizando draft.' });
+      await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Renderizando draft.' });
       this.store.markProcessedCallback(callback.id);
       return;
     }
-    await this.telegram?.answerCallbackQuery({ callback_query_id: callback.id, text: 'Ação inválida.', show_alert: true });
+    if (payload.kind === 'publish_instagram' && payload.renderId && payload.candidateId && payload.candidateVersionId) {
+      const render = this.store.getRender(payload.renderId);
+      if (!this.config.MALLARY_AI_API_TOKEN) {
+        await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'MALLARY_AI_API_TOKEN não configurado.', show_alert: true });
+        this.store.markProcessedCallback(callback.id);
+        return;
+      }
+      if (this.store.hasTaskForRender(job.id, 'publish_instagram', payload.renderId, ['queued', 'running', 'done'])) {
+        await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Publicação do Reel já foi solicitada.' });
+        await this.safeDeleteDraftMessage(job.operatorChatId, render?.telegramMessageId ?? null);
+        this.store.markProcessedCallback(callback.id);
+        return;
+      }
+      this.store.enqueueTask(job.id, 'publish_instagram', {
+        candidateId: payload.candidateId,
+        candidateVersionId: payload.candidateVersionId,
+        renderId: payload.renderId,
+      });
+      await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Enviando Reel para o Instagram.' });
+      await this.safeDeleteDraftMessage(job.operatorChatId, render?.telegramMessageId ?? null);
+      this.store.markProcessedCallback(callback.id);
+      return;
+    }
+    await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Ação inválida.', show_alert: true });
     this.store.markProcessedCallback(callback.id);
   }
 
@@ -439,23 +469,60 @@ export class ShortsWorkflow {
     } catch {
       // fall back to local block segmentation
     }
+    const jobDir = await this.ensureJobDir(job.id);
     job.semanticBlocks = blocks;
-    job.semanticBlocksPath = join(await this.ensureJobDir(job.id), 'semantic-blocks.json');
+    job.semanticBlocksPath = join(jobDir, 'semantic-blocks.json');
     await writeFile(job.semanticBlocksPath, `${JSON.stringify(blocks, null, 2)}\n`, 'utf-8');
-    const plan = await this.openRouter.planCandidates({
+    this.store.updateJob(job);
+    const blockPayload = blocks.map((block) => ({
+      id: block.id,
+      kind: block.kind,
+      summary: block.summary,
+      start_seconds: block.startSeconds,
+      end_seconds: block.endSeconds,
+      text: block.text,
+    }));
+    let opportunities = await this.openRouter.findOpportunities({
       title: job.sourceTitle,
-      blocks: blocks.map((block) => ({
-        id: block.id,
-        kind: block.kind,
-        summary: block.summary,
-        start_seconds: block.startSeconds,
-        end_seconds: block.endSeconds,
-        text: block.text,
-      })),
+      blocks: blockPayload,
     });
-    const version = buildCandidateVersionFromBlocks(job.id, this.store.latestCandidateVersionNumber(job.id) + 1, job.currentCandidateVersionId, job.currentCandidateVersionId ? 'revision' : 'initial', job.transcriptSentences, blocks, plan);
+    const opportunitiesPath = join(jobDir, 'opportunity-plan.raw.json');
+    await writeFile(opportunitiesPath, `${JSON.stringify(opportunities, null, 2)}\n`, 'utf-8');
+    let plan = await this.openRouter.planCandidates({
+      title: job.sourceTitle,
+      blocks: blockPayload,
+      opportunities: opportunities.opportunities,
+    });
+    const rawPlanPath = join(jobDir, 'candidate-plan.raw.json');
+    await writeFile(rawPlanPath, `${JSON.stringify(plan, null, 2)}\n`, 'utf-8');
+    let diagnostics = diagnoseCandidatePlan(job.transcriptSentences, blocks, plan);
+    const diagnosticsPath = join(jobDir, 'candidate-plan.validation.json');
+    await writeFile(diagnosticsPath, `${JSON.stringify({ candidates: diagnostics }, null, 2)}\n`, 'utf-8');
+    let version = buildCandidateVersionFromBlocks(job.id, this.store.latestCandidateVersionNumber(job.id) + 1, job.currentCandidateVersionId, job.currentCandidateVersionId ? 'revision' : 'initial', job.transcriptSentences, blocks, plan);
     if (version.candidates.length === 0) {
-      throw new Error('No valid short candidates were produced.');
+      opportunities = await this.openRouter.repairOpportunityPlan({
+        title: job.sourceTitle,
+        blocks: blockPayload,
+        opportunities: opportunities.opportunities,
+        diagnostics,
+      });
+      const repairedOpportunitiesPath = join(jobDir, 'opportunity-plan.repair.raw.json');
+      await writeFile(repairedOpportunitiesPath, `${JSON.stringify(opportunities, null, 2)}\n`, 'utf-8');
+      plan = await this.openRouter.planCandidates({
+        title: job.sourceTitle,
+        blocks: blockPayload,
+        opportunities: opportunities.opportunities,
+      });
+      const repairedPlanPath = join(jobDir, 'candidate-plan.repair.raw.json');
+      await writeFile(repairedPlanPath, `${JSON.stringify(plan, null, 2)}\n`, 'utf-8');
+      diagnostics = diagnoseCandidatePlan(job.transcriptSentences, blocks, plan);
+      const repairedDiagnosticsPath = join(jobDir, 'candidate-plan.repair.validation.json');
+      await writeFile(repairedDiagnosticsPath, `${JSON.stringify({ candidates: diagnostics }, null, 2)}\n`, 'utf-8');
+      version = buildCandidateVersionFromBlocks(job.id, this.store.latestCandidateVersionNumber(job.id) + 1, job.currentCandidateVersionId, job.currentCandidateVersionId ? 'revision' : 'initial', job.transcriptSentences, blocks, plan);
+    }
+    if (version.candidates.length === 0) {
+      const reasonSummary = diagnostics.map((entry) => `#${entry.index + 1} ${entry.title}: ${entry.reasons.join('; ') || 'no diagnostic reason'}`).join(' | ');
+      throw new Error(`No valid short candidates were produced. See ${diagnosticsPath}. ${reasonSummary}`);
     }
     this.store.saveCandidateVersion(version);
     for (const candidate of version.candidates) {
@@ -514,13 +581,21 @@ export class ShortsWorkflow {
       ...rendered,
     };
     this.store.saveRender(render);
-    let updatedVersion = markDraftReady(version, candidate.id);
-    this.store.updateCandidateVersion(updatedVersion);
+    let updatedVersion = version;
     if (this.telegram) {
-      const sent = await this.telegram.sendVideo(job.operatorChatId, render.artifactPath, this.renderDraftCaption(job, updatedVersion, candidate), this.candidateButtons(job.id, updatedVersion.id, candidate.id, render.id));
-      render.telegramMessageId = sent.message_id;
-      render.status = 'sent';
-      this.store.updateRender(render);
+      const sent = await this.safeSendVideo(job.operatorChatId, render.artifactPath, this.renderDraftCaption(job, version, candidate), this.candidateButtons(job.id, version.id, candidate.id, render.id));
+      if (sent) {
+        render.telegramMessageId = sent.message_id;
+        render.status = 'sent';
+        this.store.updateRender(render);
+        updatedVersion = markDraftReady(version, candidate.id);
+        this.store.updateCandidateVersion(updatedVersion);
+      } else {
+        this.store.appendAction(job.id, 'draft_delivery_failed', { candidateId: candidate.id, renderId: render.id, artifactPath: render.artifactPath });
+      }
+    } else {
+      updatedVersion = markDraftReady(version, candidate.id);
+      this.store.updateCandidateVersion(updatedVersion);
     }
     updatedVersion = this.store.getCandidateVersion(updatedVersion.id) ?? updatedVersion;
     const topCandidates = updatedVersion.candidates.filter((entry) => !entry.rejected).slice(0, 3);
@@ -544,11 +619,20 @@ export class ShortsWorkflow {
       throw new Error('Revision target not found.');
     }
     const intent = await this.openRouter.parseRevision({ candidate, message });
-    let next = applyRevision(version, candidate.id, intent.actions.filter((action) => action.kind !== 'insert_span'), job.transcriptSentences);
+    const nonInsertActions = intent.actions.filter((action) => action.kind !== 'insert_span');
+    let next = applyRevision(version, candidate.id, nonInsertActions, job.transcriptSentences);
     const insertActions = intent.actions.filter((action) => action.kind === 'insert_span');
+    const locateFailures: string[] = [];
     for (const action of insertActions) {
-      const located = await this.openRouter.locateTranscriptSpan({ query: action.query, sentences: job.transcriptSentences });
-      next = applyResolvedInsert(next, candidate.id, located.start_sentence_id, located.end_sentence_id, job.transcriptSentences);
+      try {
+        const located = await this.openRouter.locateTranscriptSpan({ query: action.query, sentences: job.transcriptSentences });
+        next = applyResolvedInsert(next, candidate.id, located.start_sentence_id, located.end_sentence_id, job.transcriptSentences);
+      } catch (error) {
+        locateFailures.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+    if (locateFailures.length > 0 && insertActions.length > 0 && nonInsertActions.length === 0) {
+      throw new Error(locateFailures.join(' | '));
     }
     this.store.saveCandidateVersion(next);
     for (const item of next.candidates) {
@@ -565,8 +649,9 @@ export class ShortsWorkflow {
     job.status = 'rendering_drafts';
     job.updatedAt = nowIso();
     this.store.updateJob(job);
-    this.store.appendAction(job.id, 'revision_applied', { candidateId: candidate.id, summary: intent.summary });
-    await this.safeSendMessage(job.operatorChatId, `Revisão aplicada: ${intent.summary}`);
+    this.store.appendAction(job.id, 'revision_applied', { candidateId: candidate.id, summary: intent.summary, locateFailures });
+    const partialNote = locateFailures.length > 0 ? `\nObs.: não localizei com segurança um dos trechos pedidos, então apliquei o restante da revisão.` : '';
+    await this.safeSendMessage(job.operatorChatId, `Revisão aplicada: ${intent.summary}${partialNote}`);
     await this.syncOverview(job, next);
     for (const item of next.candidates.filter((entry) => !entry.rejected).slice(0, 3)) {
       this.store.enqueueTask(job.id, 'render_draft', { candidateId: item.id, candidateVersionId: next.id });
@@ -576,7 +661,9 @@ export class ShortsWorkflow {
   private async renderFinal(task: QueueTask): Promise<void> {
     const job = this.requireJob(task.jobId);
     const version = this.requireCandidateVersion(task.payload.candidateVersionId ?? job.currentCandidateVersionId);
-    if (job.currentCandidateVersionId !== version.id || job.approvedRenderId !== task.payload.renderId || (job.status !== 'rendering_final' && job.status !== 'final_uploading')) {
+    const matchesClassicFinalFlow = job.approvedRenderId === task.payload.renderId && (job.status === 'rendering_final' || job.status === 'final_uploading');
+    const allowsIndependentFinal = this.telegram !== null && typeof task.payload.renderId === 'string' && ['awaiting_review', 'completed', 'rendering_final', 'final_uploading'].includes(job.status);
+    if (job.currentCandidateVersionId !== version.id || (!matchesClassicFinalFlow && !allowsIndependentFinal)) {
       return;
     }
     const candidate = version.candidates.find((entry) => entry.id === task.payload.candidateId);
@@ -614,15 +701,80 @@ export class ShortsWorkflow {
     this.store.updateJob(job);
     await this.syncOverview(job, version);
     if (this.telegram) {
-      const sent = await this.telegram.sendDocument(job.operatorChatId, render.artifactPath, this.renderFinalCaption(job, candidate));
-      render.telegramMessageId = sent.message_id;
-      render.status = 'sent';
-      this.store.updateRender(render);
+      const sent = await this.safeSendDocument(job.operatorChatId, render.artifactPath, this.renderFinalCaption(job, candidate), this.finalButtons(job.id, version.id, candidate.id, render.id));
+      if (sent) {
+        render.telegramMessageId = sent.message_id;
+        render.status = 'sent';
+        this.store.updateRender(render);
+      } else {
+        this.store.appendAction(job.id, 'final_delivery_failed', { candidateId: candidate.id, renderId: render.id, artifactPath: render.artifactPath });
+      }
     }
     job.status = 'completed';
     job.updatedAt = nowIso();
     this.store.updateJob(job);
     await this.syncOverview(job, version);
+  }
+
+  private async publishInstagram(task: QueueTask): Promise<void> {
+    if (!this.config.MALLARY_AI_API_TOKEN) {
+      throw new Error('MALLARY_AI_API_TOKEN is required to publish Instagram Reels.');
+    }
+    const job = this.requireJob(task.jobId);
+    const renderId = typeof task.payload.renderId === 'string' ? task.payload.renderId : null;
+    const candidateId = typeof task.payload.candidateId === 'string' ? task.payload.candidateId : null;
+    const candidateVersionId = typeof task.payload.candidateVersionId === 'string' ? task.payload.candidateVersionId : null;
+    if (!renderId || !candidateId || !candidateVersionId) {
+      throw new Error('Instagram publish target is incomplete.');
+    }
+    const render = this.store.getRender(renderId);
+    if (!render || render.kind !== 'final') {
+      throw new Error('Final render not found for Instagram publish.');
+    }
+    const version = this.requireCandidateVersion(candidateVersionId);
+    const candidate = version.candidates.find((entry) => entry.id === candidateId);
+    if (!candidate) {
+      throw new Error('Candidate not found for Instagram publish.');
+    }
+    const copy = await this.openRouter.writeInstagramReelDescription({ candidate });
+    const layoutProfile = await loadLayoutProfile(this.config.TELEGRAM_SHORTS_STATIC_LAYOUT_PATH, this.config.rootDir);
+    const instagramRender = await renderCandidate({
+      jobId: job.id,
+      candidate,
+      candidateVersionId: `${candidateVersionId}-instagram-prod`,
+      kind: 'final',
+      sourceVideoPath: job.sourceVideoPath ?? (() => { throw new Error('sourceVideoPath missing for Instagram publish.'); })(),
+      sourceTitle: job.sourceTitle ?? 'Vídeo original',
+      sourceThumbnailPath: job.sourceThumbnailPath,
+      transcriptWords: job.transcriptWords,
+      chosenSpeakerId: job.chosenSpeakerId,
+      layoutProfile,
+      artifactsDir: this.config.artifactsDir,
+      renderTier: 'prod',
+    });
+    const instagramCoverPath = await createInstagramCoverImage({
+      sourceVideoPath: job.sourceVideoPath ?? (() => { throw new Error('sourceVideoPath missing for Instagram cover.'); })(),
+      sourceThumbnailPath: job.sourceThumbnailPath,
+      candidate,
+      outputPath: `${instagramRender.artifactPath}.cover.jpg`,
+    });
+    const mallary = new MallaryClient(this.config.MALLARY_AI_API_TOKEN, this.config.MALLARY_PROFILE_ID);
+    const result = await mallary.publishInstagramReel({
+      filePath: instagramRender.artifactPath,
+      message: buildInstagramReelDescription(copy),
+      idempotencyKey: `telegram-shorts-instagram-${render.id}`,
+      thumbnailPath: instagramCoverPath,
+    });
+    this.store.appendAction(job.id, 'instagram_publish_enqueued', {
+      candidateId,
+      renderId,
+      instagramArtifactPath: instagramRender.artifactPath,
+      instagramCoverPath,
+      batchId: result.batchId,
+      jobs: result.jobs,
+    });
+    const jobIds = result.jobs.map((entry) => `${entry.platform}:${entry.jobId}`).join(', ');
+    await this.safeSendMessage(job.operatorChatId, `Reel enviado para a fila do Instagram. Batch ${result.batchId ?? 'n/a'}${jobIds ? ` · ${jobIds}` : ''}`);
   }
 
   private async sendSpeakerPrompt(job: JobRecord): Promise<void> {
@@ -704,6 +856,17 @@ export class ShortsWorkflow {
     };
   }
 
+  private finalButtons(jobId: string, candidateVersionId: string, candidateId: string, renderId: string): Record<string, unknown> | undefined {
+    if (!this.config.MALLARY_AI_API_TOKEN) {
+      return undefined;
+    }
+    return {
+      inline_keyboard: [[
+        { text: 'Postar Reel no Instagram', callback_data: this.store.createCallbackToken({ kind: 'publish_instagram', jobId, candidateId, candidateVersionId, renderId }) },
+      ]],
+    };
+  }
+
   private renderDraftCaption(job: JobRecord, version: CandidateVersion, candidate: Candidate): string {
     return trimCaption([
       `Draft v${version.number}`,
@@ -768,6 +931,58 @@ export class ShortsWorkflow {
       return await this.telegram.sendMessage(chatId, text);
     } catch {
       return null;
+    }
+  }
+
+  private async safeSendVideo(chatId: string, path: string, caption: string, replyMarkup?: Record<string, unknown>): Promise<{ message_id: number } | null> {
+    if (!this.telegram) {
+      return null;
+    }
+    try {
+      return await this.telegram.sendVideo(chatId, path, caption, replyMarkup);
+    } catch {
+      return null;
+    }
+  }
+
+  private async safeSendDocument(chatId: string, path: string, caption: string, replyMarkup?: Record<string, unknown>): Promise<{ message_id: number } | null> {
+    if (!this.telegram) {
+      return null;
+    }
+    try {
+      return await this.telegram.sendDocument(chatId, path, caption, replyMarkup);
+    } catch {
+      return null;
+    }
+  }
+
+  private async safeAnswerCallbackQuery(input: { callback_query_id: string; text?: string; show_alert?: boolean }): Promise<void> {
+    if (!this.telegram) {
+      return;
+    }
+    try {
+      await this.telegram.answerCallbackQuery(input);
+    } catch {
+      return;
+    }
+  }
+
+  private async safeDeleteDraftMessage(chatId: string, messageId: number | null): Promise<void> {
+    if (!this.telegram || messageId === null) {
+      return;
+    }
+    try {
+      await this.telegram.deleteMessage(chatId, messageId);
+    } catch {
+      return;
+    }
+  }
+
+  private async deleteDraftMessagesForVersion(job: JobRecord, candidateVersionId: string): Promise<void> {
+    const renders = this.store.listRendersForJob(job.id)
+      .filter((render) => render.kind === 'draft' && render.candidateVersionId === candidateVersionId);
+    for (const render of renders) {
+      await this.safeDeleteDraftMessage(job.operatorChatId, render.telegramMessageId);
     }
   }
 

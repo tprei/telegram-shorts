@@ -84,7 +84,7 @@ CREATE INDEX IF NOT EXISTS idx_actions_job ON actions(job_id, created_at);
 `;
 
 export interface CallbackTokenPayload {
-  kind: 'pick_speaker' | 'approve_draft' | 'request_revision' | 'reject_candidate' | 'render_candidate';
+  kind: 'pick_speaker' | 'approve_draft' | 'request_revision' | 'reject_candidate' | 'render_candidate' | 'publish_instagram';
   jobId: string;
   candidateId?: string;
   candidateVersionId?: string;
@@ -194,6 +194,13 @@ export class ShortsStore {
   listRendersForJob(jobId: string): RenderArtifact[] {
     const rows = this.db.prepare('SELECT payload_json FROM renders WHERE job_id = ? ORDER BY created_at ASC').all(jobId) as Array<{ payload_json: string }>;
     return rows.map((row) => parseJson<RenderArtifact>(row.payload_json));
+  }
+
+  hasTaskForRender(jobId: string, kind: QueueTask['kind'], renderId: string, statuses: Array<QueueTask['status']>): boolean {
+    const rows = this.db.prepare('SELECT payload_json FROM queue_tasks WHERE job_id = ? AND kind = ? ORDER BY created_at DESC').all(jobId, kind) as Array<{ payload_json: string }>;
+    return rows
+      .map((row) => parseJson<QueueTask>(row.payload_json))
+      .some((task) => task.status && statuses.includes(task.status) && task.payload.renderId === renderId);
   }
 
   enqueueTask(jobId: string, kind: QueueTask['kind'], payload: Record<string, unknown>): QueueTask {
