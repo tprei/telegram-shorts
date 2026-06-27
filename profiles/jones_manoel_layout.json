@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "creatorId": "jones_manoel",
+  "layoutId": "center-speaker-vertical-crop-v1",
+  "regions": [
+    {
+      "id": "center-speaker",
+      "sourceRect": { "x": 0.342, "y": 0.0, "w": 0.316, "h": 1.0 },
+      "canvasRect": { "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0 },
+      "fit": "cover"
+    }
+  ],
+  "subtitleSafeArea": { "x": 0.08, "y": 0.72, "w": 0.84, "h": 0.18 }
+}
