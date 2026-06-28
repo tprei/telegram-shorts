@@ -7,6 +7,20 @@ import { runProcess } from './process.js';
 import { logError } from './util.js';
 
 const BASE_URL = 'https://mallary.ai';
+const DISALLOWED_HASHTAGS = new Set([
+  '#instagramreels',
+  '#reels',
+  '#reel',
+  '#reelsinstagram',
+  '#instareels',
+  '#fyp',
+  '#fy',
+  '#foryou',
+  '#foryoupage',
+  '#viral',
+  '#explorepage',
+  '#explore',
+]);
 
 export class MallaryUploadClient {
   constructor(private readonly apiToken: string) {}
@@ -226,6 +240,9 @@ function uniqueHashtags(values: string[]): string[] {
       continue;
     }
     const tag = normalized.startsWith('#') ? normalized : `#${normalized}`;
+    if (DISALLOWED_HASHTAGS.has(tag.toLowerCase())) {
+      continue;
+    }
     if (!tags.includes(tag)) {
       tags.push(tag);
     }

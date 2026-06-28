@@ -293,8 +293,9 @@ export class OpenRouterClient {
         'A linha 1 deve abrir com a ideia mais forte, polêmica, útil ou surpreendente.',
         'A linha 2 deve aprofundar a consequência, o conflito, a crítica ou o payoff da tese.',
         'Hashtags devem ser específicas do tema, compartilháveis, orientadas a alcance e descoberta, com potencial de conversa e views.',
+        'Priorize hashtags em português do Brasil. Só use inglês quando for nome próprio, sigla conhecida ou termo inevitável do assunto.',
         'Prefira hashtags de assunto, identidade, conflito, debate, tendência e busca. Evite hashtags genéricas, frias ou autoexplicativas como #reels, #instagramreels, #viral, #fyp e equivalentes.',
-        'Evite palavras quebradas, duplicadas, vagas ou burocráticas.',
+        'Evite palavras quebradas, duplicadas, vagas, burocráticas ou genéricas em inglês como #mindset, #business, #success e similares.',
         'Retorne apenas JSON válido com line_1, line_2 e hashtags.',
       ].join(' '),
       payload: {
