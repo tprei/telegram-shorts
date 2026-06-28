@@ -7,7 +7,6 @@ import { runProcess } from './process.js';
 import { logError } from './util.js';
 
 const BASE_URL = 'https://mallary.ai';
-const GENERIC_HASHTAGS = ['#InstagramReels', '#ReelsBrasil'];
 
 export class MallaryUploadClient {
   constructor(private readonly apiToken: string) {}
@@ -209,8 +208,7 @@ export async function createInstagramCoverImage(input: {
 
 export function buildInstagramReelDescription(copy: InstagramReelCopy): string {
   const hashtags = uniqueHashtags(copy.hashtags).slice(0, 6);
-  const paddedHashtags = [...hashtags, ...GENERIC_HASHTAGS.filter((tag) => !hashtags.includes(tag))].slice(0, 6);
-  return `${ensureSentence(copy.line_1)}\n${ensureSentence(copy.line_2)}\n\n${paddedHashtags.join(' ')}`;
+  return `${ensureSentence(copy.line_1)}\n${ensureSentence(copy.line_2)}\n\n${hashtags.join(' ')}`;
 }
 
 function normalizeCommentsUnderPost(values: string[] | undefined): string[] {

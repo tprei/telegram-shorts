@@ -285,10 +285,16 @@ export class OpenRouterClient {
     const raw = await callJson<unknown>(this.config, {
       title: 'instagram-reel-copy',
       system: [
-        'Você escreve legenda curta para Reel em PT-BR.',
-        'Objetivo: devolver exatamente 2 linhas que resumam o short sem truncar no meio da ideia e 3 a 6 hashtags relevantes.',
-        'A linha 1 deve dizer do que o short trata. A linha 2 deve dizer por que isso importa ou qual é a conclusão.',
-        'Hashtags devem ser úteis e naturais; evite hashtags genéricas demais, verbos soltos, palavras quebradas ou duplicadas.',
+        'Você escreve legenda curta para Reel em PT-BR com cara de fala nativa do próprio criador do vídeo.',
+        'Objetivo: devolver exatamente 2 linhas fortes e 3 a 6 hashtags altamente compartilháveis.',
+        'Escreva como tese, provocação ou conclusão direta — não como descrição neutra do conteúdo.',
+        'Nunca deixe explícito que isso é um vídeo, short, reel, corte ou conteúdo editado.',
+        'Evite frases como: esse vídeo, neste vídeo, aqui eu mostro, assista, veja, no corte, no short, no reel.',
+        'A linha 1 deve abrir com a ideia mais forte, polêmica, útil ou surpreendente.',
+        'A linha 2 deve aprofundar a consequência, o conflito, a crítica ou o payoff da tese.',
+        'Hashtags devem ser específicas do tema, compartilháveis, orientadas a alcance e descoberta, com potencial de conversa e views.',
+        'Prefira hashtags de assunto, identidade, conflito, debate, tendência e busca. Evite hashtags genéricas, frias ou autoexplicativas como #reels, #instagramreels, #viral, #fyp e equivalentes.',
+        'Evite palavras quebradas, duplicadas, vagas ou burocráticas.',
         'Retorne apenas JSON válido com line_1, line_2 e hashtags.',
       ].join(' '),
       payload: {
@@ -298,6 +304,7 @@ export class OpenRouterClient {
           hook: input.candidate.hook,
           payoff: input.candidate.payoff,
           rationale: input.candidate.rationale,
+          source_quotes: input.candidate.segments.slice(0, 4).map((segment) => segment.text),
         },
       },
       responseFormat: STRUCTURED_OUTPUT_SCHEMAS.instagramCopy,
@@ -620,8 +627,8 @@ function normalizeInstagramReelCopyPayload(raw: unknown): unknown {
       ? record.hashtags.split(/\s+/)
       : [];
   return {
-    line_1: stringValue(record.line_1) ?? stringValue(record.line1) ?? stringValue(record.caption) ?? 'Assista ao short.',
-    line_2: stringValue(record.line_2) ?? stringValue(record.line2) ?? stringValue(record.summary) ?? 'Vale pela ideia e pela conclusão.',
+    line_1: stringValue(record.line_1) ?? stringValue(record.line1) ?? stringValue(record.caption) ?? 'O ponto central é bem mais incômodo do que parece.',
+    line_2: stringValue(record.line_2) ?? stringValue(record.line2) ?? stringValue(record.summary) ?? 'Quando você segue a lógica até o fim, a contradição fica óbvia.',
     hashtags: hashtags
       .map((value) => typeof value === 'string' ? value.trim() : '')
       .filter(Boolean)

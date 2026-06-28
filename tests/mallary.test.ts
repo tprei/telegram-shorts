@@ -2,16 +2,18 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { buildInstagramReelDescription, buildMallaryInstagramReelPayload, mallaryMimeType } from '../src/infra/mallary.js';
 
-test('instagram reel description uses two lines and hashtags', () => {
+test('instagram reel description uses two lines and preserves model-selected hashtags', () => {
   const description = buildInstagramReelDescription({
-    line_1: 'Como a Inteligência Artificial gamificou a autoestima masculina',
-    line_2: 'Apps e rankings transformam aparência em pontuação e comparação social',
-    hashtags: ['#InteligenciaArtificial', '#Autoestima', '#CulturaDigital'],
+    line_1: 'O neoliberalismo é hipócrita quando pede sacrifício só de quem já perdeu tudo',
+    line_2: 'A regra muda na hora em que o prejuízo encosta em quem sempre mandou no jogo',
+    hashtags: ['#Neoliberalismo', '#LutaDeClasses', '#PoliticaBrasileira'],
   });
   const lines = description.split('\n');
-  assert.ok(lines[0]?.length);
-  assert.ok(lines[1]?.length);
-  assert.ok(lines.at(-1)?.includes('#'));
+  assert.equal(lines[0], 'O neoliberalismo é hipócrita quando pede sacrifício só de quem já perdeu tudo.');
+  assert.equal(lines[1], 'A regra muda na hora em que o prejuízo encosta em quem sempre mandou no jogo.');
+  assert.equal(lines[3], '#Neoliberalismo #LutaDeClasses #PoliticaBrasileira');
+  assert.equal(description.includes('#InstagramReels'), false);
+  assert.equal(description.includes('#ReelsBrasil'), false);
 });
 
 test('mallary instagram payload includes sanitized follow-up comments', () => {
