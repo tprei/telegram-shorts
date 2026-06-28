@@ -400,13 +400,8 @@ export class ShortsWorkflow {
         this.store.markProcessedCallback(callback.id);
         return;
       }
-      if (!force && (this.store.hasTaskForJob(job.id, 'publish_instagram', ['done']) || this.store.hasAction(job.id, 'instagram_publish_enqueued'))) {
-        await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Esse job já foi postado no Instagram. Use “Forçar repost no Instagram” para repetir.', show_alert: true });
-        this.store.markProcessedCallback(callback.id);
-        return;
-      }
-      if (!force && this.store.hasTaskForRender(job.id, 'publish_instagram', payload.renderId, ['done'])) {
-        await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Esse render já foi publicado no Instagram.', show_alert: true });
+      if (!force && this.store.hasTaskForRender(job.id, 'publish_instagram', payload.renderId, ['queued', 'running', 'done'])) {
+        await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Esse render já foi publicado no Instagram. Use “Forçar repost no Instagram” para repetir.', show_alert: true });
         await this.safeDeleteDraftMessage(job.operatorChatId, render?.telegramMessageId ?? null);
         this.store.markProcessedCallback(callback.id);
         return;
