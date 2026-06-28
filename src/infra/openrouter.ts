@@ -1,5 +1,6 @@
 import { AppConfig } from './env.js';
 import { Candidate, InstagramReelCopy, InstagramReelCopySchema, OpportunityPlanResponse, OpportunityPlanResponseSchema, PlannedCandidateResponse, PlannedCandidateResponseSchema, RevisionIntent, RevisionIntentSchema, SemanticBlockKind, SemanticBlockResponseSet, SemanticBlockResponseSetSchema, TranscriptSentence, TranscriptSpanLocate, TranscriptSpanLocateSchema } from '../domain/model.js';
+import { logError } from './util.js';
 
 const BLOCK_KINDS: SemanticBlockKind[] = ['hook', 'setup', 'turn', 'explain', 'evidence', 'payoff'];
 const JSON_SCHEMA_BLOCK_KIND = { type: 'string', enum: BLOCK_KINDS, description: 'Semantic block kind.' };
@@ -357,34 +358,40 @@ async function callJson<T>(config: AppConfig, input: { title: string; system: st
 }
 
 async function requestCompletionContent(config: AppConfig, input: { title: string; system: string; user: string; temperature: number; responseFormat?: { name: string; schema: Record<string, unknown> } }): Promise<string> {
-  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${config.OPENROUTER_API_KEY}`,
-      'Content-Type': 'application/json',
-      'HTTP-Referer': 'https://github.com/retirers/telegram-shorts',
-      'X-Title': input.title,
-    },
-    body: JSON.stringify({
-      model: config.OPENROUTER_MODEL,
-      temperature: input.temperature,
-      response_format: input.responseFormat
-        ? {
-            type: 'json_schema',
-            json_schema: {
-              name: input.responseFormat.name,
-              strict: true,
-              schema: input.responseFormat.schema,
-            },
-          }
-        : { type: 'json_object' },
-      plugins: [{ id: 'response-healing' }],
-      messages: [
-        { role: 'system', content: input.system },
-        { role: 'user', content: input.user },
-      ],
-    }),
-  });
+  let response: Response;
+  try {
+    response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${config.OPENROUTER_API_KEY}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://github.com/retirers/telegram-shorts',
+        'X-Title': input.title,
+      },
+      body: JSON.stringify({
+        model: config.OPENROUTER_MODEL,
+        temperature: input.temperature,
+        response_format: input.responseFormat
+          ? {
+              type: 'json_schema',
+              json_schema: {
+                name: input.responseFormat.name,
+                strict: true,
+                schema: input.responseFormat.schema,
+              },
+            }
+          : { type: 'json_object' },
+        plugins: [{ id: 'response-healing' }],
+        messages: [
+          { role: 'system', content: input.system },
+          { role: 'user', content: input.user },
+        ],
+      }),
+    });
+  } catch (error) {
+    logError('OpenRouter request failed', error, { title: input.title, model: config.OPENROUTER_MODEL });
+    throw error;
+  }
   if (!response.ok) {
     throw new Error(`OpenRouter request failed: ${response.status} ${await response.text()}`);
   }

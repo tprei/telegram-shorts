@@ -25,3 +25,48 @@ export function clamp(value: number, min: number, max: number): number {
 export function parseJson<T>(value: string): T {
   return JSON.parse(value) as T;
 }
+
+export function describeError(error: unknown): string {
+  if (error instanceof Error) {
+    const details: string[] = [];
+    const maybeError = error as Error & {
+      cause?: unknown;
+      code?: string;
+      errno?: number | string;
+      syscall?: string;
+      address?: string;
+      port?: number;
+    };
+    if (maybeError.code) {
+      details.push(`code=${maybeError.code}`);
+    }
+    if (maybeError.errno !== undefined) {
+      details.push(`errno=${String(maybeError.errno)}`);
+    }
+    if (maybeError.syscall) {
+      details.push(`syscall=${maybeError.syscall}`);
+    }
+    if (maybeError.address) {
+      details.push(`address=${maybeError.address}`);
+    }
+    if (maybeError.port !== undefined) {
+      details.push(`port=${String(maybeError.port)}`);
+    }
+    const cause = maybeError.cause ? ` cause=${describeError(maybeError.cause)}` : '';
+    return `${error.name}: ${error.message}${details.length > 0 ? ` (${details.join(', ')})` : ''}${cause}`;
+  }
+  return String(error);
+}
+
+export function logError(context: string, error: unknown, details?: Record<string, unknown>): void {
+  const suffix = details ? ` ${safeJson(details)}` : '';
+  process.stderr.write(`[${nowIso()}] ${context}: ${describeError(error)}${suffix}\n`);
+}
+
+function safeJson(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return '[unserializable details]';
+  }
+}

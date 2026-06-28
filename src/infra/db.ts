@@ -90,6 +90,7 @@ export interface CallbackTokenPayload {
   candidateVersionId?: string;
   renderId?: string;
   speakerId?: string;
+  force?: boolean;
 }
 
 export class ShortsStore {
@@ -203,6 +204,17 @@ export class ShortsStore {
       .some((task) => task.status && statuses.includes(task.status) && task.payload.renderId === renderId);
   }
 
+  hasTaskForJob(jobId: string, kind: QueueTask['kind'], statuses: Array<QueueTask['status']>): boolean {
+    const row = this.db.prepare('SELECT 1 FROM queue_tasks WHERE job_id = ? AND kind = ? AND status IN (?, ?, ?) LIMIT 1').get(
+      jobId,
+      kind,
+      statuses[0] ?? '',
+      statuses[1] ?? '',
+      statuses[2] ?? '',
+    ) as { 1: number } | undefined;
+    return Boolean(row);
+  }
+
   enqueueTask(jobId: string, kind: QueueTask['kind'], payload: Record<string, unknown>): QueueTask {
     const task: QueueTask = {
       id: createId('task'),
@@ -284,6 +296,11 @@ export class ShortsStore {
   getCallbackToken(token: string): CallbackTokenPayload | null {
     const row = this.db.prepare('SELECT payload_json FROM callback_tokens WHERE token = ?').get(token) as { payload_json: string } | undefined;
     return row ? parseJson<CallbackTokenPayload>(row.payload_json) : null;
+  }
+
+  hasAction(jobId: string, kind: string): boolean {
+    const row = this.db.prepare('SELECT 1 FROM actions WHERE job_id = ? AND kind = ? LIMIT 1').get(jobId, kind) as { 1: number } | undefined;
+    return Boolean(row);
   }
 
   appendAction(jobId: string, kind: string, payload: Record<string, unknown>): void {

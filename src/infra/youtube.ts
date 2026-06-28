@@ -1,7 +1,7 @@
 import { readFile, rename } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { runProcess } from './process.js';
-import { ensureParent } from './util.js';
+import { ensureParent, logError } from './util.js';
 
 export interface DownloadedSource {
   sourceVideoPath: string;
@@ -88,7 +88,8 @@ async function downloadThumbnail(url: string, path: string): Promise<string | nu
     await ensureParent(path);
     await import('node:fs/promises').then(({ writeFile }) => writeFile(path, buffer));
     return path;
-  } catch {
+  } catch (error) {
+    logError('YouTube thumbnail download failed', error, { url, path });
     return null;
   }
 }

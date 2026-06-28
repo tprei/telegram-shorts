@@ -6,7 +6,16 @@ import { ShortsStore } from './infra/db.js';
 import { loadConfig } from './infra/env.js';
 import { OpenRouterClient } from './infra/openrouter.js';
 import { TelegramApi } from './infra/telegram.js';
+import { describeError } from './infra/util.js';
 import { ShortsWorkflow } from './application/workflow.js';
+
+process.on('unhandledRejection', (reason) => {
+  process.stderr.write(`[${new Date().toISOString()}] unhandledRejection: ${describeError(reason)}\n`);
+});
+
+process.on('uncaughtExceptionMonitor', (error) => {
+  process.stderr.write(`[${new Date().toISOString()}] uncaughtException: ${describeError(error)}\n`);
+});
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -30,7 +39,12 @@ async function main(): Promise<void> {
     throw new Error('TELEGRAM_BOT_TOKEN is required in bot mode.');
   }
   const lockFd = acquireLock(`${config.dbPath}.lock`);
+  let released = false;
   const release = () => {
+    if (released) {
+      return;
+    }
+    released = true;
     if (lockFd !== null) {
       try {
         closeSync(lockFd);
@@ -39,7 +53,9 @@ async function main(): Promise<void> {
         unlinkSync(`${config.dbPath}.lock`);
       } catch {}
     }
-    store.close();
+    try {
+      store.close();
+    } catch {}
   };
   process.on('exit', release);
   const telegram = new TelegramApi(config.TELEGRAM_BOT_TOKEN);
@@ -73,10 +89,17 @@ async function pollTelegram(store: ShortsStore, telegram: TelegramApi, workflow:
         }
       }
     } catch (error) {
-      process.stderr.write(`${error instanceof Error ? error.stack || error.message : String(error)}\n`);
+      if (!isBenignTelegramPollError(error)) {
+        process.stderr.write(`[${new Date().toISOString()}] telegram poll failed: ${describeError(error)}\n`);
+      }
       await sleep(pollIntervalMs);
     }
   }
+}
+
+function isBenignTelegramPollError(error: unknown): boolean {
+  const message = describeError(error);
+  return message.includes('UND_ERR_INFO') || message.includes('stream timeout') || message.includes('ECONNRESET');
 }
 
 async function runWorker(workflow: ShortsWorkflow): Promise<never> {

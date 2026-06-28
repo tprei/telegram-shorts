@@ -5,23 +5,29 @@ import { applyResolvedInsert, applyRevision, buildSentences, detectStrongSpeaker
 import { buildCandidateVersionFromBlocks, diagnoseCandidatePlan, fallbackSemanticBlocks, materializeSemanticBlocks, semanticBlocksAreUsable } from '../domain/semantic.js';
 import { ShortsStore } from '../infra/db.js';
 import { AppConfig } from '../infra/env.js';
+import { type InstagramPublishProvider } from '../infra/instagram-publisher.js';
+import { createInstagramPublishProvider } from '../infra/instagram-publisher-factory.js';
 import { loadLayoutProfile } from '../infra/layout.js';
 import { OpenRouterClient } from '../infra/openrouter.js';
 import { writeArcPreview } from '../infra/arc-preview.js';
-import { buildInstagramReelDescription, createInstagramCoverImage, MallaryClient } from '../infra/mallary.js';
+import { buildInstagramReelDescription, createInstagramCoverImage } from '../infra/mallary.js';
 import { renderCandidate } from '../infra/render.js';
 import { type TelegramGateway } from '../infra/telegram.js';
 import { transcribeSource } from '../infra/transcript.js';
-import { createId, nowIso } from '../infra/util.js';
+import { createId, logError, nowIso } from '../infra/util.js';
 import { assertPublicYouTubeUrl, downloadSource } from '../infra/youtube.js';
 
 export class ShortsWorkflow {
+  private readonly instagramPublisher: InstagramPublishProvider | null;
+
   constructor(
     private readonly config: AppConfig,
     private readonly store: ShortsStore,
     private readonly telegram: TelegramGateway | null,
     private readonly openRouter: OpenRouterClient,
-  ) {}
+  ) {
+    this.instagramPublisher = createInstagramPublishProvider(config);
+  }
 
   async handleUpdate(raw: unknown): Promise<void> {
     const update = raw as TelegramUpdateEnvelope;
@@ -383,13 +389,24 @@ export class ShortsWorkflow {
     }
     if (payload.kind === 'publish_instagram' && payload.renderId && payload.candidateId && payload.candidateVersionId) {
       const render = this.store.getRender(payload.renderId);
-      if (!this.config.MALLARY_AI_API_TOKEN) {
-        await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'MALLARY_AI_API_TOKEN não configurado.', show_alert: true });
+      const force = payload.force === true;
+      if (!this.instagramPublisher) {
+        await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Nenhum provedor de publicação do Instagram configurado.', show_alert: true });
         this.store.markProcessedCallback(callback.id);
         return;
       }
-      if (this.store.hasTaskForRender(job.id, 'publish_instagram', payload.renderId, ['queued', 'running', 'done'])) {
-        await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Publicação do Reel já foi solicitada.' });
+      if (this.store.hasTaskForJob(job.id, 'publish_instagram', ['queued', 'running'])) {
+        await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Já existe uma publicação do Instagram em andamento.', show_alert: true });
+        this.store.markProcessedCallback(callback.id);
+        return;
+      }
+      if (!force && (this.store.hasTaskForJob(job.id, 'publish_instagram', ['done']) || this.store.hasAction(job.id, 'instagram_publish_enqueued'))) {
+        await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Esse job já foi postado no Instagram. Use “Forçar repost no Instagram” para repetir.', show_alert: true });
+        this.store.markProcessedCallback(callback.id);
+        return;
+      }
+      if (!force && this.store.hasTaskForRender(job.id, 'publish_instagram', payload.renderId, ['done'])) {
+        await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Esse render já foi publicado no Instagram.', show_alert: true });
         await this.safeDeleteDraftMessage(job.operatorChatId, render?.telegramMessageId ?? null);
         this.store.markProcessedCallback(callback.id);
         return;
@@ -398,8 +415,9 @@ export class ShortsWorkflow {
         candidateId: payload.candidateId,
         candidateVersionId: payload.candidateVersionId,
         renderId: payload.renderId,
+        force,
       });
-      await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Enviando Reel para o Instagram.' });
+      await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: force ? 'Forçando repost do Reel no Instagram.' : 'Enviando Reel para o Instagram.' });
       await this.safeDeleteDraftMessage(job.operatorChatId, render?.telegramMessageId ?? null);
       this.store.markProcessedCallback(callback.id);
       return;
@@ -721,8 +739,8 @@ export class ShortsWorkflow {
   }
 
   private async publishInstagram(task: QueueTask): Promise<void> {
-    if (!this.config.MALLARY_AI_API_TOKEN) {
-      throw new Error('MALLARY_AI_API_TOKEN is required to publish Instagram Reels.');
+    if (!this.instagramPublisher) {
+      throw new Error('An Instagram publish provider is required to publish Instagram Reels.');
     }
     const job = this.requireJob(task.jobId);
     const renderId = typeof task.payload.renderId === 'string' ? task.payload.renderId : null;
@@ -762,23 +780,27 @@ export class ShortsWorkflow {
       candidate,
       outputPath: `${instagramRender.artifactPath}.cover.jpg`,
     });
-    const mallary = new MallaryClient(this.config.MALLARY_AI_API_TOKEN, this.config.MALLARY_PROFILE_ID);
-    const result = await mallary.publishInstagramReel({
+    const commentsUnderPost = this.buildInstagramCommentsUnderPost(job.sourceUrl);
+    const result = await this.instagramPublisher.publishInstagramReel({
       filePath: instagramRender.artifactPath,
       message: buildInstagramReelDescription(copy),
       idempotencyKey: `telegram-shorts-instagram-${render.id}`,
       thumbnailPath: instagramCoverPath,
+      commentsUnderPost,
     });
     this.store.appendAction(job.id, 'instagram_publish_enqueued', {
       candidateId,
       renderId,
+      forced: task.payload.force === true,
       instagramArtifactPath: instagramRender.artifactPath,
       instagramCoverPath,
+      provider: result.provider,
+      commentsUnderPost,
       batchId: result.batchId,
       jobs: result.jobs,
     });
     const jobIds = result.jobs.map((entry) => `${entry.platform}:${entry.jobId}`).join(', ');
-    await this.safeSendMessage(job.operatorChatId, `Reel enviado para a fila do Instagram. Batch ${result.batchId ?? 'n/a'}${jobIds ? ` · ${jobIds}` : ''}`);
+    await this.safeSendMessage(job.operatorChatId, `Reel enviado para a fila do Instagram via ${result.provider}. Batch ${result.batchId ?? 'n/a'}${jobIds ? ` · ${jobIds}` : ''}`);
   }
 
   private async sendSpeakerPrompt(job: JobRecord): Promise<void> {
@@ -861,14 +883,27 @@ export class ShortsWorkflow {
   }
 
   private finalButtons(jobId: string, candidateVersionId: string, candidateId: string, renderId: string): Record<string, unknown> | undefined {
-    if (!this.config.MALLARY_AI_API_TOKEN) {
+    if (!this.instagramPublisher) {
       return undefined;
     }
     return {
-      inline_keyboard: [[
-        { text: 'Postar Reel no Instagram', callback_data: this.store.createCallbackToken({ kind: 'publish_instagram', jobId, candidateId, candidateVersionId, renderId }) },
-      ]],
+      inline_keyboard: [
+        [
+          { text: 'Postar Reel no Instagram', callback_data: this.store.createCallbackToken({ kind: 'publish_instagram', jobId, candidateId, candidateVersionId, renderId }) },
+        ],
+        [
+          { text: 'Forçar repost no Instagram', callback_data: this.store.createCallbackToken({ kind: 'publish_instagram', jobId, candidateId, candidateVersionId, renderId, force: true }) },
+        ],
+      ],
     };
+  }
+
+  private buildInstagramCommentsUnderPost(sourceUrl: string | null): string[] {
+    const normalized = sourceUrl?.trim();
+    if (!normalized) {
+      return [];
+    }
+    return [`Vídeo completo: ${normalized}`];
   }
 
   private renderDraftCaption(job: JobRecord, version: CandidateVersion, candidate: Candidate): string {
@@ -933,7 +968,8 @@ export class ShortsWorkflow {
     }
     try {
       return await this.telegram.sendMessage(chatId, text);
-    } catch {
+    } catch (error) {
+      logError('Telegram sendMessage failed', error, { chatId, textPreview: text.slice(0, 140) });
       return null;
     }
   }
@@ -944,7 +980,8 @@ export class ShortsWorkflow {
     }
     try {
       return await this.telegram.sendVideo(chatId, path, caption, replyMarkup);
-    } catch {
+    } catch (error) {
+      logError('Telegram sendVideo failed', error, { chatId, path, captionPreview: caption.slice(0, 140) });
       return null;
     }
   }
@@ -955,7 +992,8 @@ export class ShortsWorkflow {
     }
     try {
       return await this.telegram.sendDocument(chatId, path, caption, replyMarkup);
-    } catch {
+    } catch (error) {
+      logError('Telegram sendDocument failed', error, { chatId, path, captionPreview: caption.slice(0, 140) });
       return null;
     }
   }
@@ -966,7 +1004,8 @@ export class ShortsWorkflow {
     }
     try {
       await this.telegram.answerCallbackQuery(input);
-    } catch {
+    } catch (error) {
+      logError('Telegram answerCallbackQuery failed', error, { callbackQueryId: input.callback_query_id, text: input.text });
       return;
     }
   }
@@ -977,7 +1016,8 @@ export class ShortsWorkflow {
     }
     try {
       await this.telegram.deleteMessage(chatId, messageId);
-    } catch {
+    } catch (error) {
+      logError('Telegram deleteMessage failed', error, { chatId, messageId });
       return;
     }
   }
@@ -996,7 +1036,8 @@ export class ShortsWorkflow {
     }
     try {
       await this.telegram.editMessageText(chatId, messageId, text, replyMarkup);
-    } catch {
+    } catch (error) {
+      logError('Telegram editMessageText failed', error, { chatId, messageId, textPreview: text.slice(0, 140) });
       return;
     }
   }

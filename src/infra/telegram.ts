@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
+import { describeError, logError } from './util.js';
 
 export interface TelegramMessage {
   message_id: number;
@@ -115,13 +116,22 @@ export class TelegramApi implements TelegramGateway {
   }
 
   private async callJson<T>(method: string, init: RequestInit): Promise<T> {
-    const response = await fetch(`${this.baseUrl}/${method}`, {
-      ...init,
-      headers: {
-        'content-type': 'application/json',
-        ...(init.headers ?? {}),
-      },
-    });
+    const url = `${this.baseUrl}/${method}`;
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        ...init,
+        headers: {
+          'content-type': 'application/json',
+          ...(init.headers ?? {}),
+        },
+      });
+    } catch (error) {
+      if (!shouldSuppressTelegramRequestError(method, error)) {
+        logError(`Telegram ${method} request failed`, error, { url });
+      }
+      throw error;
+    }
     const payload = await response.json().catch(() => undefined) as { ok?: boolean; description?: string } & T;
     if (!response.ok || payload?.ok === false) {
       throw new Error(payload?.description || `${method} failed with ${response.status}`);
@@ -130,14 +140,31 @@ export class TelegramApi implements TelegramGateway {
   }
 
   private async callForm<T>(method: string, form: FormData): Promise<T> {
-    const response = await fetch(`${this.baseUrl}/${method}`, {
-      method: 'POST',
-      body: form,
-    });
+    const url = `${this.baseUrl}/${method}`;
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        body: form,
+      });
+    } catch (error) {
+      if (!shouldSuppressTelegramRequestError(method, error)) {
+        logError(`Telegram ${method} request failed`, error, { url });
+      }
+      throw error;
+    }
     const payload = await response.json().catch(() => undefined) as { ok?: boolean; description?: string } & T;
     if (!response.ok || payload?.ok === false) {
       throw new Error(payload?.description || `${method} failed with ${response.status}`);
     }
     return payload;
   }
+}
+
+function shouldSuppressTelegramRequestError(method: string, error: unknown): boolean {
+  if (method !== 'getUpdates') {
+    return false;
+  }
+  const message = describeError(error);
+  return message.includes('UND_ERR_INFO') || message.includes('stream timeout') || message.includes('ECONNRESET');
 }
