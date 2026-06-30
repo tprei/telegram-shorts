@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildInstagramReelDescription, buildMallaryInstagramReelPayload, mallaryMimeType } from '../src/infra/mallary.js';
+import { buildInstagramReelDescription, buildMallaryInstagramReelPayload, mallaryMimeType, parseMallaryRetryAfterSeconds } from '../src/infra/mallary.js';
 
 test('instagram reel description removes irrelevant platform/meta tags only', () => {
   const description = buildInstagramReelDescription({
@@ -41,4 +41,16 @@ test('mallary mime type supports video and image uploads', () => {
   assert.equal(mallaryMimeType('/tmp/video.mov'), 'video/quicktime');
   assert.equal(mallaryMimeType('/tmp/cover.jpg'), 'image/jpeg');
   assert.equal(mallaryMimeType('/tmp/cover.png'), 'image/png');
+});
+
+test('mallary throttle payload exposes retry-after seconds', () => {
+  const retryAfter = parseMallaryRetryAfterSeconds(JSON.stringify({
+    status: 'error',
+    error: {
+      code: 'trial_posting_throttled',
+      details: { retry_after: 234 },
+    },
+  }));
+  assert.equal(retryAfter, 234);
+  assert.equal(parseMallaryRetryAfterSeconds('{"error":{"code":"other"}}'), null);
 });

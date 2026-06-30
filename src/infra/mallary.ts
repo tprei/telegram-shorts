@@ -1,8 +1,8 @@
 import { basename, extname } from 'node:path';
 import { readFile, unlink } from 'node:fs/promises';
 import { Candidate, InstagramReelCopy } from '../domain/model.js';
-import type { InstagramPublishInput, InstagramPublishProvider, InstagramPublishResult } from './instagram-publisher.js';
-import { InstagramPublishError } from './instagram-publisher.js';
+import type { ShortVideoPlatform, ShortVideoPublishInput, ShortVideoPublishProvider, ShortVideoPublishResult } from './instagram-publisher.js';
+import { ShortVideoPublishError } from './instagram-publisher.js';
 import { runProcess } from './process.js';
 import { logError } from './util.js';
 
@@ -41,7 +41,7 @@ export class MallaryUploadClient {
       });
     } catch (error) {
       logError('Mallary media upload failed', error, { path, uploadUrl: upload.uploadUrl, type: mallaryMimeType(path) });
-      throw new InstagramPublishError({
+      throw new ShortVideoPublishError({
         provider: 'mallary',
         stage: 'upload',
         message: `Mallary media upload failed for ${path}`,
@@ -66,7 +66,7 @@ export class MallaryUploadClient {
       });
     } catch (error) {
       logError('Mallary upload URL request failed', error, input);
-      throw new InstagramPublishError({
+      throw new ShortVideoPublishError({
         provider: 'mallary',
         stage: 'upload',
         message: 'Mallary upload URL request failed.',
@@ -77,7 +77,7 @@ export class MallaryUploadClient {
     response = await assertOk('mallary', 'upload', 'Mallary upload URL request failed')(response);
     const json = await response.json() as { uploadUrl?: string; mediaUrl?: string; headers?: Record<string, string> };
     if (!json.uploadUrl || !json.mediaUrl) {
-      throw new InstagramPublishError({
+      throw new ShortVideoPublishError({
         provider: 'mallary',
         stage: 'upload',
         message: 'Mallary upload URL response was incomplete.',
@@ -92,12 +92,9 @@ export class MallaryUploadClient {
   }
 }
 
-export class MallaryClient implements InstagramPublishProvider {
+export class MallaryClient implements ShortVideoPublishProvider {
   readonly name = 'mallary';
-  readonly capabilities = {
-    commentsUnderPostMax: 3,
-    customThumbnail: true,
-  } as const;
+  readonly supportedPlatforms: ShortVideoPlatform[] = ['instagram', 'tiktok', 'youtube_shorts'];
   private readonly uploadClient: MallaryUploadClient;
 
   constructor(
@@ -107,11 +104,19 @@ export class MallaryClient implements InstagramPublishProvider {
     this.uploadClient = new MallaryUploadClient(apiToken);
   }
 
-  async publishInstagramReel(input: InstagramPublishInput): Promise<InstagramPublishResult> {
+  supports(platform: ShortVideoPlatform): boolean {
+    return this.supportedPlatforms.includes(platform);
+  }
+
+  async publishShortVideo(input: ShortVideoPublishInput): Promise<ShortVideoPublishResult> {
     const upload = await this.uploadClient.uploadFile(input.filePath);
-    const thumbnailUpload = input.thumbnailPath ? await this.uploadClient.uploadFile(input.thumbnailPath) : null;
-    const payload = buildMallaryInstagramReelPayload({
+    const thumbnailUpload = input.platform === 'instagram' && input.thumbnailPath
+      ? await this.uploadClient.uploadFile(input.thumbnailPath)
+      : null;
+    const payload = buildMallaryShortVideoPayload({
+      platform: input.platform,
       message: input.message,
+      title: input.title,
       mediaUrl: upload.mediaUrl,
       mediaType: mallaryMimeType(input.filePath),
       profileId: this.profileId,
@@ -131,11 +136,12 @@ export class MallaryClient implements InstagramPublishProvider {
       });
     } catch (error) {
       logError('Mallary create post request failed', error, {
+        platform: input.platform,
         filePath: input.filePath,
         hasThumbnail: Boolean(input.thumbnailPath),
         commentsUnderPostCount: input.commentsUnderPost?.length ?? 0,
       });
-      throw new InstagramPublishError({
+      throw new ShortVideoPublishError({
         provider: this.name,
         stage: 'create',
         message: 'Mallary create post request failed.',
@@ -147,6 +153,7 @@ export class MallaryClient implements InstagramPublishProvider {
     const json = await response.json() as { status?: string; batch_id?: string; jobs?: Array<{ platform?: string; jobId?: string }> };
     return {
       provider: this.name,
+      platform: input.platform,
       status: json.status ?? 'unknown',
       batchId: json.batch_id ?? null,
       jobs: (json.jobs ?? []).map((job) => ({ platform: String(job.platform ?? ''), jobId: String(job.jobId ?? '') })).filter((job) => job.platform.length > 0 && job.jobId.length > 0),
@@ -176,6 +183,57 @@ export function buildMallaryInstagramReelPayload(input: {
     platform_options: {
       instagram: {
         post_type: 'reel',
+      },
+    },
+  };
+}
+
+function buildMallaryShortVideoPayload(input: {
+  platform: ShortVideoPlatform;
+  message: string;
+  title?: string | null;
+  mediaUrl: string;
+  mediaType: string;
+  profileId?: string | null;
+  thumbnailUrl?: string | null;
+  commentsUnderPost?: string[];
+}): Record<string, unknown> {
+  if (input.platform === 'instagram') {
+    return buildMallaryInstagramReelPayload(input);
+  }
+  if (input.platform === 'tiktok') {
+    return {
+      message: input.message,
+      platforms: ['tiktok'],
+      ...(input.profileId ? { profile_id: input.profileId } : {}),
+      media: [{
+        url: input.mediaUrl,
+        type: input.mediaType,
+      }],
+      platform_options: {
+        tiktok: {
+          post_type: 'video',
+          post_mode: 'DIRECT_POST',
+          source: 'FILE_UPLOAD',
+        },
+      },
+    };
+  }
+  return {
+    message: input.message,
+    platforms: ['youtube'],
+    ...(input.profileId ? { profile_id: input.profileId } : {}),
+    media: [{
+      url: input.mediaUrl,
+      type: input.mediaType,
+    }],
+    platform_options: {
+      youtube: {
+        post_type: 'shorts',
+        title: input.title ?? 'Shorts',
+        visibility: 'public',
+        categoryId: '22',
+        madeForKids: false,
       },
     },
   };
@@ -281,17 +339,35 @@ export function mallaryMimeType(path: string): string {
   return 'application/octet-stream';
 }
 
+export function parseMallaryRetryAfterSeconds(bodyText: string): number | null {
+  try {
+    const payload = JSON.parse(bodyText) as {
+      error?: { code?: string; details?: { retry_after?: number | string } };
+    };
+    if (payload.error?.code !== 'trial_posting_throttled') {
+      return null;
+    }
+    const retryAfter = payload.error.details?.retry_after;
+    const numeric = typeof retryAfter === 'number' ? retryAfter : typeof retryAfter === 'string' ? Number(retryAfter) : NaN;
+    return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
+  } catch {
+    return null;
+  }
+}
+
 function assertOk(provider: string, stage: 'upload' | 'create', message: string) {
   return async (response: Response): Promise<Response> => {
     if (response.ok) {
       return response;
     }
     const text = await response.text().catch(() => '');
-    throw new InstagramPublishError({
+    const retryAfterSeconds = provider === 'mallary' && response.status === 429 ? parseMallaryRetryAfterSeconds(text) : null;
+    throw new ShortVideoPublishError({
       provider,
       stage,
       message: `${message}: ${response.status} ${text}`.trim(),
-      safeToFailover: response.status < 500,
+      safeToFailover: retryAfterSeconds === null && response.status < 500,
+      retryAfterSeconds,
     });
   };
 }

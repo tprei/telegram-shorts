@@ -14,6 +14,7 @@ const LayoutProfileSchema = z.strictObject({
   version: z.literal(1),
   creatorId: z.string().min(1),
   layoutId: z.string().min(1),
+  defaultPlaybackSpeed: z.number().positive().max(1.5).optional(),
   regions: z.array(z.strictObject({
     id: z.string().min(1),
     sourceRect: RectSchema,

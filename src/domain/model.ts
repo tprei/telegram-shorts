@@ -20,7 +20,8 @@ export type QueueTaskKind =
   | 'render_draft'
   | 'apply_revision'
   | 'render_final'
-  | 'publish_instagram';
+  | 'publish_instagram'
+  | 'publish_short_video';
 
 export type TranscriptProvider = 'deepgram' | 'scribe';
 
@@ -178,6 +179,7 @@ export interface QueueTask {
   status: 'queued' | 'running' | 'done' | 'failed';
   payload: Record<string, unknown>;
   createdAt: string;
+  availableAt: string | null;
   startedAt: string | null;
   error: string | null;
 }
@@ -287,6 +289,7 @@ export interface LayoutProfile {
   version: 1;
   creatorId: string;
   layoutId: string;
+  defaultPlaybackSpeed?: number;
   regions: LayoutRegion[];
   subtitleSafeArea: SubtitleSafeArea;
 }

@@ -149,6 +149,41 @@ test('candidate version from semantic blocks prefers argument arc over chapter s
   assert.equal(version.candidates[0]?.seamCount, 0);
 });
 
+test('candidate version can inherit a default playback speed from the profile', () => {
+  const blocks = materializeSemanticBlocks(sentences, {
+    blocks: [
+      { id: 'b_001', kind: 'hook', summary: 'setup', start_sentence_id: 's_0001', end_sentence_id: 's_0001' },
+      { id: 'b_002', kind: 'turn', summary: 'turn', start_sentence_id: 's_0002', end_sentence_id: 's_0002' },
+      { id: 'b_003', kind: 'evidence', summary: 'evidence', start_sentence_id: 's_0003', end_sentence_id: 's_0003' },
+      { id: 'b_004', kind: 'payoff', summary: 'payoff', start_sentence_id: 's_0004', end_sentence_id: 's_0005' },
+    ],
+  });
+  const plan = {
+    candidates: [{
+      title: 'Velocidade maior',
+      summary: 'x',
+      hook: 'x',
+      payoff: 'x',
+      rationale: 'x',
+      thesis: 'x',
+      risk: 'medium' as const,
+      block_ids: ['b_001', 'b_002', 'b_003', 'b_004'],
+      steps: [
+        { kind: 'hook' as const, label: 'setup', block_ids: ['b_001'] },
+        { kind: 'turn' as const, label: 'virada', block_ids: ['b_002'] },
+        { kind: 'evidence' as const, label: 'evidence', block_ids: ['b_003'] },
+        { kind: 'payoff' as const, label: 'payoff', block_ids: ['b_004'] },
+      ],
+    }],
+  };
+  const normal = buildCandidateVersionFromBlocks('job_1', 1, null, 'initial', sentences, blocks, plan);
+  const faster = buildCandidateVersionFromBlocks('job_1', 1, null, 'initial', sentences, blocks, plan, 1.5);
+  assert.equal(normal.candidates.length, 1);
+  assert.equal(faster.candidates.length, 1);
+  assert.equal(faster.candidates[0]?.playbackSpeed, 1.5);
+  assert.ok((faster.candidates[0]?.durationSeconds ?? 0) < (normal.candidates[0]?.durationSeconds ?? 0));
+});
+
 function sentence(id: string, index: number, startSeconds: number, endSeconds: number, text: string): TranscriptSentence {
   return { id, index, speakerId: 'speaker_0', startSeconds, endSeconds, text };
 }

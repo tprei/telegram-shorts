@@ -2,6 +2,7 @@
   "version": 1,
   "creatorId": "filipe_boni",
   "layoutId": "source-left-host-right-stack-v1",
+  "defaultPlaybackSpeed": 1.5,
   "regions": [
     {
       "id": "source-top",

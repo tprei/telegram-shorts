@@ -5,7 +5,7 @@ import { applyResolvedInsert, applyRevision, buildSentences, detectStrongSpeaker
 import { buildCandidateVersionFromBlocks, diagnoseCandidatePlan, fallbackSemanticBlocks, materializeSemanticBlocks, semanticBlocksAreUsable } from '../domain/semantic.js';
 import { ShortsStore } from '../infra/db.js';
 import { AppConfig } from '../infra/env.js';
-import { type InstagramPublishProvider } from '../infra/instagram-publisher.js';
+import { ShortVideoPublishError, type ShortVideoPlatform, type ShortVideoPublishProvider } from '../infra/instagram-publisher.js';
 import { createInstagramPublishProvider } from '../infra/instagram-publisher-factory.js';
 import { loadLayoutProfile } from '../infra/layout.js';
 import { OpenRouterClient } from '../infra/openrouter.js';
@@ -18,7 +18,7 @@ import { createId, logError, nowIso } from '../infra/util.js';
 import { assertPublicYouTubeUrl, downloadSource } from '../infra/youtube.js';
 
 export class ShortsWorkflow {
-  private readonly instagramPublisher: InstagramPublishProvider | null;
+  private readonly shortVideoPublisher: ShortVideoPublishProvider | null;
 
   constructor(
     private readonly config: AppConfig,
@@ -26,7 +26,7 @@ export class ShortsWorkflow {
     private readonly telegram: TelegramGateway | null,
     private readonly openRouter: OpenRouterClient,
   ) {
-    this.instagramPublisher = createInstagramPublishProvider(config);
+    this.shortVideoPublisher = createInstagramPublishProvider(config);
   }
 
   async handleUpdate(raw: unknown): Promise<void> {
@@ -63,17 +63,37 @@ export class ShortsWorkflow {
         await this.renderFinal(task);
       } else if (task.kind === 'publish_instagram') {
         await this.publishInstagram(task);
+      } else if (task.kind === 'publish_short_video') {
+        await this.publishShortVideo(task);
       }
       this.store.completeTask(task);
       return true;
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.store.failTask(task, message);
-      if (task.kind === 'publish_instagram') {
+      const platform = typeof task.payload.platform === 'string' ? task.payload.platform : 'instagram';
+      if ((task.kind === 'publish_instagram' || task.kind === 'publish_short_video') && error instanceof ShortVideoPublishError && error.provider === 'mallary' && error.retryAfterSeconds) {
+        const availableAt = futureIso(error.retryAfterSeconds);
+        this.store.setSetting(mallaryCooldownKey(platform), availableAt);
+        this.store.rescheduleTask(task, availableAt, error.message);
         const job = this.store.getJob(task.jobId);
         if (job) {
-          this.store.appendAction(job.id, 'instagram_publish_failed', { error: message, payload: task.payload });
-          await this.safeSendMessage(job.operatorChatId, `Falha ao publicar Reel no Instagram: ${message}`);
+          this.store.appendAction(job.id, 'short_video_publish_deferred', {
+            provider: error.provider,
+            platform,
+            retryAfterSeconds: error.retryAfterSeconds,
+            availableAt,
+            payload: task.payload,
+          });
+          await this.safeSendMessage(job.operatorChatId, `${platformLabel(platform)} em fila no Mallary. Vou tentar de novo em ${formatDelay(error.retryAfterSeconds)}.`);
+        }
+        return true;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      this.store.failTask(task, message);
+      if (task.kind === 'publish_instagram' || task.kind === 'publish_short_video') {
+        const job = this.store.getJob(task.jobId);
+        if (job) {
+          this.store.appendAction(job.id, 'short_video_publish_failed', { error: message, payload: task.payload, platform });
+          await this.safeSendMessage(job.operatorChatId, `Falha ao publicar em ${platformLabel(platform)}: ${message}`);
         }
         return true;
       }
@@ -304,7 +324,7 @@ export class ShortsWorkflow {
       this.store.markProcessedCallback(callback.id);
       return;
     }
-    if (payload.kind !== 'publish_instagram' && payload.candidateVersionId && job.currentCandidateVersionId !== payload.candidateVersionId) {
+    if (!['publish_instagram', 'publish_everywhere'].includes(payload.kind) && payload.candidateVersionId && job.currentCandidateVersionId !== payload.candidateVersionId) {
       await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Essa versão está desatualizada.', show_alert: true });
       this.store.markProcessedCallback(callback.id);
       return;
@@ -387,32 +407,52 @@ export class ShortsWorkflow {
       this.store.markProcessedCallback(callback.id);
       return;
     }
-    if (payload.kind === 'publish_instagram' && payload.renderId && payload.candidateId && payload.candidateVersionId) {
+    if ((payload.kind === 'publish_instagram' || payload.kind === 'publish_everywhere') && payload.renderId && payload.candidateId && payload.candidateVersionId) {
       const render = this.store.getRender(payload.renderId);
       const force = payload.force === true;
-      if (!this.instagramPublisher) {
-        await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Nenhum provedor de publicação do Instagram configurado.', show_alert: true });
+      if (!this.shortVideoPublisher) {
+        await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Nenhum provedor de publicação curto configurado.', show_alert: true });
         this.store.markProcessedCallback(callback.id);
         return;
       }
-      if (this.store.hasTaskForJob(job.id, 'publish_instagram', ['queued', 'running'])) {
-        await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Já existe uma publicação do Instagram em andamento.', show_alert: true });
-        this.store.markProcessedCallback(callback.id);
-        return;
+      const platforms: ShortVideoPlatform[] = payload.kind === 'publish_everywhere'
+        ? this.availableShortVideoPlatforms()
+        : this.availableShortVideoPlatforms().filter((platform) => platform === 'instagram');
+      const unavailable = payload.kind === 'publish_everywhere'
+        ? this.unavailableShortVideoPlatforms()
+        : [];
+      const enqueued: string[] = [];
+      const delayed: string[] = [];
+      const skipped: string[] = [];
+      for (const platform of platforms) {
+        const enqueueResult = this.enqueueShortVideoPublish(job.id, {
+          platform,
+          renderId: payload.renderId,
+          candidateId: payload.candidateId,
+          candidateVersionId: payload.candidateVersionId,
+          force,
+        });
+        if (enqueueResult === 'enqueued') {
+          enqueued.push(platformLabel(platform));
+        } else if (enqueueResult === 'delayed') {
+          delayed.push(platformLabel(platform));
+        } else {
+          skipped.push(platformLabel(platform));
+        }
       }
-      if (!force && this.store.hasTaskForRender(job.id, 'publish_instagram', payload.renderId, ['queued', 'running', 'done'])) {
-        await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Esse render já foi publicado no Instagram. Use “Forçar repost no Instagram” para repetir.', show_alert: true });
-        await this.safeDeleteDraftMessage(job.operatorChatId, render?.telegramMessageId ?? null);
-        this.store.markProcessedCallback(callback.id);
-        return;
-      }
-      this.store.enqueueTask(job.id, 'publish_instagram', {
-        candidateId: payload.candidateId,
-        candidateVersionId: payload.candidateVersionId,
-        renderId: payload.renderId,
-        force,
-      });
-      await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: force ? 'Forçando repost do Reel no Instagram.' : 'Enviando Reel para o Instagram.' });
+      const responseText = enqueued.length === 0 && delayed.length === 0
+        ? unavailable.length > 0
+          ? `Nada enfileirado. Indisponível: ${unavailable.map((platform) => platformLabel(platform)).join(', ')}.`
+          : force
+            ? 'Nada novo foi enfileirado; use um render diferente para repostar.'
+            : 'Esses destinos já foram solicitados para esse render.'
+        : [
+            enqueued.length > 0 ? `Enfileirado: ${enqueued.join(', ')}.` : '',
+            delayed.length > 0 ? `Na fila por limite temporário: ${delayed.join(', ')}.` : '',
+            skipped.length > 0 ? `Já existia: ${skipped.join(', ')}.` : '',
+            unavailable.length > 0 ? `Indisponível: ${unavailable.map((platform) => platformLabel(platform)).join(', ')}.` : '',
+          ].filter(Boolean).join(' ');
+      await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: responseText, show_alert: enqueued.length === 0 && delayed.length === 0 });
       await this.safeDeleteDraftMessage(job.operatorChatId, render?.telegramMessageId ?? null);
       this.store.markProcessedCallback(callback.id);
       return;
@@ -499,6 +539,8 @@ export class ShortsWorkflow {
       end_seconds: block.endSeconds,
       text: block.text,
     }));
+    const layoutProfile = await loadLayoutProfile(this.config.TELEGRAM_SHORTS_STATIC_LAYOUT_PATH, this.config.rootDir);
+    const defaultPlaybackSpeed = layoutProfile?.defaultPlaybackSpeed ?? 1;
     let opportunities = await this.openRouter.findOpportunities({
       title: job.sourceTitle,
       blocks: blockPayload,
@@ -512,10 +554,10 @@ export class ShortsWorkflow {
     });
     const rawPlanPath = join(jobDir, 'candidate-plan.raw.json');
     await writeFile(rawPlanPath, `${JSON.stringify(plan, null, 2)}\n`, 'utf-8');
-    let diagnostics = diagnoseCandidatePlan(job.transcriptSentences, blocks, plan);
+    let diagnostics = diagnoseCandidatePlan(job.transcriptSentences, blocks, plan, defaultPlaybackSpeed);
     const diagnosticsPath = join(jobDir, 'candidate-plan.validation.json');
     await writeFile(diagnosticsPath, `${JSON.stringify({ candidates: diagnostics }, null, 2)}\n`, 'utf-8');
-    let version = buildCandidateVersionFromBlocks(job.id, this.store.latestCandidateVersionNumber(job.id) + 1, job.currentCandidateVersionId, job.currentCandidateVersionId ? 'revision' : 'initial', job.transcriptSentences, blocks, plan);
+    let version = buildCandidateVersionFromBlocks(job.id, this.store.latestCandidateVersionNumber(job.id) + 1, job.currentCandidateVersionId, job.currentCandidateVersionId ? 'revision' : 'initial', job.transcriptSentences, blocks, plan, defaultPlaybackSpeed);
     if (version.candidates.length === 0) {
       opportunities = await this.openRouter.repairOpportunityPlan({
         title: job.sourceTitle,
@@ -532,10 +574,10 @@ export class ShortsWorkflow {
       });
       const repairedPlanPath = join(jobDir, 'candidate-plan.repair.raw.json');
       await writeFile(repairedPlanPath, `${JSON.stringify(plan, null, 2)}\n`, 'utf-8');
-      diagnostics = diagnoseCandidatePlan(job.transcriptSentences, blocks, plan);
+      diagnostics = diagnoseCandidatePlan(job.transcriptSentences, blocks, plan, defaultPlaybackSpeed);
       const repairedDiagnosticsPath = join(jobDir, 'candidate-plan.repair.validation.json');
       await writeFile(repairedDiagnosticsPath, `${JSON.stringify({ candidates: diagnostics }, null, 2)}\n`, 'utf-8');
-      version = buildCandidateVersionFromBlocks(job.id, this.store.latestCandidateVersionNumber(job.id) + 1, job.currentCandidateVersionId, job.currentCandidateVersionId ? 'revision' : 'initial', job.transcriptSentences, blocks, plan);
+      version = buildCandidateVersionFromBlocks(job.id, this.store.latestCandidateVersionNumber(job.id) + 1, job.currentCandidateVersionId, job.currentCandidateVersionId ? 'revision' : 'initial', job.transcriptSentences, blocks, plan, defaultPlaybackSpeed);
     }
     if (version.candidates.length === 0) {
       const reasonSummary = diagnostics.map((entry) => `#${entry.index + 1} ${entry.title}: ${entry.reasons.join('; ') || 'no diagnostic reason'}`).join(' | ');
@@ -734,33 +776,45 @@ export class ShortsWorkflow {
   }
 
   private async publishInstagram(task: QueueTask): Promise<void> {
-    if (!this.instagramPublisher) {
-      throw new Error('An Instagram publish provider is required to publish Instagram Reels.');
+    await this.publishShortVideoTask(task, 'instagram');
+  }
+
+  private async publishShortVideo(task: QueueTask): Promise<void> {
+    const platform = typeof task.payload.platform === 'string' ? task.payload.platform as ShortVideoPlatform : null;
+    if (!platform) {
+      throw new Error('Short-video publish target is incomplete.');
+    }
+    await this.publishShortVideoTask(task, platform);
+  }
+
+  private async publishShortVideoTask(task: QueueTask, platform: ShortVideoPlatform): Promise<void> {
+    if (!this.shortVideoPublisher || !this.shortVideoPublisher.supports(platform)) {
+      throw new Error(`No provider configured for ${platform}.`);
     }
     const job = this.requireJob(task.jobId);
     const renderId = typeof task.payload.renderId === 'string' ? task.payload.renderId : null;
     const candidateId = typeof task.payload.candidateId === 'string' ? task.payload.candidateId : null;
     const candidateVersionId = typeof task.payload.candidateVersionId === 'string' ? task.payload.candidateVersionId : null;
     if (!renderId || !candidateId || !candidateVersionId) {
-      throw new Error('Instagram publish target is incomplete.');
+      throw new Error(`${platform} publish target is incomplete.`);
     }
     const render = this.store.getRender(renderId);
     if (!render || render.kind !== 'final') {
-      throw new Error('Final render not found for Instagram publish.');
+      throw new Error('Final render not found for short-video publish.');
     }
     const version = this.requireCandidateVersion(candidateVersionId);
     const candidate = version.candidates.find((entry) => entry.id === candidateId);
     if (!candidate) {
-      throw new Error('Candidate not found for Instagram publish.');
+      throw new Error('Candidate not found for short-video publish.');
     }
     const copy = await this.openRouter.writeInstagramReelDescription({ candidate });
     const layoutProfile = await loadLayoutProfile(this.config.TELEGRAM_SHORTS_STATIC_LAYOUT_PATH, this.config.rootDir);
-    const instagramRender = await renderCandidate({
+    const publishRender = await renderCandidate({
       jobId: job.id,
       candidate,
-      candidateVersionId: `${candidateVersionId}-instagram-prod`,
+      candidateVersionId: `${candidateVersionId}-social-prod`,
       kind: 'final',
-      sourceVideoPath: job.sourceVideoPath ?? (() => { throw new Error('sourceVideoPath missing for Instagram publish.'); })(),
+      sourceVideoPath: job.sourceVideoPath ?? (() => { throw new Error('sourceVideoPath missing for short-video publish.'); })(),
       sourceTitle: job.sourceTitle ?? 'Vídeo original',
       sourceThumbnailPath: job.sourceThumbnailPath,
       transcriptWords: job.transcriptWords,
@@ -769,33 +823,37 @@ export class ShortsWorkflow {
       artifactsDir: this.config.artifactsDir,
       renderTier: 'prod',
     });
-    const instagramCoverPath = await createInstagramCoverImage({
-      sourceVideoPath: job.sourceVideoPath ?? (() => { throw new Error('sourceVideoPath missing for Instagram cover.'); })(),
-      sourceThumbnailPath: job.sourceThumbnailPath,
-      candidate,
-      outputPath: `${instagramRender.artifactPath}.cover.jpg`,
+    const coverPath = platform === 'instagram'
+      ? await createInstagramCoverImage({
+          sourceVideoPath: job.sourceVideoPath ?? (() => { throw new Error('sourceVideoPath missing for Instagram cover.'); })(),
+          sourceThumbnailPath: job.sourceThumbnailPath,
+          candidate,
+          outputPath: `${publishRender.artifactPath}.cover.jpg`,
+        })
+      : null;
+    const message = buildInstagramReelDescription(copy);
+    const result = await this.shortVideoPublisher.publishShortVideo({
+      platform,
+      filePath: publishRender.artifactPath,
+      message,
+      title: platform === 'youtube_shorts' ? candidate.title : null,
+      idempotencyKey: `telegram-shorts-${platform}-${render.id}`,
+      thumbnailPath: coverPath,
+      commentsUnderPost: this.buildCommentsUnderPost(platform, job.sourceUrl),
     });
-    const commentsUnderPost = this.buildInstagramCommentsUnderPost(job.sourceUrl);
-    const result = await this.instagramPublisher.publishInstagramReel({
-      filePath: instagramRender.artifactPath,
-      message: buildInstagramReelDescription(copy),
-      idempotencyKey: `telegram-shorts-instagram-${render.id}`,
-      thumbnailPath: instagramCoverPath,
-      commentsUnderPost,
-    });
-    this.store.appendAction(job.id, 'instagram_publish_enqueued', {
+    this.store.appendAction(job.id, 'short_video_publish_enqueued', {
+      platform,
       candidateId,
       renderId,
       forced: task.payload.force === true,
-      instagramArtifactPath: instagramRender.artifactPath,
-      instagramCoverPath,
+      artifactPath: publishRender.artifactPath,
+      coverPath,
       provider: result.provider,
-      commentsUnderPost,
       batchId: result.batchId,
       jobs: result.jobs,
     });
     const jobIds = result.jobs.map((entry) => `${entry.platform}:${entry.jobId}`).join(', ');
-    await this.safeSendMessage(job.operatorChatId, `Reel enviado para a fila do Instagram via ${result.provider}. Batch ${result.batchId ?? 'n/a'}${jobIds ? ` · ${jobIds}` : ''}`);
+    await this.safeSendMessage(job.operatorChatId, `${platformLabel(platform)} enviado via ${result.provider}. Batch ${result.batchId ?? 'n/a'}${jobIds ? ` · ${jobIds}` : ''}`);
   }
 
   private async sendSpeakerPrompt(job: JobRecord): Promise<void> {
@@ -878,22 +936,90 @@ export class ShortsWorkflow {
   }
 
   private finalButtons(jobId: string, candidateVersionId: string, candidateId: string, renderId: string): Record<string, unknown> | undefined {
-    if (!this.instagramPublisher) {
+    if (!this.shortVideoPublisher) {
       return undefined;
     }
-    return {
-      inline_keyboard: [
-        [
-          { text: 'Postar Reel no Instagram', callback_data: this.store.createCallbackToken({ kind: 'publish_instagram', jobId, candidateId, candidateVersionId, renderId }) },
-        ],
-        [
-          { text: 'Forçar repost no Instagram', callback_data: this.store.createCallbackToken({ kind: 'publish_instagram', jobId, candidateId, candidateVersionId, renderId, force: true }) },
-        ],
-      ],
-    };
+    const availablePlatforms = this.availableShortVideoPlatforms();
+    const supportsInstagram = availablePlatforms.includes('instagram');
+    const supportsAnywhere = availablePlatforms.length > 0;
+    const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+    if (supportsAnywhere) {
+      rows.push([
+        { text: 'Postar em todo lugar', callback_data: this.store.createCallbackToken({ kind: 'publish_everywhere', jobId, candidateId, candidateVersionId, renderId }) },
+      ]);
+      rows.push([
+        { text: 'Forçar repost em todo lugar', callback_data: this.store.createCallbackToken({ kind: 'publish_everywhere', jobId, candidateId, candidateVersionId, renderId, force: true }) },
+      ]);
+    }
+    if (supportsInstagram) {
+      rows.push([
+        { text: 'Postar Reel no Instagram', callback_data: this.store.createCallbackToken({ kind: 'publish_instagram', jobId, candidateId, candidateVersionId, renderId }) },
+      ]);
+      rows.push([
+        { text: 'Forçar repost no Instagram', callback_data: this.store.createCallbackToken({ kind: 'publish_instagram', jobId, candidateId, candidateVersionId, renderId, force: true }) },
+      ]);
+    }
+    return rows.length > 0 ? { inline_keyboard: rows } : undefined;
   }
 
-  private buildInstagramCommentsUnderPost(sourceUrl: string | null): string[] {
+  private enqueueShortVideoPublish(jobId: string, input: { platform: ShortVideoPlatform; candidateId: string; candidateVersionId: string; renderId: string; force: boolean }): 'enqueued' | 'delayed' | 'skipped' {
+    if (!input.force && this.store.hasTaskForRenderPlatform(jobId, 'publish_short_video', input.renderId, input.platform, ['queued', 'running', 'done'])) {
+      return 'skipped';
+    }
+    const cooldownUntil = this.activeMallaryCooldownUntil(input.platform);
+    if (cooldownUntil) {
+      this.store.enqueueTask(jobId, 'publish_short_video', input, { availableAt: cooldownUntil });
+      return 'delayed';
+    }
+    this.store.enqueueTask(jobId, 'publish_short_video', input);
+    return 'enqueued';
+  }
+
+  private availableShortVideoPlatforms(): ShortVideoPlatform[] {
+    return this.configuredShortVideoPlatforms().filter((platform) => this.shortVideoPublisher?.supports(platform));
+  }
+
+  private unavailableShortVideoPlatforms(): ShortVideoPlatform[] {
+    const configured = this.configuredShortVideoPlatforms();
+    const all: ShortVideoPlatform[] = ['instagram', 'tiktok', 'youtube_shorts'];
+    return all.filter((platform) => !configured.includes(platform));
+  }
+
+  private configuredShortVideoPlatforms(): ShortVideoPlatform[] {
+    const configured: ShortVideoPlatform[] = [];
+    if (this.shortVideoPublisher?.supports('instagram') && (this.config.MALLARY_AI_API_TOKEN || (this.config.BUFFER_API_KEY && this.config.BUFFER_INSTAGRAM_CHANNEL_ID))) {
+      configured.push('instagram');
+    }
+    if (this.shortVideoPublisher?.supports('tiktok') && (this.config.BUFFER_API_KEY && this.config.BUFFER_TIKTOK_CHANNEL_ID)) {
+      configured.push('tiktok');
+    }
+    if (this.shortVideoPublisher?.supports('youtube_shorts') && (this.config.BUFFER_API_KEY && this.config.BUFFER_YOUTUBE_CHANNEL_ID)) {
+      configured.push('youtube_shorts');
+    }
+    return configured;
+  }
+
+  private activeMallaryCooldownUntil(platform: ShortVideoPlatform): string | null {
+    if (!this.shouldUseMallaryCooldown(platform)) {
+      return null;
+    }
+    const value = this.store.getSetting(mallaryCooldownKey(platform));
+    if (!value) {
+      return null;
+    }
+    return value > nowIso() ? value : null;
+  }
+
+  private shouldUseMallaryCooldown(platform: ShortVideoPlatform): boolean {
+    return platform === 'instagram'
+      && Boolean(this.config.MALLARY_AI_API_TOKEN)
+      && preferredProvidersForPlatform(this.config, platform)[0] === 'mallary';
+  }
+
+  private buildCommentsUnderPost(platform: ShortVideoPlatform, sourceUrl: string | null): string[] {
+    if (platform !== 'instagram') {
+      return [];
+    }
     const normalized = sourceUrl?.trim();
     if (!normalized) {
       return [];
@@ -1038,8 +1164,52 @@ export class ShortsWorkflow {
   }
 }
 
+function futureIso(delaySeconds: number): string {
+  return new Date(Date.now() + delaySeconds * 1000).toISOString();
+}
+
+function mallaryCooldownKey(platform: string): string {
+  return `cooldown:mallary:${platform}`;
+}
+
+function preferredProvidersForPlatform(config: AppConfig, platform: ShortVideoPlatform): Array<'mallary' | 'buffer'> {
+  if (platform === 'instagram') {
+    const providers = config.TELEGRAM_SHORTS_INSTAGRAM_PUBLISH_PROVIDERS
+      .split(',')
+      .map((entry) => entry.trim().toLowerCase())
+      .filter((entry): entry is 'mallary' | 'buffer' => entry === 'mallary' || entry === 'buffer');
+    return providers.length > 0 ? providers : ['mallary', 'buffer'];
+  }
+  return ['buffer', 'mallary'];
+}
+
+function formatDelay(delaySeconds: number): string {
+  const minutes = Math.floor(delaySeconds / 60);
+  const seconds = delaySeconds % 60;
+  if (minutes <= 0) {
+    return `${seconds}s`;
+  }
+  if (seconds === 0) {
+    return `${minutes} min`;
+  }
+  return `${minutes} min ${seconds}s`;
+}
+
 function trimCaption(text: string): string {
   return text.length <= 1024 ? text : `${text.slice(0, 1020)}...`;
+}
+
+function platformLabel(platform: string): string {
+  if (platform === 'instagram') {
+    return 'Instagram';
+  }
+  if (platform === 'tiktok') {
+    return 'TikTok';
+  }
+  if (platform === 'youtube_shorts') {
+    return 'YouTube Shorts';
+  }
+  return platform;
 }
 
 function sourceRanges(candidate: Candidate): string {

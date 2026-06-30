@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS queue_tasks (
   kind TEXT NOT NULL,
   status TEXT NOT NULL,
   created_at TEXT NOT NULL,
+  available_at TEXT,
   started_at TEXT,
   error TEXT,
   payload_json TEXT NOT NULL
@@ -84,13 +85,21 @@ CREATE INDEX IF NOT EXISTS idx_actions_job ON actions(job_id, created_at);
 `;
 
 export interface CallbackTokenPayload {
-  kind: 'pick_speaker' | 'approve_draft' | 'request_revision' | 'reject_candidate' | 'render_candidate' | 'publish_instagram';
+  kind: 'pick_speaker' | 'approve_draft' | 'request_revision' | 'reject_candidate' | 'render_candidate' | 'publish_instagram' | 'publish_everywhere';
   jobId: string;
   candidateId?: string;
   candidateVersionId?: string;
   renderId?: string;
   speakerId?: string;
   force?: boolean;
+}
+
+function ensureColumn(db: DatabaseSync, table: string, column: string, definition: string): void {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (rows.some((row) => row.name === column)) {
+    return;
+  }
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
 }
 
 export class ShortsStore {
@@ -104,6 +113,8 @@ export class ShortsStore {
     db.exec('PRAGMA foreign_keys = ON');
     db.exec('PRAGMA busy_timeout = 5000');
     db.exec(SCHEMA_SQL);
+    ensureColumn(db, 'queue_tasks', 'available_at', 'TEXT');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_queue_tasks_status_available_created ON queue_tasks(status, available_at, created_at)');
     return new ShortsStore(db);
   }
 
@@ -204,6 +215,13 @@ export class ShortsStore {
       .some((task) => task.status && statuses.includes(task.status) && task.payload.renderId === renderId);
   }
 
+  hasTaskForRenderPlatform(jobId: string, kind: QueueTask['kind'], renderId: string, platform: string, statuses: Array<QueueTask['status']>): boolean {
+    const rows = this.db.prepare('SELECT payload_json FROM queue_tasks WHERE job_id = ? AND kind = ? ORDER BY created_at DESC').all(jobId, kind) as Array<{ payload_json: string }>;
+    return rows
+      .map((row) => parseJson<QueueTask>(row.payload_json))
+      .some((task) => task.status && statuses.includes(task.status) && task.payload.renderId === renderId && task.payload.platform === platform);
+  }
+
   hasTaskForJob(jobId: string, kind: QueueTask['kind'], statuses: Array<QueueTask['status']>): boolean {
     const row = this.db.prepare('SELECT 1 FROM queue_tasks WHERE job_id = ? AND kind = ? AND status IN (?, ?, ?) LIMIT 1').get(
       jobId,
@@ -215,7 +233,7 @@ export class ShortsStore {
     return Boolean(row);
   }
 
-  enqueueTask(jobId: string, kind: QueueTask['kind'], payload: Record<string, unknown>): QueueTask {
+  enqueueTask(jobId: string, kind: QueueTask['kind'], payload: Record<string, unknown>, options: { availableAt?: string | null } = {}): QueueTask {
     const task: QueueTask = {
       id: createId('task'),
       jobId,
@@ -223,19 +241,21 @@ export class ShortsStore {
       status: 'queued',
       payload,
       createdAt: nowIso(),
+      availableAt: options.availableAt ?? null,
       startedAt: null,
       error: null,
     };
-    this.db.prepare('INSERT INTO queue_tasks(id, job_id, kind, status, created_at, started_at, error, payload_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?)').run(task.id, task.jobId, task.kind, task.status, task.createdAt, task.startedAt, task.error, JSON.stringify(task));
+    this.db.prepare('INSERT INTO queue_tasks(id, job_id, kind, status, created_at, available_at, started_at, error, payload_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)').run(task.id, task.jobId, task.kind, task.status, task.createdAt, task.availableAt, task.startedAt, task.error, JSON.stringify(task));
     return task;
   }
 
   claimNextTask(jobId?: string): QueueTask | null {
     this.db.exec('BEGIN IMMEDIATE');
     try {
+      const now = nowIso();
       const row = (jobId
-        ? this.db.prepare("SELECT payload_json FROM queue_tasks WHERE status = 'queued' AND job_id = ? ORDER BY created_at ASC LIMIT 1").get(jobId)
-        : this.db.prepare("SELECT payload_json FROM queue_tasks WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1").get()) as { payload_json: string } | undefined;
+        ? this.db.prepare("SELECT payload_json FROM queue_tasks WHERE status = 'queued' AND job_id = ? AND (available_at IS NULL OR available_at <= ?) ORDER BY COALESCE(available_at, created_at) ASC, created_at ASC LIMIT 1").get(jobId, now)
+        : this.db.prepare("SELECT payload_json FROM queue_tasks WHERE status = 'queued' AND (available_at IS NULL OR available_at <= ?) ORDER BY COALESCE(available_at, created_at) ASC, created_at ASC LIMIT 1").get(now)) as { payload_json: string } | undefined;
       if (!row) {
         this.db.exec('COMMIT');
         return null;
@@ -243,7 +263,8 @@ export class ShortsStore {
       const task = parseJson<QueueTask>(row.payload_json);
       task.status = 'running';
       task.startedAt = nowIso();
-      this.db.prepare('UPDATE queue_tasks SET status = ?, started_at = ?, payload_json = ? WHERE id = ?').run(task.status, task.startedAt, JSON.stringify(task), task.id);
+      task.availableAt = null;
+      this.db.prepare('UPDATE queue_tasks SET status = ?, available_at = NULL, started_at = ?, payload_json = ? WHERE id = ?').run(task.status, task.startedAt, JSON.stringify(task), task.id);
       this.db.exec('COMMIT');
       return task;
     } catch (error) {
@@ -258,20 +279,31 @@ export class ShortsStore {
       const task = parseJson<QueueTask>(row.payload_json);
       task.status = 'queued';
       task.startedAt = null;
+      task.availableAt = null;
       task.error = null;
-      this.db.prepare('UPDATE queue_tasks SET status = ?, started_at = NULL, error = NULL, payload_json = ? WHERE id = ?').run(task.status, JSON.stringify(task), task.id);
+      this.db.prepare('UPDATE queue_tasks SET status = ?, available_at = NULL, started_at = NULL, error = NULL, payload_json = ? WHERE id = ?').run(task.status, JSON.stringify(task), task.id);
     }
   }
 
   completeTask(task: QueueTask): void {
     task.status = 'done';
-    this.db.prepare('UPDATE queue_tasks SET status = ?, payload_json = ? WHERE id = ?').run(task.status, JSON.stringify(task), task.id);
+    task.availableAt = null;
+    this.db.prepare('UPDATE queue_tasks SET status = ?, available_at = NULL, payload_json = ? WHERE id = ?').run(task.status, JSON.stringify(task), task.id);
   }
 
   failTask(task: QueueTask, errorMessage: string): void {
     task.status = 'failed';
+    task.availableAt = null;
     task.error = errorMessage;
-    this.db.prepare('UPDATE queue_tasks SET status = ?, error = ?, payload_json = ? WHERE id = ?').run(task.status, task.error, JSON.stringify(task), task.id);
+    this.db.prepare('UPDATE queue_tasks SET status = ?, available_at = NULL, error = ?, payload_json = ? WHERE id = ?').run(task.status, task.error, JSON.stringify(task), task.id);
+  }
+
+  rescheduleTask(task: QueueTask, availableAt: string, errorMessage: string | null = null): void {
+    task.status = 'queued';
+    task.availableAt = availableAt;
+    task.startedAt = null;
+    task.error = errorMessage;
+    this.db.prepare('UPDATE queue_tasks SET status = ?, available_at = ?, started_at = NULL, error = ?, payload_json = ? WHERE id = ?').run(task.status, task.availableAt, task.error, JSON.stringify(task), task.id);
   }
 
   setPendingReply(context: PendingReplyContext): void {

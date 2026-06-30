@@ -112,15 +112,15 @@ export interface CandidatePlanDiagnostic {
   reasons: string[];
 }
 
-export function diagnoseCandidatePlan(sentences: TranscriptSentence[], blocks: SemanticBlock[], plan: PlannedCandidateResponse): CandidatePlanDiagnostic[] {
-  return plan.candidates.map((candidate, index) => diagnoseCandidateFromBlocks(sentences, blocks, candidate, index));
+export function diagnoseCandidatePlan(sentences: TranscriptSentence[], blocks: SemanticBlock[], plan: PlannedCandidateResponse, playbackSpeed = 1): CandidatePlanDiagnostic[] {
+  return plan.candidates.map((candidate, index) => diagnoseCandidateFromBlocks(sentences, blocks, candidate, index, playbackSpeed));
 }
 
-export function buildCandidateVersionFromBlocks(jobId: string, versionNumber: number, parentId: string | null, source: 'initial' | 'revision', sentences: TranscriptSentence[], blocks: SemanticBlock[], plan: PlannedCandidateResponse): CandidateVersion {
+export function buildCandidateVersionFromBlocks(jobId: string, versionNumber: number, parentId: string | null, source: 'initial' | 'revision', sentences: TranscriptSentence[], blocks: SemanticBlock[], plan: PlannedCandidateResponse, playbackSpeed = 1): CandidateVersion {
   const candidates: Candidate[] = [];
   const seen = new Set<string>();
   for (const raw of plan.candidates) {
-    const candidate = validateCandidateFromBlocks(sentences, blocks, raw, candidates.length + 1);
+    const candidate = validateCandidateFromBlocks(sentences, blocks, raw, candidates.length + 1, playbackSpeed);
     if (!candidate) {
       continue;
     }
@@ -145,7 +145,7 @@ export function buildCandidateVersionFromBlocks(jobId: string, versionNumber: nu
   };
 }
 
-function diagnoseCandidateFromBlocks(sentences: TranscriptSentence[], blocks: SemanticBlock[], raw: PlannedCandidateResponse['candidates'][number], index: number): CandidatePlanDiagnostic {
+function diagnoseCandidateFromBlocks(sentences: TranscriptSentence[], blocks: SemanticBlock[], raw: PlannedCandidateResponse['candidates'][number], index: number, playbackSpeed = 1): CandidatePlanDiagnostic {
   const byBlockId = new Map(blocks.map((block) => [block.id, block]));
   const reasons: string[] = [];
   const missingBlockIds = raw.block_ids.filter((id) => !byBlockId.has(id));
@@ -171,12 +171,13 @@ function diagnoseCandidateFromBlocks(sentences: TranscriptSentence[], blocks: Se
   if (segments.length === 0) {
     reasons.push('blocks could not be converted into renderable segments');
   }
-  const durationSeconds = segments.length > 0 ? roundSeconds(segments.reduce((sum, segment) => sum + (segment.endSeconds - segment.startSeconds), 0)) : null;
-  if (durationSeconds !== null && durationSeconds < MIN_DURATION_SECONDS) {
-    reasons.push(`duration ${durationSeconds}s is below minimum ${MIN_DURATION_SECONDS}s`);
+  const rawDurationSeconds = segments.length > 0 ? segments.reduce((sum, segment) => sum + (segment.endSeconds - segment.startSeconds), 0) : null;
+  const durationSeconds = rawDurationSeconds !== null ? roundSeconds(rawDurationSeconds / Math.max(playbackSpeed, 1)) : null;
+  if (rawDurationSeconds !== null && rawDurationSeconds < MIN_DURATION_SECONDS) {
+    reasons.push(`duration ${roundSeconds(rawDurationSeconds)}s is below minimum ${MIN_DURATION_SECONDS}s`);
   }
-  if (durationSeconds !== null && durationSeconds > MAX_DURATION_SECONDS) {
-    reasons.push(`duration ${durationSeconds}s exceeds maximum ${MAX_DURATION_SECONDS}s`);
+  if (rawDurationSeconds !== null && rawDurationSeconds > MAX_DURATION_SECONDS) {
+    reasons.push(`duration ${roundSeconds(rawDurationSeconds)}s exceeds maximum ${MAX_DURATION_SECONDS}s`);
   }
   if (selectedBlocks.length >= 2) {
     const resolvedSteps = resolveCandidateArcSteps(orderedBlocks, raw.steps);
@@ -192,8 +193,8 @@ function diagnoseCandidateFromBlocks(sentences: TranscriptSentence[], blocks: Se
   };
 }
 
-export function validateCandidateFromBlocks(sentences: TranscriptSentence[], blocks: SemanticBlock[], raw: PlannedCandidateResponse['candidates'][number], rank: number): Candidate | null {
-  const diagnostic = diagnoseCandidateFromBlocks(sentences, blocks, raw, rank - 1);
+export function validateCandidateFromBlocks(sentences: TranscriptSentence[], blocks: SemanticBlock[], raw: PlannedCandidateResponse['candidates'][number], rank: number, playbackSpeed = 1): Candidate | null {
+  const diagnostic = diagnoseCandidateFromBlocks(sentences, blocks, raw, rank - 1, playbackSpeed);
   if (diagnostic.reasons.length > 0) {
     return null;
   }
@@ -202,7 +203,7 @@ export function validateCandidateFromBlocks(sentences: TranscriptSentence[], blo
   const selectedBlocks = dedupedBlockIds.map((id) => byBlockId.get(id)).filter((value): value is SemanticBlock => Boolean(value));
   const orderedBlocks = selectedBlocks.slice().sort((left, right) => left.startSeconds - right.startSeconds);
   const segments = mergeBlocksIntoSegments(orderedBlocks, sentences);
-  const durationSeconds = roundSeconds(segments.reduce((sum, segment) => sum + (segment.endSeconds - segment.startSeconds), 0));
+  const durationSeconds = roundSeconds(segments.reduce((sum, segment) => sum + (segment.endSeconds - segment.startSeconds), 0) / Math.max(playbackSpeed, 1));
   const arc = buildCandidateArc(raw.thesis, orderedBlocks, raw.steps);
   return {
     id: createId('cand'),
@@ -218,7 +219,7 @@ export function validateCandidateFromBlocks(sentences: TranscriptSentence[], blo
     segments,
     arc,
     arcPreviewPath: null,
-    playbackSpeed: 1,
+    playbackSpeed,
     previewEndCard: false,
     draftReady: false,
     rejected: false,
