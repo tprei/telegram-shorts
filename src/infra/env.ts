@@ -29,6 +29,8 @@ const EnvSchema = z.object({
   TELEGRAM_SHORTS_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(1500),
   TELEGRAM_SHORTS_ALLOWED_USER_ID: OptionalStringSchema,
   TELEGRAM_SHORTS_MAX_FILE_BYTES: z.coerce.number().int().positive().default(45_000_000),
+  TELEGRAM_SHORTS_CREATOR_PROFILES_PATH: OptionalStringSchema,
+  TELEGRAM_SHORTS_DEFAULT_CREATOR_ID: OptionalStringSchema,
   TELEGRAM_SHORTS_STATIC_LAYOUT_PATH: OptionalStringSchema,
   TELEGRAM_SHORTS_RENDER_TIER: z.enum(['dev', 'prod']).default('dev'),
   TELEGRAM_SHORTS_YTDLP_COOKIES_PATH: OptionalStringSchema,

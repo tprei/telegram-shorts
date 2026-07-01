@@ -84,15 +84,22 @@ CREATE TABLE IF NOT EXISTS actions (
 CREATE INDEX IF NOT EXISTS idx_actions_job ON actions(job_id, created_at);
 `;
 
-export interface CallbackTokenPayload {
-  kind: 'pick_speaker' | 'approve_draft' | 'request_revision' | 'reject_candidate' | 'render_candidate' | 'publish_instagram' | 'publish_everywhere';
-  jobId: string;
-  candidateId?: string;
-  candidateVersionId?: string;
-  renderId?: string;
-  speakerId?: string;
-  force?: boolean;
-}
+export type CallbackTokenPayload =
+  | {
+      kind: 'profile_select';
+      chatId: string;
+      userId: string;
+      creatorId: string;
+    }
+  | {
+      kind: 'pick_speaker' | 'approve_draft' | 'request_revision' | 'reject_candidate' | 'render_candidate' | 'publish_instagram' | 'publish_everywhere';
+      jobId: string;
+      candidateId?: string;
+      candidateVersionId?: string;
+      renderId?: string;
+      speakerId?: string;
+      force?: boolean;
+    };
 
 function ensureColumn(db: DatabaseSync, table: string, column: string, definition: string): void {
   const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
@@ -100,6 +107,10 @@ function ensureColumn(db: DatabaseSync, table: string, column: string, definitio
     return;
   }
   db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+
+function defaultCreatorProfileSettingKey(chatId: string): string {
+  return `telegram.chat.${chatId}.defaultCreatorProfileId`;
 }
 
 export class ShortsStore {
@@ -129,6 +140,14 @@ export class ShortsStore {
 
   setSetting(key: string, value: string): void {
     this.db.prepare('INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value);
+  }
+
+  getDefaultCreatorProfileId(chatId: string): string | null {
+    return this.getSetting(defaultCreatorProfileSettingKey(chatId));
+  }
+
+  setDefaultCreatorProfileId(chatId: string, creatorProfileId: string): void {
+    this.setSetting(defaultCreatorProfileSettingKey(chatId), creatorProfileId);
   }
 
   hasProcessedUpdate(updateId: number): boolean {

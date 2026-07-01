@@ -143,6 +143,11 @@ export interface JobRecord {
   operatorChatId: string;
   operatorUserId: string;
   transcriptProvider: TranscriptProvider;
+  creatorProfileId?: string | null;
+  creatorProfileSnapshot?: CreatorProfile | null;
+  layoutProfileId?: string | null;
+  layoutProfileSnapshot?: LayoutProfile | null;
+  profileSelectionSource?: ProfileSelectionSource;
   sourceVideoPath: string | null;
   sourceAudioPath: string | null;
   sourceThumbnailPath: string | null;
@@ -293,6 +298,50 @@ export interface LayoutProfile {
   regions: LayoutRegion[];
   subtitleSafeArea: SubtitleSafeArea;
 }
+
+export type CreatorPublishMode = 'disabled' | 'global' | 'profile';
+
+export interface CreatorPlatformPublishConfig {
+  mode: CreatorPublishMode;
+  provider?: string | null;
+  fallbackToGlobal?: boolean;
+  configRef?: string | null;
+}
+
+export interface CreatorPublishConfig {
+  instagram?: CreatorPlatformPublishConfig;
+  tiktok?: CreatorPlatformPublishConfig;
+  youtube_shorts?: CreatorPlatformPublishConfig;
+}
+
+export interface CreatorRenderConfig {
+  layoutPath?: string | null;
+  layoutId?: string | null;
+  snapshotLayoutInJobs?: boolean;
+}
+
+export interface CreatorTelegramConfig {
+  buttonLabel?: string;
+  aliases?: string[];
+}
+
+export interface CreatorProfile {
+  id: string;
+  displayName: string;
+  enabled: boolean;
+  description?: string;
+  telegram?: CreatorTelegramConfig;
+  render: CreatorRenderConfig;
+  publish?: CreatorPublishConfig;
+}
+
+export interface CreatorProfileManifest {
+  version: 1;
+  defaultCreatorId?: string;
+  creators: CreatorProfile[];
+}
+
+export type ProfileSelectionSource = 'explicit' | 'chat_default' | 'env_default' | 'manifest_default' | 'first_enabled' | 'legacy_static_layout';
 
 export interface TelegramUpdateEnvelope {
   update_id: number;

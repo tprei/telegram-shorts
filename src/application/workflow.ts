@@ -1,13 +1,13 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import { Candidate, CandidateVersion, JobRecord, PendingReplyContext, QueueTask, RenderArtifact, TelegramUpdateEnvelope } from '../domain/model.js';
+import { Candidate, CandidateVersion, CreatorPlatformPublishConfig, CreatorProfile, JobRecord, LayoutProfile, PendingReplyContext, QueueTask, RenderArtifact, TelegramUpdateEnvelope } from '../domain/model.js';
 import { applyResolvedInsert, applyRevision, buildSentences, detectStrongSpeakers, markDraftReady, rejectCandidate } from '../domain/policies.js';
 import { buildCandidateVersionFromBlocks, diagnoseCandidatePlan, fallbackSemanticBlocks, materializeSemanticBlocks, semanticBlocksAreUsable } from '../domain/semantic.js';
-import { ShortsStore } from '../infra/db.js';
+import { CallbackTokenPayload, ShortsStore } from '../infra/db.js';
 import { AppConfig } from '../infra/env.js';
 import { ShortVideoPublishError, type ShortVideoPlatform, type ShortVideoPublishProvider } from '../infra/instagram-publisher.js';
 import { createInstagramPublishProvider } from '../infra/instagram-publisher-factory.js';
-import { loadLayoutProfile } from '../infra/layout.js';
+import { CreatorProfileRepository, publishConfigForPlatform, resolveLayoutProfileForJob, snapshotCreatorProfile, snapshotLayoutProfile } from '../infra/creator-profile-loader.js';
 import { OpenRouterClient } from '../infra/openrouter.js';
 import { writeArcPreview } from '../infra/arc-preview.js';
 import { buildInstagramReelDescription, createInstagramCoverImage } from '../infra/mallary.js';
@@ -19,6 +19,7 @@ import { assertPublicYouTubeUrl, downloadSource } from '../infra/youtube.js';
 
 export class ShortsWorkflow {
   private readonly shortVideoPublisher: ShortVideoPublishProvider | null;
+  private readonly creatorProfiles: CreatorProfileRepository;
 
   constructor(
     private readonly config: AppConfig,
@@ -27,6 +28,12 @@ export class ShortsWorkflow {
     private readonly openRouter: OpenRouterClient,
   ) {
     this.shortVideoPublisher = createInstagramPublishProvider(config);
+    this.creatorProfiles = new CreatorProfileRepository({
+      rootDir: config.rootDir,
+      manifestPath: config.TELEGRAM_SHORTS_CREATOR_PROFILES_PATH,
+      defaultCreatorId: config.TELEGRAM_SHORTS_DEFAULT_CREATOR_ID,
+      legacyLayoutPath: config.TELEGRAM_SHORTS_STATIC_LAYOUT_PATH,
+    });
   }
 
   async handleUpdate(raw: unknown): Promise<void> {
@@ -109,7 +116,7 @@ export class ShortsWorkflow {
   }
 
   async processOnce(url: string, expectedSpeakerName: string): Promise<string> {
-    const job = this.createJob(url, 'local', 'local');
+    const job = await this.createJob(url, 'local', 'local');
     while (true) {
       const didWork = await this.runNextTask(job.id);
       const current = this.store.getJob(job.id);
@@ -174,8 +181,17 @@ export class ShortsWorkflow {
     return render.artifactPath;
   }
 
-  createJob(url: string, chatId: string, userId: string): JobRecord {
+  async createJob(url: string, chatId: string, userId: string): Promise<JobRecord> {
     assertPublicYouTubeUrl(url);
+    const manifestConfigured = Boolean(this.config.TELEGRAM_SHORTS_CREATOR_PROFILES_PATH?.trim());
+    const chatDefaultCreatorId = this.store.getDefaultCreatorProfileId(chatId);
+    const resolvedProfile = await this.creatorProfiles.resolveCreatorProfile({
+      chatDefaultCreatorId,
+      strictChatDefault: manifestConfigured && chatId !== 'local' && chatDefaultCreatorId !== 'legacy_default',
+      strictEnvDefault: manifestConfigured,
+    });
+    const creatorProfileSnapshot = snapshotCreatorProfile(resolvedProfile.profile);
+    const layoutProfileSnapshot = snapshotLayoutProfile(resolvedProfile.layoutProfile);
     const job: JobRecord = {
       id: createId('job'),
       sourceUrl: url,
@@ -184,6 +200,11 @@ export class ShortsWorkflow {
       operatorChatId: chatId,
       operatorUserId: userId,
       transcriptProvider: this.config.TELEGRAM_SHORTS_TRANSCRIPT_PROVIDER,
+      creatorProfileId: resolvedProfile.profile.id,
+      creatorProfileSnapshot,
+      layoutProfileId: layoutProfileSnapshot?.layoutId ?? resolvedProfile.profile.render.layoutId ?? null,
+      layoutProfileSnapshot,
+      profileSelectionSource: resolvedProfile.source,
       sourceVideoPath: null,
       sourceAudioPath: null,
       sourceThumbnailPath: null,
@@ -208,7 +229,7 @@ export class ShortsWorkflow {
     };
     this.store.createJob(job);
     this.store.enqueueTask(job.id, 'process_source', {});
-    this.store.appendAction(job.id, 'job_created', { url });
+    this.store.appendAction(job.id, 'job_created', { url, creatorProfileId: job.creatorProfileId, layoutProfileId: job.layoutProfileId, profileSelectionSource: job.profileSelectionSource });
     return job;
   }
 
@@ -250,8 +271,17 @@ export class ShortsWorkflow {
       await this.safeSendMessage(chatId, [
         'Comandos:',
         '/process <youtube-url>',
+        '/profile',
         '/status',
       ].join('\n'));
+      return;
+    }
+    if (text.startsWith('/profile')) {
+      try {
+        await this.sendProfileSelection(chatId, userId);
+      } catch (error) {
+        await this.safeSendMessage(chatId, error instanceof Error ? error.message : String(error));
+      }
       return;
     }
     if (text.startsWith('/status')) {
@@ -266,14 +296,55 @@ export class ShortsWorkflow {
     if (text.startsWith('/process ') || looksLikeUrl(text)) {
       const url = text.startsWith('/process ') ? text.slice('/process '.length).trim() : text;
       try {
-        const job = this.createJob(url, chatId, userId);
-        await this.safeSendMessage(chatId, `Recebi o vídeo. Job ${job.id} entrou na fila.`);
+        const job = await this.createJob(url, chatId, userId);
+        const profileName = job.creatorProfileSnapshot?.displayName ?? job.creatorProfileId ?? 'legado';
+        await this.safeSendMessage(chatId, `Recebi o vídeo. Job ${job.id} entrou na fila. Perfil: ${profileName}.`);
       } catch (error) {
         await this.safeSendMessage(chatId, error instanceof Error ? error.message : String(error));
       }
       return;
     }
-    await this.safeSendMessage(chatId, 'Use /process <youtube-url> ou /status.');
+    await this.safeSendMessage(chatId, 'Use /process <youtube-url>, /profile ou /status.');
+  }
+
+  private async sendProfileSelection(chatId: string, userId: string): Promise<void> {
+    const profiles = await this.creatorProfiles.getEnabledCreatorProfiles();
+    const current = await this.creatorProfiles.resolveCreatorProfile({ chatDefaultCreatorId: this.store.getDefaultCreatorProfileId(chatId) });
+    if (profiles.length === 0) {
+      await this.safeSendMessage(chatId, `Perfil atual: ${current.profile.displayName}. Nenhum outro perfil habilitado.`);
+      return;
+    }
+    const rows = profiles.map((profile) => [{
+      text: `${profile.id === current.profile.id ? '✅ ' : ''}${profile.telegram?.buttonLabel ?? profile.displayName}`,
+      callback_data: this.store.createCallbackToken({ kind: 'profile_select', chatId, userId, creatorId: profile.id }),
+    }]);
+    await this.safeSendMessage(chatId, [
+      `Perfil atual: ${current.profile.displayName}`,
+      'Escolha o perfil padrão para novos /process neste chat:',
+    ].join('\n'), { inline_keyboard: rows });
+  }
+
+  private async handleProfileSelectCallback(callback: NonNullable<TelegramUpdateEnvelope['callback_query']>, payload: Extract<CallbackTokenPayload, { kind: 'profile_select' }>): Promise<void> {
+    const callbackChatId = String(callback.message?.chat?.id ?? '');
+    const callbackUserId = String(callback.from?.id ?? '');
+    if (callbackChatId !== payload.chatId || callbackUserId !== payload.userId) {
+      await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Seleção inválida para este chat/usuário.', show_alert: true });
+      return;
+    }
+    const profiles = await this.creatorProfiles.getEnabledCreatorProfiles();
+    const profile = profiles.find((entry) => entry.id === payload.creatorId);
+    if (!profile) {
+      await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Perfil indisponível.', show_alert: true });
+      return;
+    }
+    this.store.setDefaultCreatorProfileId(payload.chatId, profile.id);
+    await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: `Perfil: ${profile.displayName}` });
+    const text = `Perfil padrão definido para ${profile.displayName}. Novos /process usarão esse perfil de render.`;
+    if (callback.message?.message_id) {
+      await this.safeEditMessage(payload.chatId, callback.message.message_id, text);
+    } else {
+      await this.safeSendMessage(payload.chatId, text);
+    }
   }
 
   private async handleCallback(update: TelegramUpdateEnvelope): Promise<void> {
@@ -295,6 +366,11 @@ export class ShortsWorkflow {
     const payload = this.store.getCallbackToken(token);
     if (!payload) {
       await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: 'Ação expirada.', show_alert: true });
+      this.store.markProcessedCallback(callback.id);
+      return;
+    }
+    if (payload.kind === 'profile_select') {
+      await this.handleProfileSelectCallback(callback, payload);
       this.store.markProcessedCallback(callback.id);
       return;
     }
@@ -415,12 +491,15 @@ export class ShortsWorkflow {
         this.store.markProcessedCallback(callback.id);
         return;
       }
+      const availablePlatforms = await this.availableShortVideoPlatforms(job);
       const platforms: ShortVideoPlatform[] = payload.kind === 'publish_everywhere'
-        ? this.availableShortVideoPlatforms()
-        : this.availableShortVideoPlatforms().filter((platform) => platform === 'instagram');
+        ? availablePlatforms
+        : availablePlatforms.filter((platform) => platform === 'instagram');
       const unavailable = payload.kind === 'publish_everywhere'
-        ? this.unavailableShortVideoPlatforms()
-        : [];
+        ? await this.unavailableShortVideoPlatforms(job)
+        : platforms.includes('instagram')
+          ? []
+          : ['instagram'];
       const enqueued: string[] = [];
       const delayed: string[] = [];
       const skipped: string[] = [];
@@ -453,7 +532,9 @@ export class ShortsWorkflow {
             unavailable.length > 0 ? `Indisponível: ${unavailable.map((platform) => platformLabel(platform)).join(', ')}.` : '',
           ].filter(Boolean).join(' ');
       await this.safeAnswerCallbackQuery({ callback_query_id: callback.id, text: responseText, show_alert: enqueued.length === 0 && delayed.length === 0 });
-      await this.safeDeleteDraftMessage(job.operatorChatId, render?.telegramMessageId ?? null);
+      if (enqueued.length > 0 || delayed.length > 0) {
+        await this.safeDeleteDraftMessage(job.operatorChatId, render?.telegramMessageId ?? null);
+      }
       this.store.markProcessedCallback(callback.id);
       return;
     }
@@ -539,7 +620,7 @@ export class ShortsWorkflow {
       end_seconds: block.endSeconds,
       text: block.text,
     }));
-    const layoutProfile = await loadLayoutProfile(this.config.TELEGRAM_SHORTS_STATIC_LAYOUT_PATH, this.config.rootDir);
+    const layoutProfile = await this.resolveJobLayoutProfile(job);
     const defaultPlaybackSpeed = layoutProfile?.defaultPlaybackSpeed ?? 1;
     let opportunities = await this.openRouter.findOpportunities({
       title: job.sourceTitle,
@@ -615,7 +696,7 @@ export class ShortsWorkflow {
     if (!candidate || !job.sourceVideoPath) {
       throw new Error('Draft render target not found.');
     }
-    const layoutProfile = await loadLayoutProfile(this.config.TELEGRAM_SHORTS_STATIC_LAYOUT_PATH, this.config.rootDir);
+    const layoutProfile = await this.resolveJobLayoutProfile(job);
     const rendered = await renderCandidate({
       jobId: job.id,
       candidate,
@@ -729,7 +810,7 @@ export class ShortsWorkflow {
     if (!candidate || !job.sourceVideoPath) {
       throw new Error('Final render target not found.');
     }
-    const layoutProfile = await loadLayoutProfile(this.config.TELEGRAM_SHORTS_STATIC_LAYOUT_PATH, this.config.rootDir);
+    const layoutProfile = await this.resolveJobLayoutProfile(job);
     const rendered = await renderCandidate({
       jobId: job.id,
       candidate,
@@ -760,7 +841,7 @@ export class ShortsWorkflow {
     this.store.updateJob(job);
     await this.syncOverview(job, version);
     if (this.telegram) {
-      const sent = await this.safeSendDocument(job.operatorChatId, render.artifactPath, this.renderFinalCaption(job, candidate), this.finalButtons(job.id, version.id, candidate.id, render.id));
+      const sent = await this.safeSendDocument(job.operatorChatId, render.artifactPath, this.renderFinalCaption(job, candidate), await this.finalButtons(job, version.id, candidate.id, render.id));
       if (sent) {
         render.telegramMessageId = sent.message_id;
         render.status = 'sent';
@@ -792,6 +873,9 @@ export class ShortsWorkflow {
       throw new Error(`No provider configured for ${platform}.`);
     }
     const job = this.requireJob(task.jobId);
+    if (!(await this.isPublishingEnabledForJob(job, platform))) {
+      throw new Error(`Publishing to ${platformLabel(platform)} is disabled for profile ${job.creatorProfileSnapshot?.displayName ?? job.creatorProfileId ?? 'legacy'}.`);
+    }
     const renderId = typeof task.payload.renderId === 'string' ? task.payload.renderId : null;
     const candidateId = typeof task.payload.candidateId === 'string' ? task.payload.candidateId : null;
     const candidateVersionId = typeof task.payload.candidateVersionId === 'string' ? task.payload.candidateVersionId : null;
@@ -808,7 +892,7 @@ export class ShortsWorkflow {
       throw new Error('Candidate not found for short-video publish.');
     }
     const copy = await this.openRouter.writeInstagramReelDescription({ candidate });
-    const layoutProfile = await loadLayoutProfile(this.config.TELEGRAM_SHORTS_STATIC_LAYOUT_PATH, this.config.rootDir);
+    const layoutProfile = await this.resolveJobLayoutProfile(job);
     const publishRender = await renderCandidate({
       jobId: job.id,
       candidate,
@@ -901,6 +985,7 @@ export class ShortsWorkflow {
       `Job ${job.id}`,
       `${job.sourceTitle ?? job.sourceUrl}`,
       `Status: ${job.status}`,
+      `Perfil: ${job.creatorProfileSnapshot?.displayName ?? job.creatorProfileId ?? 'legado'}`,
     ];
     if (version) {
       lines.push(`Versão: ${version.number}`);
@@ -935,35 +1020,35 @@ export class ShortsWorkflow {
     };
   }
 
-  private finalButtons(jobId: string, candidateVersionId: string, candidateId: string, renderId: string): Record<string, unknown> | undefined {
+  private async finalButtons(job: JobRecord, candidateVersionId: string, candidateId: string, renderId: string): Promise<Record<string, unknown> | undefined> {
     if (!this.shortVideoPublisher) {
       return undefined;
     }
-    const availablePlatforms = this.availableShortVideoPlatforms();
+    const availablePlatforms = await this.availableShortVideoPlatforms(job);
     const supportsInstagram = availablePlatforms.includes('instagram');
     const supportsAnywhere = availablePlatforms.length > 0;
     const rows: Array<Array<{ text: string; callback_data: string }>> = [];
     if (supportsAnywhere) {
       rows.push([
-        { text: 'Postar em todo lugar', callback_data: this.store.createCallbackToken({ kind: 'publish_everywhere', jobId, candidateId, candidateVersionId, renderId }) },
+        { text: 'Postar em todo lugar', callback_data: this.store.createCallbackToken({ kind: 'publish_everywhere', jobId: job.id, candidateId, candidateVersionId, renderId }) },
       ]);
       rows.push([
-        { text: 'Forçar repost em todo lugar', callback_data: this.store.createCallbackToken({ kind: 'publish_everywhere', jobId, candidateId, candidateVersionId, renderId, force: true }) },
+        { text: 'Forçar repost em todo lugar', callback_data: this.store.createCallbackToken({ kind: 'publish_everywhere', jobId: job.id, candidateId, candidateVersionId, renderId, force: true }) },
       ]);
     }
     if (supportsInstagram) {
       rows.push([
-        { text: 'Postar Reel no Instagram', callback_data: this.store.createCallbackToken({ kind: 'publish_instagram', jobId, candidateId, candidateVersionId, renderId }) },
+        { text: 'Postar Reel no Instagram', callback_data: this.store.createCallbackToken({ kind: 'publish_instagram', jobId: job.id, candidateId, candidateVersionId, renderId }) },
       ]);
       rows.push([
-        { text: 'Forçar repost no Instagram', callback_data: this.store.createCallbackToken({ kind: 'publish_instagram', jobId, candidateId, candidateVersionId, renderId, force: true }) },
+        { text: 'Forçar repost no Instagram', callback_data: this.store.createCallbackToken({ kind: 'publish_instagram', jobId: job.id, candidateId, candidateVersionId, renderId, force: true }) },
       ]);
     }
     return rows.length > 0 ? { inline_keyboard: rows } : undefined;
   }
 
   private enqueueShortVideoPublish(jobId: string, input: { platform: ShortVideoPlatform; candidateId: string; candidateVersionId: string; renderId: string; force: boolean }): 'enqueued' | 'delayed' | 'skipped' {
-    if (!input.force && this.store.hasTaskForRenderPlatform(jobId, 'publish_short_video', input.renderId, input.platform, ['queued', 'running', 'done'])) {
+    if (!input.force && this.hasExistingShortVideoPublishRequest(jobId, input.renderId, input.platform)) {
       return 'skipped';
     }
     const cooldownUntil = this.activeMallaryCooldownUntil(input.platform);
@@ -975,14 +1060,70 @@ export class ShortsWorkflow {
     return 'enqueued';
   }
 
-  private availableShortVideoPlatforms(): ShortVideoPlatform[] {
-    return this.configuredShortVideoPlatforms().filter((platform) => this.shortVideoPublisher?.supports(platform));
+  private hasExistingShortVideoPublishRequest(jobId: string, renderId: string, platform: ShortVideoPlatform): boolean {
+    if (this.store.hasTaskForRenderPlatform(jobId, 'publish_short_video', renderId, platform, ['queued', 'running', 'done'])) {
+      return true;
+    }
+    if (platform === 'instagram' && this.store.hasTaskForRender(jobId, 'publish_instagram', renderId, ['queued', 'running', 'done'])) {
+      return true;
+    }
+    return false;
   }
 
-  private unavailableShortVideoPlatforms(): ShortVideoPlatform[] {
-    const configured = this.configuredShortVideoPlatforms();
+  private async availableShortVideoPlatforms(job: JobRecord): Promise<ShortVideoPlatform[]> {
+    const configured = this.configuredShortVideoPlatforms()
+      .filter((platform) => this.shortVideoPublisher?.supports(platform));
+    const enabled: ShortVideoPlatform[] = [];
+    for (const platform of configured) {
+      if (await this.isPublishingEnabledForJob(job, platform)) {
+        enabled.push(platform);
+      }
+    }
+    return enabled;
+  }
+
+  private async unavailableShortVideoPlatforms(job: JobRecord): Promise<ShortVideoPlatform[]> {
+    const available = await this.availableShortVideoPlatforms(job);
     const all: ShortVideoPlatform[] = ['instagram', 'tiktok', 'youtube_shorts'];
-    return all.filter((platform) => !configured.includes(platform));
+    return all.filter((platform) => !available.includes(platform));
+  }
+
+  private async isPublishingEnabledForJob(job: JobRecord, platform: ShortVideoPlatform): Promise<boolean> {
+    const config = await this.currentPublishConfigForJob(job, platform);
+    if (!config) {
+      return false;
+    }
+    return this.publishModeUsesGlobalProvider(config);
+  }
+
+  private async currentPublishConfigForJob(job: JobRecord, platform: ShortVideoPlatform): Promise<CreatorPlatformPublishConfig | null> {
+    const creatorId = job.creatorProfileId?.trim();
+    if (creatorId && creatorId !== 'legacy_default') {
+      try {
+        const currentProfile = await this.creatorProfiles.getCreatorProfileById(creatorId);
+        if (!currentProfile?.enabled) {
+          return { mode: 'disabled' };
+        }
+        return publishConfigForPlatform(currentProfile, platform) ?? { mode: 'disabled' };
+      } catch (error) {
+        logError('Creator profile publish lookup failed; disabling publishing for job', error, { jobId: job.id, creatorId, platform });
+        return { mode: 'disabled' };
+      }
+    }
+    if (!job.creatorProfileSnapshot) {
+      return { mode: 'global', provider: 'global', fallbackToGlobal: true, configRef: null };
+    }
+    return publishConfigForPlatform(job.creatorProfileSnapshot, platform) ?? { mode: 'disabled' };
+  }
+
+  private publishModeUsesGlobalProvider(config: CreatorPlatformPublishConfig): boolean {
+    if (config.mode === 'disabled') {
+      return false;
+    }
+    if (config.mode === 'global') {
+      return true;
+    }
+    return config.fallbackToGlobal === true;
   }
 
   private configuredShortVideoPlatforms(): ShortVideoPlatform[] {
@@ -1046,6 +1187,40 @@ export class ShortsWorkflow {
     ].join('\n'));
   }
 
+  private async resolveJobLayoutProfile(job: JobRecord): Promise<LayoutProfile | null> {
+    const hadSnapshot = Object.prototype.hasOwnProperty.call(job, 'layoutProfileSnapshot');
+    const layoutProfile = await resolveLayoutProfileForJob(job, this.config.rootDir, this.config.TELEGRAM_SHORTS_STATIC_LAYOUT_PATH);
+    if (!hadSnapshot) {
+      job.layoutProfileSnapshot = snapshotLayoutProfile(layoutProfile);
+      job.layoutProfileId = layoutProfile?.layoutId ?? null;
+      if (!job.creatorProfileSnapshot) {
+        const legacyProfile: CreatorProfile = {
+          id: job.creatorProfileId ?? 'legacy_default',
+          displayName: 'Legacy default',
+          enabled: true,
+          description: 'Backfilled legacy profile from TELEGRAM_SHORTS_STATIC_LAYOUT_PATH.',
+          telegram: { buttonLabel: 'Legacy default', aliases: ['legacy'] },
+          render: {
+            layoutPath: this.config.TELEGRAM_SHORTS_STATIC_LAYOUT_PATH ?? null,
+            layoutId: layoutProfile?.layoutId ?? null,
+            snapshotLayoutInJobs: true,
+          },
+          publish: {
+            instagram: { mode: 'global', provider: 'global', fallbackToGlobal: true, configRef: null },
+            tiktok: { mode: 'global', provider: 'global', fallbackToGlobal: true, configRef: null },
+            youtube_shorts: { mode: 'global', provider: 'global', fallbackToGlobal: true, configRef: null },
+          },
+        };
+        job.creatorProfileId = legacyProfile.id;
+        job.creatorProfileSnapshot = legacyProfile;
+        job.profileSelectionSource = 'legacy_static_layout';
+      }
+      job.updatedAt = nowIso();
+      this.store.updateJob(job);
+    }
+    return layoutProfile;
+  }
+
   private requireJob(jobId: string): JobRecord {
     const job = this.store.getJob(jobId);
     if (!job) {
@@ -1083,12 +1258,12 @@ export class ShortsWorkflow {
     await this.syncOverview(job);
   }
 
-  private async safeSendMessage(chatId: string, text: string): Promise<{ message_id: number } | null> {
+  private async safeSendMessage(chatId: string, text: string, replyMarkup?: Record<string, unknown>): Promise<{ message_id: number } | null> {
     if (!this.telegram) {
       return null;
     }
     try {
-      return await this.telegram.sendMessage(chatId, text);
+      return await this.telegram.sendMessage(chatId, text, replyMarkup);
     } catch (error) {
       logError('Telegram sendMessage failed', error, { chatId, textPreview: text.slice(0, 140) });
       return null;

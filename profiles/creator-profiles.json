@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "defaultCreatorId": "filipe_boni",
+  "creators": [
+    {
+      "id": "filipe_boni",
+      "displayName": "Filipe Boni",
+      "enabled": true,
+      "description": "Default Filipe Boni render/publish profile.",
+      "telegram": {
+        "buttonLabel": "Filipe Boni",
+        "aliases": ["filipe", "boni"]
+      },
+      "render": {
+        "layoutPath": "profiles/filipe_boni_layout.json",
+        "layoutId": "source-left-host-right-stack-v1",
+        "snapshotLayoutInJobs": true
+      },
+      "publish": {
+        "instagram": {
+          "mode": "global",
+          "provider": "global",
+          "fallbackToGlobal": true,
+          "configRef": null
+        },
+        "tiktok": {
+          "mode": "global",
+          "provider": "global",
+          "fallbackToGlobal": true,
+          "configRef": null
+        },
+        "youtube_shorts": {
+          "mode": "global",
+          "provider": "global",
+          "fallbackToGlobal": true,
+          "configRef": null
+        }
+      }
+    },
+    {
+      "id": "jones_manoel",
+      "displayName": "Jones Manoel",
+      "enabled": true,
+      "description": "Safe render-only experimentation profile for Jones Manoel.",
+      "telegram": {
+        "buttonLabel": "Jones Manoel",
+        "aliases": ["jones"]
+      },
+      "render": {
+        "layoutPath": "profiles/jones_manoel_layout.json",
+        "layoutId": "center-speaker-vertical-crop-v1",
+        "snapshotLayoutInJobs": true
+      },
+      "publish": {
+        "instagram": {
+          "mode": "disabled"
+        },
+        "tiktok": {
+          "mode": "disabled"
+        },
+        "youtube_shorts": {
+          "mode": "disabled"
+        }
+      }
+    }
+  ]
+}
