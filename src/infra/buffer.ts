@@ -53,8 +53,6 @@ export class BufferClient implements ShortVideoPublishProvider {
   private async publishInstagram(input: ShortVideoPublishInput): Promise<ShortVideoPublishResult> {
     const channelId = await this.resolveChannelId('instagram');
     const videoUrl = await this.hostAsset(input.filePath);
-    const thumbnailUrl = input.thumbnailPath ? await this.hostAsset(input.thumbnailPath) : null;
-    const firstComment = normalizeFirstComment(input.commentsUnderPost);
     const result = await this.callCreatePost<{
       createPost?: {
         __typename?: string;
@@ -64,14 +62,14 @@ export class BufferClient implements ShortVideoPublishProvider {
     }>({
       title: 'create-buffer-instagram-reel',
       query: `
-        mutation CreateInstagramReel($channelId: ChannelId!, $text: String!, $videoUrl: String!, $thumbnailUrl: String, $firstComment: String) {
+        mutation CreateInstagramReel($channelId: ChannelId!, $text: String!, $videoUrl: String!) {
           createPost(input: {
             channelId: $channelId
             text: $text
             schedulingType: automatic
             mode: shareNow
-            assets: [{ video: { url: $videoUrl, thumbnailUrl: $thumbnailUrl } }]
-            metadata: { instagram: { type: reel, shouldShareToFeed: true, firstComment: $firstComment } }
+            assets: [{ video: { url: $videoUrl } }]
+            metadata: { instagram: { type: reel, shouldShareToFeed: true } }
           }) {
             __typename
             ... on PostActionSuccess { post { id } }
@@ -79,7 +77,7 @@ export class BufferClient implements ShortVideoPublishProvider {
           }
         }
       `,
-      variables: { channelId, text: input.message, videoUrl, thumbnailUrl, firstComment },
+      variables: { channelId, text: input.message, videoUrl },
       platform: 'instagram',
     });
     return toPublishResult('buffer', 'instagram', result.data?.createPost);
@@ -88,7 +86,6 @@ export class BufferClient implements ShortVideoPublishProvider {
   private async publishTikTok(input: ShortVideoPublishInput): Promise<ShortVideoPublishResult> {
     const channelId = await this.resolveChannelId('tiktok');
     const videoUrl = await this.hostAsset(input.filePath);
-    const thumbnailUrl = input.thumbnailPath ? await this.hostAsset(input.thumbnailPath) : null;
     const result = await this.callCreatePost<{
       createPost?: {
         __typename?: string;
@@ -98,13 +95,13 @@ export class BufferClient implements ShortVideoPublishProvider {
     }>({
       title: 'create-buffer-tiktok-video',
       query: `
-        mutation CreateTikTokVideo($channelId: ChannelId!, $text: String!, $videoUrl: String!, $thumbnailUrl: String) {
+        mutation CreateTikTokVideo($channelId: ChannelId!, $text: String!, $videoUrl: String!) {
           createPost(input: {
             channelId: $channelId
             text: $text
             schedulingType: automatic
             mode: shareNow
-            assets: [{ video: { url: $videoUrl, thumbnailUrl: $thumbnailUrl } }]
+            assets: [{ video: { url: $videoUrl } }]
             metadata: { tiktok: { isAiGenerated: false } }
           }) {
             __typename
@@ -113,11 +110,12 @@ export class BufferClient implements ShortVideoPublishProvider {
           }
         }
       `,
-      variables: { channelId, text: input.message, videoUrl, thumbnailUrl },
+      variables: { channelId, text: input.message, videoUrl },
       platform: 'tiktok',
     });
     return toPublishResult('buffer', 'tiktok', result.data?.createPost);
   }
+
 
   private async publishYouTubeShort(input: ShortVideoPublishInput): Promise<ShortVideoPublishResult> {
     const channelId = await this.resolveChannelId('youtube_shorts');
@@ -368,12 +366,21 @@ function toPublishResult(provider: string, platform: ShortVideoPlatform, result:
       safeToFailover: true,
     });
   }
-  if (result.__typename === 'MutationError') {
+  if (result.__typename !== 'PostActionSuccess') {
     throw new ShortVideoPublishError({
       provider,
       stage: 'create',
-      message: `Buffer createPost failed: ${result.message ?? 'unknown mutation error'}`,
+      message: `Buffer createPost failed: ${result.message ?? result.__typename ?? 'unknown mutation response'}`,
       safeToFailover: true,
+    });
+  }
+  const jobId = result.post?.id;
+  if (!jobId) {
+    throw new ShortVideoPublishError({
+      provider,
+      stage: 'create',
+      message: 'Buffer createPost succeeded without a post id.',
+      safeToFailover: false,
     });
   }
   return {
@@ -381,14 +388,10 @@ function toPublishResult(provider: string, platform: ShortVideoPlatform, result:
     platform,
     status: 'queued',
     batchId: null,
-    jobs: [{ platform: platform === 'youtube_shorts' ? 'youtube' : platform, jobId: String(result.post?.id ?? '') }].filter((entry) => entry.jobId.length > 0),
+    jobs: [{ platform: platform === 'youtube_shorts' ? 'youtube' : platform, jobId }],
   };
 }
 
-function normalizeFirstComment(values: string[] | undefined): string | null {
-  const value = values?.map((entry) => entry.replace(/\s+/g, ' ').trim()).find((entry) => entry.length > 0);
-  return value ?? null;
-}
 
 function normalizeYouTubeTitle(value: string): string {
   const compact = value.replace(/\s+/g, ' ').trim();
