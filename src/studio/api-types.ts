@@ -167,6 +167,16 @@ export const ChooseSpeakerRequestSchema = z.strictObject({
 });
 export type ChooseSpeakerRequest = z.infer<typeof ChooseSpeakerRequestSchema>;
 
+export const CorrectWordRequestSchema = z.strictObject({
+  text: z
+    .string()
+    .trim()
+    .min(1)
+    .max(40)
+    .regex(/^[^\n\r\t]*$/, 'Text must not contain line breaks or tabs'),
+});
+export type CorrectWordRequest = z.infer<typeof CorrectWordRequestSchema>;
+
 export const SetDefaultCreatorRequestSchema = z.strictObject({
   creatorId: z.string().min(1),
 });
@@ -226,6 +236,7 @@ export interface StudioApi {
   getJob(jobId: string): JobDetailDto;
   retryJob(jobId: string): JobDetailDto;
   getTranscript(jobId: string): TranscriptDto;
+  correctWord(jobId: string, wordIndex: number, request: CorrectWordRequest): TranscriptDto;
   chooseSpeaker(jobId: string, request: ChooseSpeakerRequest): JobDetailDto;
   replan(jobId: string): JobDetailDto;
   createManualShort(jobId: string, request: CreateManualShortRequest): ShortDetailDto;

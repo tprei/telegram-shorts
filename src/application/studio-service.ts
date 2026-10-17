@@ -3,6 +3,7 @@ import { rename, rm } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { addRange, createInitialEdit, extendEndBySeconds, extendStartBySeconds, keptText, keptWordIndices, normalizeEdit, setWordsRemoved, trimEndBySeconds, trimStartBySeconds, type ShortEdit, type WordRange } from '../domain/edit.js';
 import { outputDurationSeconds } from '../domain/timeline.js';
+import { sentenceText } from '../domain/policies.js';
 import type { ExportRecord, JobRecord, JobSummaryRecord, PublicationRecord, ShortRecord, SourceMedia } from '../domain/model.js';
 import type { RevisionIntent } from '../domain/model.js';
 import {
@@ -10,6 +11,7 @@ import {
   type ChooseSpeakerRequest,
   type CreateJobRequest,
   type CreateManualShortRequest,
+  type CorrectWordRequest,
   type CreatorDto,
   type ExportDto,
   type HookSuggestionsDto,
@@ -103,6 +105,7 @@ export class StudioService implements StudioApi, StudioMediaResolver {
       media: null,
       transcriptWords: [],
       transcriptSentences: [],
+      transcriptRevision: 0,
       semanticBlocks: [],
       strongSpeakers: [],
       chosenSpeakerId: null,
@@ -166,6 +169,31 @@ export class StudioService implements StudioApi, StudioMediaResolver {
         text: sentence.text,
       })),
     };
+  }
+
+  correctWord(jobId: string, wordIndex: number, request: CorrectWordRequest): TranscriptDto {
+    const job = this.requireJob(jobId);
+    if (job.status !== 'ready') {
+      throw new StudioError('conflict', 'Job must be ready to correct words; planning rewrites the transcript.');
+    }
+    if (!Number.isInteger(wordIndex) || wordIndex < 0 || wordIndex >= job.transcriptWords.length) {
+      throw new StudioError('invalid', `Word index ${wordIndex} is outside the transcript.`);
+    }
+    const word = job.transcriptWords[wordIndex];
+    if (word.text === request.text) {
+      return this.getTranscript(jobId);
+    }
+    const from = word.text;
+    word.text = request.text;
+    const sentence = job.transcriptSentences.find((entry) => wordIndex >= entry.startWord && wordIndex <= entry.endWord);
+    if (sentence) {
+      sentence.text = sentenceText(job.transcriptWords, sentence);
+    }
+    job.transcriptRevision += 1;
+    job.updatedAt = nowIso();
+    this.deps.store.updateJob(job);
+    this.deps.store.appendAction(job.id, 'word_corrected', { wordIndex, from, to: request.text });
+    return this.getTranscript(jobId);
   }
 
   chooseSpeaker(jobId: string, request: ChooseSpeakerRequest): JobDetailDto {
@@ -406,7 +434,7 @@ export class StudioService implements StudioApi, StudioMediaResolver {
     }
     const reusable = this.deps.store
       .listExportsForShort(short.id)
-      .find((record) => record.editRevision === short.editRevision && record.title === short.title && (record.status === 'queued' || record.status === 'rendering' || record.status === 'ready'));
+      .find((record) => record.editRevision === short.editRevision && record.title === short.title && record.transcriptRevision === job.transcriptRevision && (record.status === 'queued' || record.status === 'rendering' || record.status === 'ready'));
     if (reusable) {
       return this.shortDetailWithAvailability(job, short);
     }
@@ -415,6 +443,7 @@ export class StudioService implements StudioApi, StudioMediaResolver {
       jobId: job.id,
       shortId: short.id,
       editRevision: short.editRevision,
+      transcriptRevision: job.transcriptRevision,
       edit: short.edit,
       title: short.title,
       status: 'queued',

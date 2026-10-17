@@ -14,18 +14,19 @@ export function buildSentences(words: TranscriptWord[], chosenSpeakerId?: string
     if (current.length === 0) {
       return;
     }
-    const text = normalizeSentenceText(current.map((entry) => entry.word.text).join(' '));
-    if (text.length > 0) {
-      sentences.push({
-        id: `s_${String(sentences.length + 1).padStart(4, '0')}`,
-        index: sentences.length,
-        speakerId: current[0].word.speakerId,
-        startWord: current[0].index,
-        endWord: current[current.length - 1].index,
-        startSeconds: current[0].word.startSeconds,
-        endSeconds: current[current.length - 1].word.endSeconds,
-        text,
-      });
+    const sentence: TranscriptSentence = {
+      id: `s_${String(sentences.length + 1).padStart(4, '0')}`,
+      index: sentences.length,
+      speakerId: current[0].word.speakerId,
+      startWord: current[0].index,
+      endWord: current[current.length - 1].index,
+      startSeconds: current[0].word.startSeconds,
+      endSeconds: current[current.length - 1].word.endSeconds,
+      text: '',
+    };
+    sentence.text = sentenceText(words, sentence);
+    if (sentence.text.length > 0) {
+      sentences.push(sentence);
     }
     current = [];
   };
@@ -46,6 +47,17 @@ export function buildSentences(words: TranscriptWord[], chosenSpeakerId?: string
   }
   flush();
   return sentences;
+}
+
+export function sentenceText(words: TranscriptWord[], sentence: TranscriptSentence): string {
+  const texts: string[] = [];
+  for (let index = sentence.startWord; index <= sentence.endWord; index += 1) {
+    const word = words[index];
+    if (word !== undefined && word.speakerId === sentence.speakerId) {
+      texts.push(word.text);
+    }
+  }
+  return normalizeSentenceText(texts.join(' '));
 }
 
 export function detectStrongSpeakers(words: TranscriptWord[]): SpeakerSample[] {

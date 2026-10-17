@@ -14,6 +14,7 @@ import {
   relativeTime,
 } from './StudioPrimitives';
 import { CropEditor } from './CropEditor';
+import { ExportFeedback, newestExport } from './ExportFeedback';
 
 export type InspectorTab = 'edit' | 'framing' | 'revise' | 'publish';
 export interface RevisionSummary {
@@ -37,6 +38,8 @@ export interface EditorInspectorProps {
   publishPending?: boolean;
   error?: string | null;
   initialTab?: InspectorTab;
+  tab?: InspectorTab;
+  onTabChange?: (tab: InspectorTab) => void;
   onTitleChange: (title: string) => void;
   onEditChange: (edit: ShortEdit) => void;
   onSuggestHooks: () => void;
@@ -92,7 +95,12 @@ export function EditorInspector(props: EditorInspectorProps) {
     onSelectedPlatformsChange,
     onPublish,
   } = props;
-  const [tab, setTab] = useState<InspectorTab>(props.initialTab ?? 'edit');
+  const [internalTab, setInternalTab] = useState<InspectorTab>(props.initialTab ?? 'edit');
+  const tab = props.tab ?? internalTab;
+  function setTab(next: InspectorTab) {
+    setInternalTab(next);
+    props.onTabChange?.(next);
+  }
   const [cropIndex, setCropIndex] = useState(0);
   const [revisionMessage, setRevisionMessage] = useState('');
   const [hashtagDraft, setHashtagDraft] = useState('');
@@ -106,6 +114,7 @@ export function EditorInspector(props: EditorInspectorProps) {
     ?.sourceRect ?? { x: 0, y: 0, w: 1, h: 1 };
   const analyzing =
     detail.short.cropAnalysis === 'queued' || detail.short.cropAnalysis === 'running';
+  const currentExport = newestExport(detail.exports, detail.short.editRevision);
   const latestReadyExport = detail.exports.find((item) => item.status === 'ready');
   const rendering = detail.exports.some(
     (item) => item.status === 'queued' || item.status === 'rendering',
@@ -435,6 +444,7 @@ export function EditorInspector(props: EditorInspectorProps) {
                 <h3>Export your short</h3>
                 <span className="muted small">1080 × 1920 MP4</span>
               </div>
+              <ExportFeedback item={currentExport} pending={exportPending} />
               <Button
                 variant="primary"
                 className="full-width"
@@ -442,18 +452,18 @@ export function EditorInspector(props: EditorInspectorProps) {
                 pending={exportPending || rendering}
                 onClick={onExport}
               >
-                Export video
+                {currentExport?.status === 'failed' ? 'Try export again' : currentExport?.status === 'ready' ? 'Export again' : 'Export video'}
               </Button>
               <div className="export-list">
-                {detail.exports.map((item) => (
-                  <article className="export-item" key={item.id}>
+                {[...detail.exports].sort((left, right) => right.createdAt.localeCompare(left.createdAt)).map((item) => (
+                  <article className={`export-item${item.id === currentExport?.id ? ' export-item--current' : ''}`} key={item.id}>
                     <div className="field-line">
                       <span className="small">
-                        Revision {item.editRevision} · {relativeTime(item.createdAt)}
+                        {item.id === currentExport?.id ? 'Current edit' : `Revision ${item.editRevision}`} · {relativeTime(item.createdAt)}
                       </span>
                       <StatusBadge status={item.status} />
                     </div>
-                    {item.videoUrl && (
+                    {item.status === 'ready' && item.videoUrl && (
                       <>
                         <video
                           controls
@@ -471,7 +481,9 @@ export function EditorInspector(props: EditorInspectorProps) {
                         </a>
                       </>
                     )}
-                    <ApiError message={item.error} title="Export failed" />
+                    {item.status === 'failed' && item.id !== currentExport?.id && (
+                      <ApiError message={item.error || 'The video could not be rendered.'} title="Export failed" />
+                    )}
                   </article>
                 ))}
               </div>

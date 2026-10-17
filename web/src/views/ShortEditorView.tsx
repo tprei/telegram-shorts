@@ -1,16 +1,17 @@
-import type { Ref } from 'react';
+import { useRef, useState, type Ref } from 'react';
 import { Link } from 'react-router';
 import type { TranscriptDto } from '@api';
 import type { WordRange } from '@domain/edit';
 import type { Timeline } from '@domain/timeline';
 import { ApiError, Button, Icon } from '../components/StudioPrimitives';
-import { EditorInspector, type EditorInspectorProps } from '../components/EditorInspector';
+import { EditorInspector, type EditorInspectorProps, type InspectorTab } from '../components/EditorInspector';
+import { ExportFeedback, newestExport } from '../components/ExportFeedback';
 import { PreviewPanel } from '../components/PreviewPanel';
 import { TranscriptPanel, type TranscriptAction } from '../components/TranscriptPanel';
 import '../styles/studio.css';
 
 export type AutosaveState = 'saved' | 'saving' | 'unsaved' | 'conflict';
-export interface ShortEditorViewProps extends EditorInspectorProps {
+export interface ShortEditorViewProps extends Omit<EditorInspectorProps, 'tab' | 'onTabChange'> {
   transcript: TranscriptDto;
   timeline: Timeline;
   canvasRef: Ref<HTMLCanvasElement>;
@@ -33,6 +34,8 @@ export interface ShortEditorViewProps extends EditorInspectorProps {
   onToggleWord: (wordIndex: number) => void;
   onRangeAction: (action: TranscriptAction, range: WordRange) => void;
   onSetBoundary: (rangeIndex: number, side: 'start' | 'end', wordIndex: number) => void;
+  onCorrectWord: (wordIndex: number, text: string) => void;
+  correctingWordIndex: number | null;
 }
 const saveLabels: Record<AutosaveState, string> = {
   saved: 'All changes saved',
@@ -67,9 +70,29 @@ export function ShortEditorView(props: ShortEditorViewProps) {
     onToggleWord,
     onRangeAction,
     onSetBoundary,
+    onCorrectWord,
+    correctingWordIndex,
     onExport,
     exportPending,
   } = props;
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>(props.initialTab ?? 'edit');
+  const inspectorRegion = useRef<HTMLDivElement>(null);
+  const currentExport = newestExport(detail.exports, detail.short.editRevision);
+  function showExport() {
+    setInspectorTab('publish');
+    requestAnimationFrame(() => {
+      const region = inspectorRegion.current;
+      if (!region) return;
+      region.querySelector('.inspector-scroll')?.scrollTo({ top: 0 });
+      if (window.matchMedia('(max-width: 1000px)').matches) {
+        region.scrollIntoView({ block: 'start', behavior: 'instant' });
+      }
+    });
+  }
+  function startExport() {
+    showExport();
+    onExport();
+  }
   const rendering = detail.exports.some(
     (item) => item.status === 'queued' || item.status === 'rendering',
   );
@@ -114,14 +137,17 @@ export function ShortEditorView(props: ShortEditorViewProps) {
           <span>+</span>
           <kbd>Z</kbd>
         </span>
-        <Button
-          variant="primary"
-          icon="download"
-          pending={exportPending || rendering}
-          onClick={onExport}
-        >
-          Export
-        </Button>
+        <div className="editor-export-actions">
+          <ExportFeedback item={currentExport} pending={exportPending} compact onShowExport={showExport} />
+          <Button
+            variant={currentExport?.status === 'ready' ? 'secondary' : 'primary'}
+            icon="download"
+            pending={exportPending || rendering}
+            onClick={startExport}
+          >
+            {exportPending ? 'Starting…' : rendering ? 'Exporting…' : currentExport?.status === 'failed' ? 'Retry export' : currentExport?.status === 'ready' ? 'Export again' : 'Export'}
+          </Button>
+        </div>
       </header>
       <main className="editor-grid">
         <PreviewPanel
@@ -159,9 +185,18 @@ export function ShortEditorView(props: ShortEditorViewProps) {
             onRangeAction={onRangeAction}
             onSetBoundary={onSetBoundary}
             onSeekWord={onSeekWord}
+            onCorrectWord={onCorrectWord}
+            correctingWordIndex={correctingWordIndex}
           />
         </section>
-        <EditorInspector {...props} />
+        <div className="editor-inspector-region" ref={inspectorRegion}>
+          <EditorInspector
+            {...props}
+            tab={inspectorTab}
+            onTabChange={setInspectorTab}
+            onExport={startExport}
+          />
+        </div>
       </main>
       <footer className="editor-statusbar">
         <span>

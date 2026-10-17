@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type {
   ChooseSpeakerRequest,
+  CorrectWordRequest,
   CreateJobRequest,
   CreateManualShortRequest,
   JobDetailDto,
@@ -8,6 +9,7 @@ import type {
   SaveEditRequest,
   SetShortStatusRequest,
   ShortDetailDto,
+  TranscriptDto,
   UpdatePublishCopyRequest,
   UpdateShortMetaRequest,
   PublishRequest,
@@ -246,6 +248,19 @@ export function useCreateManualShortMutation(jobId: string) {
       queryClient.setQueryData(queryKeys.short(detail.short.id), detail);
       void queryClient.invalidateQueries({ queryKey: queryKeys.job(jobId) });
       void queryClient.invalidateQueries({ queryKey: queryKeys.jobs });
+    },
+  });
+}
+
+export function useCorrectWordMutation(jobId: string, shortId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { wordIndex: number; text: string }) =>
+      api.correctWord(jobId, input.wordIndex, { text: input.text } satisfies CorrectWordRequest),
+    onSuccess: (dto) => {
+      queryClient.setQueryData(queryKeys.transcript(jobId), dto);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.short(shortId) });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.job(jobId) });
     },
   });
 }

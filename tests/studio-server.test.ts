@@ -12,6 +12,7 @@ import {
   type ChooseSpeakerRequest,
   type CreateJobRequest,
   type CreateManualShortRequest,
+  type CorrectWordRequest,
   type CreatorDto,
   type ExportDto,
   type HookSuggestionsDto,
@@ -129,6 +130,11 @@ class FakeStudioApi implements StudioApi {
   getTranscript(jobId: string): TranscriptDto {
     this.note('getTranscript', [jobId]);
     return { words: [], sentences: [] };
+  }
+
+  correctWord(jobId: string, wordIndex: number, request: CorrectWordRequest): TranscriptDto {
+    this.note('correctWord', [jobId, wordIndex, request]);
+    return { words: [{ i: wordIndex, text: request.text, start: 1.5, end: 2.0, speakerId: 'S1' }], sentences: [] };
   }
 
   chooseSpeaker(jobId: string, request: ChooseSpeakerRequest): JobDetailDto {
@@ -591,6 +597,7 @@ test('every StudioApi route dispatches with parsed bodies', async () => {
     ['/api/creators/default', { method: 'PUT', body: JSON.stringify({ creatorId: 'jones_manoel' }) }, 'setDefaultCreator', [{ creatorId: 'jones_manoel' }]],
     ['/api/jobs/j1/retry', { method: 'POST' }, 'retryJob', ['j1']],
     ['/api/jobs/j1/transcript', {}, 'getTranscript', ['j1']],
+    ['/api/jobs/j1/words/3', { method: 'PUT', body: JSON.stringify({ text: 'mês' }) }, 'correctWord', ['j1', 3, { text: 'mês' }]],
     ['/api/jobs/j1/speaker', { method: 'POST', body: JSON.stringify({ speakerId: 'S1' }) }, 'chooseSpeaker', ['j1', { speakerId: 'S1' }]],
     ['/api/jobs/j1/replan', { method: 'POST' }, 'replan', ['j1']],
     ['/api/jobs/j1/shorts', { method: 'POST', body: JSON.stringify({ range: { startWord: 0, endWord: 10 } }) }, 'createManualShort', ['j1', { range: { startWord: 0, endWord: 10 } }]],
@@ -613,9 +620,40 @@ test('every StudioApi route dispatches with parsed bodies', async () => {
     api.calls.map((call) => call.method),
     cases.map(([, , method]) => method),
   );
-  assert.deepEqual(api.calls[7], { method: 'saveEdit', args: cases[7][3] });
-  assert.deepEqual(api.calls[9], { method: 'suggestHooks', args: cases[9][3] });
-  assert.deepEqual(api.calls[15], { method: 'publish', args: cases[15][3] });
+  assert.deepEqual(api.calls[8], { method: 'saveEdit', args: cases[8][3] });
+  assert.deepEqual(api.calls[10], { method: 'suggestHooks', args: cases[10][3] });
+  assert.deepEqual(api.calls[16], { method: 'publish', args: cases[16][3] });
+});
+
+test('PUT /api/jobs/:jobId/words/:wordIndex parses the index or rejects bad input with 400', async () => {
+  const api = new FakeStudioApi();
+  const app = buildApp({ api });
+  const ok = await app.request('/api/jobs/j1/words/3', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ text: '  mês  ' }),
+  });
+  assert.equal(ok.status, 200);
+  assert.deepEqual(await ok.json(), { words: [{ i: 3, text: 'mês', start: 1.5, end: 2.0, speakerId: 'S1' }], sentences: [] });
+  assert.deepEqual(api.calls, [{ method: 'correctWord', args: ['j1', 3, { text: 'mês' }] }]);
+
+  for (const [route, body] of [
+    ['/api/jobs/j1/words/abc', { text: 'mês' }],
+    ['/api/jobs/j1/words/-1', { text: 'mês' }],
+    ['/api/jobs/j1/words/1.5', { text: 'mês' }],
+    ['/api/jobs/j1/words/3', { text: '' }],
+    ['/api/jobs/j1/words/3', { text: '   ' }],
+    ['/api/jobs/j1/words/3', { text: 'duas\nlinhas' }],
+    ['/api/jobs/j1/words/3', { text: 'coluna\tsecreta' }],
+    ['/api/jobs/j1/words/3', { text: 'x'.repeat(41) }],
+    ['/api/jobs/j1/words/3', { text: 'mês', extra: 1 }],
+  ] as const) {
+    const bad = await app.request(route, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    assert.equal(bad.status, 400, route);
+    const payload: { code: string } = await bad.json();
+    assert.equal(payload.code, 'invalid', route);
+    assert.equal(api.calls.length, 1, route);
+  }
 });
 
 test('startStudioServer binds 127.0.0.1 and serves the app', async () => {

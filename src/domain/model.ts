@@ -114,6 +114,7 @@ export interface JobRecord {
   media: SourceMedia | null;
   transcriptWords: TranscriptWord[];
   transcriptSentences: TranscriptSentence[];
+  transcriptRevision: number;
   semanticBlocks: SemanticBlock[];
   strongSpeakers: SpeakerSample[];
   chosenSpeakerId: string | null;
@@ -164,6 +165,7 @@ export interface ExportRecord {
   jobId: string;
   shortId: string;
   editRevision: number;
+  transcriptRevision: number;
   edit: ShortEdit;
   title: string;
   status: ExportStatus;

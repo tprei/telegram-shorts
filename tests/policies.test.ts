@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildSentences, detectStrongSpeakers } from '../src/domain/policies.js';
+import { buildSentences, detectStrongSpeakers, sentenceText } from '../src/domain/policies.js';
 import type { TranscriptWord } from '../src/domain/model.js';
 
 function word(text: string, startSeconds: number, endSeconds: number, index: number, speakerId = 'A'): TranscriptWord {
@@ -64,6 +64,30 @@ test('buildSentences breaks on speaker changes, terminal punctuation and long ga
 
   const gapped = buildSentences([word('um', 0, 0.5, 0), word('dois', 5.0, 5.5, 1)]);
   assert.equal(gapped.length, 2);
+});
+
+test('sentenceText joins only the sentence speaker words inside the span and reflects word corrections', () => {
+  const words: TranscriptWord[] = [
+    word('oi', 2.0, 2.5, 0),
+    word('blá', 0.5, 1.0, 1, 'B'),
+    word('assunto.', 2.5, 3.0, 2),
+  ];
+  const sentences = buildSentences(words, 'A');
+  assert.equal(sentences.length, 1);
+  assert.deepEqual(
+    sentences.map((sentence) => [sentence.startWord, sentence.endWord]),
+    [[0, 2]],
+  );
+  assert.equal(sentences[0]!.text, 'oi assunto.');
+  assert.equal(sentenceText(words, sentences[0]!), 'oi assunto.');
+
+  const mixed = buildSentences(words);
+  const hostSentence = mixed.find((sentence) => sentence.speakerId === 'A');
+  assert.ok(hostSentence);
+  assert.equal(sentenceText(words, hostSentence), 'oi assunto.');
+
+  words[0]!.text = 'olá';
+  assert.equal(sentenceText(words, hostSentence), 'olá assunto.');
 });
 
 test('detectStrongSpeakers keeps only speakers above the threshold, loudest first', () => {

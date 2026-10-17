@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { StudioService } from '../src/application/studio-service.js';
 import { ShortsPipeline } from '../src/application/pipeline.js';
@@ -157,8 +158,7 @@ interface SeededJob {
   edit: ShortEdit;
 }
 
-function seedReadyJob(store: ShortsStore, creator: CreatorProfile, rootDir: string): SeededJob {
-  const words = transcriptWords();
+function seedReadyJob(store: ShortsStore, creator: CreatorProfile, rootDir: string, words: TranscriptWord[] = transcriptWords()): SeededJob {
   const range: WordRange = { startWord: 0, endWord: words.length - 1 };
   const edit = createInitialEdit({ ranges: [range], words, speed: 1, hookText: 'A REGRA MUDOU' });
   const job: JobRecord = {
@@ -182,6 +182,7 @@ function seedReadyJob(store: ShortsStore, creator: CreatorProfile, rootDir: stri
     },
     transcriptWords: words,
     transcriptSentences: buildSentences(words),
+    transcriptRevision: 0,
     semanticBlocks: [],
     strongSpeakers: [],
     chosenSpeakerId: 'speaker_0',
@@ -222,6 +223,7 @@ function seedReadyExport(store: ShortsStore, seeded: SeededJob, rootDir: string)
     jobId: seeded.jobId,
     shortId: seeded.shortId,
     editRevision: 1,
+    transcriptRevision: 0,
     edit: seeded.edit,
     title: 'Short de teste',
     status: 'ready',
@@ -316,6 +318,141 @@ test('exportShort deduplicates per edit revision', async () => {
     assert.equal(afterEdit.exports[0].editRevision, 2);
   } finally {
     await cleanup(context);
+  }
+});
+
+test('correctWord updates the word and its sentence, bumps the revision, and ignores identical text', async () => {
+  const context = await makeContext();
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const before = context.store.getJob(seeded.jobId);
+    assert.ok(before);
+    assert.equal(before.transcriptRevision, 0);
+    const sentence = before.transcriptSentences.find((entry) => 3 >= entry.startWord && 3 <= entry.endWord);
+    assert.ok(sentence);
+
+    const corrected = context.service.correctWord(seeded.jobId, 3, { text: 'mes' });
+    assert.equal(corrected.words[3].text, 'mes');
+    const correctedSentence = corrected.sentences.find((entry) => entry.id === sentence.id);
+    assert.ok(correctedSentence);
+    assert.equal(correctedSentence.text, sentence.text.replace('jogo', 'mes'));
+
+    const stored = context.store.getJob(seeded.jobId);
+    assert.ok(stored);
+    assert.equal(stored.transcriptRevision, 1);
+    assert.equal(stored.transcriptWords[3].text, 'mes');
+    assert.equal(stored.transcriptSentences.find((entry) => entry.id === sentence.id)?.text, correctedSentence.text);
+
+    const unchanged = context.service.correctWord(seeded.jobId, 3, { text: 'mes' });
+    assert.deepEqual(unchanged, corrected);
+    assert.equal(context.store.getJob(seeded.jobId)?.transcriptRevision, 1);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('correctWord rebuilds the sentence text without an interleaved other-speaker word', async () => {
+  const context = await makeContext();
+  try {
+    const words: TranscriptWord[] = [
+      { id: 'w_000001', text: 'oi', startSeconds: 2.0, endSeconds: 2.5, speakerId: 'speaker_0', confidence: 0.99 },
+      { id: 'w_000002', text: 'blá', startSeconds: 0.5, endSeconds: 1.0, speakerId: 'speaker_1', confidence: 0.99 },
+      { id: 'w_000003', text: 'assunto.', startSeconds: 2.5, endSeconds: 3.0, speakerId: 'speaker_0', confidence: 0.99 },
+    ];
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir, words);
+    const corrected = context.service.correctWord(seeded.jobId, 0, { text: 'olá' });
+    assert.equal(corrected.words[0].text, 'olá');
+    assert.deepEqual(
+      corrected.sentences.map((sentence) => [sentence.startWord, sentence.endWord, sentence.text]),
+      [
+        [1, 1, 'blá'],
+        [0, 2, 'olá assunto.'],
+      ],
+    );
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('correctWord conflicts while planning and rejects out-of-range indices', async () => {
+  const context = await makeContext();
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const job = context.store.getJob(seeded.jobId);
+    assert.ok(job);
+    job.status = 'planning';
+    context.store.updateJob(job);
+    assert.throws(
+      () => context.service.correctWord(seeded.jobId, 3, { text: 'mes' }),
+      isStudioErrorWithCode('conflict'),
+    );
+    job.status = 'ready';
+    context.store.updateJob(job);
+    assert.throws(
+      () => context.service.correctWord(seeded.jobId, job.transcriptWords.length, { text: 'mes' }),
+      isStudioErrorWithCode('invalid'),
+    );
+    assert.throws(
+      () => context.service.correctWord(seeded.jobId, -1, { text: 'mes' }),
+      isStudioErrorWithCode('invalid'),
+    );
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('a correction invalidates exports created before it', async () => {
+  const context = await makeContext();
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const first = await context.service.exportShort(seeded.shortId);
+    assert.equal(context.store.listExportsForShort(seeded.shortId).length, 1);
+
+    context.service.correctWord(seeded.jobId, 3, { text: 'mes' });
+    const second = await context.service.exportShort(seeded.shortId);
+    assert.equal(context.store.listExportsForShort(seeded.shortId).length, 2);
+    assert.notEqual(second.exports[0].id, first.exports[0].id);
+
+    const third = await context.service.exportShort(seeded.shortId);
+    assert.equal(context.store.listExportsForShort(seeded.shortId).length, 2);
+    assert.equal(third.exports[0].id, second.exports[0].id);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('a version-2 database migrates payloads to transcriptRevision 0 and unknown versions throw', async () => {
+  const context = await makeContext();
+  const dbPath = join(context.rootDir, 'shorts.sqlite');
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    seedReadyExport(context.store, seeded, context.rootDir);
+    context.store.close();
+
+    const legacy = new DatabaseSync(dbPath);
+    legacy.exec("UPDATE jobs SET payload_json = json_remove(payload_json, '$.transcriptRevision')");
+    legacy.exec("UPDATE exports SET payload_json = json_remove(payload_json, '$.transcriptRevision')");
+    legacy.exec('PRAGMA user_version = 2');
+    legacy.close();
+
+    const migrated = await ShortsStore.open(dbPath);
+    try {
+      const job = migrated.getJob(seeded.jobId);
+      assert.ok(job);
+      assert.equal(job.transcriptRevision, 0);
+      const record = migrated.getExport('export_test');
+      assert.ok(record);
+      assert.equal(record.transcriptRevision, 0);
+    } finally {
+      migrated.close();
+    }
+
+    const unknown = new DatabaseSync(dbPath);
+    unknown.exec('PRAGMA user_version = 9');
+    unknown.close();
+    await assert.rejects(ShortsStore.open(dbPath), /Incompatible database/);
+  } finally {
+    await rm(context.rootDir, { recursive: true, force: true });
   }
 });
 

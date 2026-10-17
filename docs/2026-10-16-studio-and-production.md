@@ -455,12 +455,30 @@ Implemented presentation entrypoints are `web/src/views/InboxView.tsx`, `JobView
 
 `web/src/api/` fetch client typed with `@api` DTOs; TanStack Query hooks (poll every 2 s while a job is in progress, a short has crop analysis queued/running, an export is queued/rendering, or a publication is queued/publishing/deferred); editor state: local `ShortEdit` + undo/redo stack, debounced (400 ms) `PUT edit` with `baseRevision`, 409 → adopt the server edit and show a toast; adopt server edits when the revision changes and there are no unsaved local changes; `buildTimeline` from `@domain/timeline` on every edit change → `usePreviewEngine`; transcript actions call S1 edit ops; crop editor uses `MEDIA_ROUTES.frame`.
 
+## Word corrections (follow-up, 2026-10-17)
+
+Deepgram mishears some words ("MEI" → "mês"), and captions show whatever the transcript says. The operator fixes one word at a time in the editor's transcript; the fix belongs to the job's transcript, so every short of that job picks it up.
+
+### Contract
+
+- `JobRecord.transcriptRevision: number`: 0 at job creation, +1 per applied correction.
+- `ExportRecord.transcriptRevision: number`: snapshot at export creation. Export reuse requires the same `editRevision`, `title`, and `transcriptRevision`.
+- `src/domain/policies.ts` exports `sentenceText(words: TranscriptWord[], sentence: TranscriptSentence): string` (join of the texts of the sentence's speaker words with indices in `[startWord, endWord]`, normalized the same way `buildSentences` does); `buildSentences` uses it.
+- `src/studio/api-types.ts`: `CorrectWordRequestSchema = z.strictObject({ text })` where `text` is trimmed, 1–40 characters, no line breaks or tabs; `StudioApi.correctWord(jobId: string, wordIndex: number, request: CorrectWordRequest): TranscriptDto`.
+- Route: `PUT /api/jobs/:jobId/words/:wordIndex` (`wordIndex` must be a non-negative integer, else 400).
+- Service rules: the job must be `ready` (else `conflict`: planning rewrites the job record); `wordIndex >= words.length` → `invalid`; text equal to the current text → return the transcript unchanged, no revision bump; otherwise set the word text, recompute the containing sentence's `text` with `sentenceText`, `transcriptRevision + 1`, `appendAction('word_corrected', { wordIndex, from, to })`, return the full `TranscriptDto`. Replans pick corrections up because `plan_shorts` rebuilds sentences from `transcriptWords`.
+- Store: `SCHEMA_VERSION = 3`. Opening a version-2 database migrates in place (`json_set(payload_json, '$.transcriptRevision', 0)` on `jobs` and `exports`) and sets `user_version = 3`; version 0 creates fresh; anything else throws as today.
+- UI: `TranscriptPanel` and `ShortEditorViewProps` gain `onCorrectWord(wordIndex: number, text: string): void` and `correctingWordIndex: number | null`. Right-click a word, touch-and-hold it for 450 ms (movement cancels), or press F2 on the word cursor to open an in-flow correction card (Enter saves, Escape cancels, 1–40 characters, note that the fix applies to every short from the video). The pending word shows an amber dotted underline. Click-to-cut, drag-select, Alt+click seek, boundary handles, and Enter/Space toggling are unchanged.
+- Export feedback: every Export action switches the inspector to Export & publish (`EditorInspector` takes optional controlled `tab`/`onTabChange`), and the top bar shows queued, rendering, ready (with Download MP4), or failed (with the error and a retry) for the newest export of the current edit revision.
+- Wiring: `correctWord` client call; on success `setQueryData(['transcript', jobId], dto)` (the preview timeline rebuilds from it instantly) and invalidate `['short', shortId]` and `['job', jobId]`; `correctingWordIndex` comes from the pending mutation's variables; errors go to the editor toast. Corrections are not part of the edit undo stack.
+
 ## Verification
 
 1. `pnpm typecheck` and `pnpm test` pass with zero errors.
 2. `pnpm studio` serves the app at `http://127.0.0.1:4310`.
 3. With API keys: add a recent Filipe Boni video → shorts appear with hooks and auto crops → editor preview plays with cuts, zooms, captions, hook band → word strike and range changes update instantly → export produces a 1080×1920 mp4 whose captions, crops, and cut points match the preview.
 4. Without API keys: a throwaway script under `/tmp` seeds a job with media and a transcript, then the studio flow is exercised via a manual short and export.
+5. Word corrections: the backend tests for the rules above pass, and in the browser a corrected word shows up in the preview captions immediately and in a new export.
 
 ## Non-goals
 

@@ -8,6 +8,7 @@ import type { StudioMediaResolver } from '../application/studio-media.js';
 import { logError } from '../infra/util.js';
 import {
   ChooseSpeakerRequestSchema,
+  CorrectWordRequestSchema,
   CreateJobRequestSchema,
   CreateManualShortRequestSchema,
   PublishRequestSchema,
@@ -73,6 +74,12 @@ const FrameQuerySchema = z.object({
   w: finiteNumberQuery,
 });
 
+const WordIndexParamSchema = z
+  .string()
+  .min(1)
+  .regex(/^\d+$/)
+  .transform((value) => Number.parseInt(value, 10));
+
 export interface StudioAppInput {
   api: StudioApi;
   media: StudioMediaResolver;
@@ -105,6 +112,9 @@ export function createStudioApp(input: StudioAppInput): Hono {
   app.get('/api/jobs/:jobId', (c) => c.json(api.getJob(c.req.param('jobId'))));
   app.post('/api/jobs/:jobId/retry', (c) => c.json(api.retryJob(c.req.param('jobId'))));
   app.get('/api/jobs/:jobId/transcript', (c) => c.json(api.getTranscript(c.req.param('jobId'))));
+  app.put('/api/jobs/:jobId/words/:wordIndex', async (c) =>
+    c.json(api.correctWord(c.req.param('jobId'), WordIndexParamSchema.parse(c.req.param('wordIndex')), CorrectWordRequestSchema.parse(await parseBody(c)))),
+  );
   app.post('/api/jobs/:jobId/speaker', async (c) =>
     c.json(api.chooseSpeaker(c.req.param('jobId'), ChooseSpeakerRequestSchema.parse(await parseBody(c)))),
   );

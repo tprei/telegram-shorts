@@ -1,5 +1,6 @@
 import type {
   ChooseSpeakerRequest,
+  CorrectWordRequest,
   CreateJobRequest,
   CreateManualShortRequest,
   CreatorDto,
@@ -101,6 +102,18 @@ export function retryJob(jobId: string): Promise<JobDetailDto> {
 
 export function getTranscript(jobId: string): Promise<TranscriptDto> {
   return request<TranscriptDto>(`/api/jobs/${encodeURIComponent(jobId)}/transcript`);
+}
+
+export function correctWord(
+  jobId: string,
+  wordIndex: number,
+  request: CorrectWordRequest,
+): Promise<TranscriptDto> {
+  return jsonRequest<TranscriptDto>(
+    'PUT',
+    `/api/jobs/${encodeURIComponent(jobId)}/words/${wordIndex}`,
+    request,
+  );
 }
 
 export function chooseSpeaker(jobId: string, request: ChooseSpeakerRequest): Promise<JobDetailDto> {

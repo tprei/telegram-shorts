@@ -24,6 +24,7 @@ import { ApiRequestError, errorMessage } from '../api/client';
 import {
   queryKeys,
   useAnalyzeCropsMutation,
+  useCorrectWordMutation,
   useExportShortMutation,
   useGeneratePublishCopyMutation,
   usePublishMutation,
@@ -133,6 +134,7 @@ function ShortEditorSurface({ detail, transcript, refetchShort }: ShortEditorSur
   const generateCopyMutation = useGeneratePublishCopyMutation(detail.short.id);
   const updatePublishCopyMutation = useUpdatePublishCopyMutation(detail.short.id);
   const publishMutation = usePublishMutation();
+  const correctWordMutation = useCorrectWordMutation(detail.job.id, detail.short.id);
 
   const transcriptWords = useMemo<TranscriptWord[]>(
     () =>
@@ -338,6 +340,17 @@ function ShortEditorSurface({ detail, transcript, refetchShort }: ShortEditorSur
     [preview, timeline, transcriptWords],
   );
 
+  const onCorrectWord = useCallback(
+    (wordIndex: number, text: string) => {
+      void correctWordMutation.mutateAsync({ wordIndex, text }).catch(showToast);
+    },
+    [correctWordMutation.mutateAsync, showToast],
+  );
+
+  const correctingWordIndex = correctWordMutation.isPending
+    ? (correctWordMutation.variables?.wordIndex ?? null)
+    : null;
+
   const onSuggestHooks = useCallback(() => {
     void runAction(async () => {
       const suggestions = await suggestHooksMutation.mutateAsync(undefined);
@@ -461,6 +474,8 @@ function ShortEditorSurface({ detail, transcript, refetchShort }: ShortEditorSur
       onToggleWord={onToggleWord}
       onRangeAction={onRangeAction}
       onSetBoundary={onSetBoundary}
+      onCorrectWord={onCorrectWord}
+      correctingWordIndex={correctingWordIndex}
       frameUrl={frameUrl}
       hookSuggestions={hookSuggestions}
       hooksPending={suggestHooksMutation.isPending}

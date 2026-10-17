@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import type { ExportRecord, JobRecord, JobSummaryRecord, PublicationRecord, QueueTask, QueueTaskKind, QueueTaskPayloads, ShortRecord, ShortVideoPlatform } from '../domain/model.js';
 import { createId, ensureParent, nowIso, parseJson } from './util.js';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS settings (
@@ -97,9 +97,13 @@ export class ShortsStore {
     if (versionRow !== null && typeof versionRow === 'object' && 'user_version' in versionRow && typeof versionRow.user_version === 'number') {
       userVersion = versionRow.user_version;
     }
-    if (userVersion !== 0 && userVersion !== SCHEMA_VERSION) {
+    if (userVersion !== 0 && userVersion !== 2 && userVersion !== SCHEMA_VERSION) {
       db.close();
       throw new Error(`Incompatible database at ${path}; delete it to start fresh`);
+    }
+    if (userVersion === 2) {
+      db.exec(`UPDATE jobs SET payload_json = json_set(payload_json, '$.transcriptRevision', 0)`);
+      db.exec(`UPDATE exports SET payload_json = json_set(payload_json, '$.transcriptRevision', 0)`);
     }
     db.exec(SCHEMA_SQL);
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
