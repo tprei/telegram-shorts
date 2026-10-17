@@ -4,7 +4,7 @@ import { BufferClient } from './buffer.js';
 import { MallaryClient, MallaryUploadClient } from './mallary.js';
 import { createPublicAssetHost } from './public-asset-host.js';
 import type { ShortVideoPlatform } from '../domain/model.js';
-import type { ShortVideoPublishInput, ShortVideoPublishProvider, ShortVideoPublishResult } from './instagram-publisher.js';
+import type { ShortVideoCheckPublicationInput, ShortVideoPublishInput, ShortVideoPublishProvider, ShortVideoPublishResult, RemotePublicationState } from './instagram-publisher.js';
 import { ShortVideoPublishError } from './instagram-publisher.js';
 
 export function createShortVideoPublishProvider(config: AppConfig): ShortVideoPublishProvider | null {
@@ -35,9 +35,6 @@ export function createShortVideoPublishProvider(config: AppConfig): ShortVideoPu
 
   if (providers.length === 0) {
     return null;
-  }
-  if (providers.length === 1) {
-    return providers[0];
   }
   return new FallbackShortVideoPublishProvider(providers, {
     instagram: order,
@@ -81,6 +78,19 @@ class FallbackShortVideoPublishProvider implements ShortVideoPublishProvider {
       }
     }
     throw new Error(`All short-video publish providers failed for ${input.platform}: ${failures.join(' | ')}`);
+  }
+
+  async checkPublication(input: ShortVideoCheckPublicationInput): Promise<RemotePublicationState> {
+    const provider = this.providers.find((entry) => entry.name === input.provider);
+    if (!provider) {
+      throw new ShortVideoPublishError({
+        provider: input.provider,
+        stage: 'discovery',
+        message: `No publish provider named ${input.provider} is configured to check ${input.platform}.`,
+        safeToFailover: false,
+      });
+    }
+    return provider.checkPublication(input);
   }
 
   private orderedProvidersForPlatform(platform: ShortVideoPlatform): ShortVideoPublishProvider[] {

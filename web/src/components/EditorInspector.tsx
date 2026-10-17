@@ -6,7 +6,6 @@ import type { PublishCopy, ShortVideoPlatform } from '@domain/model';
 import {
   ApiError,
   Button,
-  EmptyState,
   Slider,
   StatusBadge,
   Toggle,
@@ -15,6 +14,7 @@ import {
 } from './StudioPrimitives';
 import { CropEditor } from './CropEditor';
 import { ExportFeedback, newestExport } from './ExportFeedback';
+import { PublishPanel } from './PublishPanel';
 
 export type InspectorTab = 'edit' | 'framing' | 'revise' | 'publish';
 export interface RevisionSummary {
@@ -52,18 +52,13 @@ export interface EditorInspectorProps {
   onGenerateCopy: () => void;
   onPublishCopyChange: (copy: PublishCopy) => void;
   onSelectedPlatformsChange: (platforms: ShortVideoPlatform[]) => void;
-  onPublish: (force: boolean) => void;
+  onPublish: (force: boolean, platforms: ShortVideoPlatform[]) => void;
 }
 const tabLabels: Record<InspectorTab, string> = {
   edit: 'Edit',
   framing: 'Framing',
   revise: 'Revise',
   publish: 'Export & publish',
-};
-const platformNames: Record<ShortVideoPlatform, string> = {
-  instagram: 'Instagram',
-  tiktok: 'TikTok',
-  youtube_shorts: 'YouTube Shorts',
 };
 export function EditorInspector(props: EditorInspectorProps) {
   const {
@@ -104,7 +99,6 @@ export function EditorInspector(props: EditorInspectorProps) {
   const [cropIndex, setCropIndex] = useState(0);
   const [revisionMessage, setRevisionMessage] = useState('');
   const [hashtagDraft, setHashtagDraft] = useState('');
-  const [forceConfirm, setForceConfirm] = useState(false);
   const publishCopy: PublishCopy = savedPublishCopy ?? { line1: '', line2: '', hashtags: [] };
   const copyReady = Boolean(
     publishCopy.line1.trim() && publishCopy.line2.trim() && publishCopy.hashtags.length,
@@ -115,7 +109,7 @@ export function EditorInspector(props: EditorInspectorProps) {
   const analyzing =
     detail.short.cropAnalysis === 'queued' || detail.short.cropAnalysis === 'running';
   const currentExport = newestExport(detail.exports, detail.short.editRevision);
-  const latestReadyExport = detail.exports.find((item) => item.status === 'ready');
+  const latestReadyExport = detail.exports.find((item) => item.status === 'ready') ?? null;
   const rendering = detail.exports.some(
     (item) => item.status === 'queued' || item.status === 'rendering',
   );
@@ -468,6 +462,7 @@ export function EditorInspector(props: EditorInspectorProps) {
                         <video
                           controls
                           src={item.videoUrl}
+                          poster={item.coverUrl ?? undefined}
                           preload="none"
                           aria-label={`Export revision ${item.editRevision}`}
                         />
@@ -556,119 +551,17 @@ export function EditorInspector(props: EditorInspectorProps) {
                 </div>
               </div>
             </section>
-            <section className="inspector-section">
-              <p className="eyebrow">DESTINATIONS</p>
-              <div className="platform-list">
-                {detail.platforms.map((platform) => (
-                  <label
-                    className={`platform-row ${platform.available ? '' : 'is-disabled'}`}
-                    key={platform.platform}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={selectedPlatforms.includes(platform.platform)}
-                      disabled={!platform.available || publishPending}
-                      onChange={(event) =>
-                        onSelectedPlatformsChange(
-                          event.target.checked
-                            ? [...selectedPlatforms, platform.platform]
-                            : selectedPlatforms.filter((item) => item !== platform.platform),
-                        )
-                      }
-                    />
-                    <span>
-                      <strong>{platformNames[platform.platform]}</strong>
-                      {!platform.available && (
-                        <span className="control-description">
-                          {platform.reason || 'Not connected'}
-                        </span>
-                      )}
-                    </span>
-                  </label>
-                ))}
-              </div>
-              {!latestReadyExport && (
-                <p className="field-help">Export a video before publishing.</p>
-              )}
-              <Button
-                variant="primary"
-                className="full-width"
-                pending={publishPending}
-                disabled={!latestReadyExport || selectedPlatforms.length === 0 || !copyReady}
-                onClick={() => onPublish(false)}
-              >
-                Publish to {selectedPlatforms.length || 'selected'}{' '}
-                {selectedPlatforms.length === 1 ? 'platform' : 'platforms'}
-              </Button>
-              {detail.publications.length > 0 && (
-                <div className="force-repost">
-                  {forceConfirm ? (
-                    <>
-                      <p className="warning-note">
-                        This may create duplicate posts on the selected platforms.
-                      </p>
-                      <div className="button-group">
-                        <Button
-                          variant="danger"
-                          disabled={
-                            publishPending ||
-                            !latestReadyExport ||
-                            !copyReady ||
-                            selectedPlatforms.length === 0
-                          }
-                          onClick={() => {
-                            onPublish(true);
-                            setForceConfirm(false);
-                          }}
-                        >
-                          Confirm repost
-                        </Button>
-                        <Button variant="ghost" onClick={() => setForceConfirm(false)}>
-                          Cancel
-                        </Button>
-                      </div>
-                    </>
-                  ) : (
-                    <Button
-                      variant="ghost"
-                      disabled={
-                        publishPending ||
-                        !latestReadyExport ||
-                        selectedPlatforms.length === 0 ||
-                        !copyReady
-                      }
-                      onClick={() => setForceConfirm(true)}
-                    >
-                      Force repost
-                    </Button>
-                  )}
-                </div>
-              )}
-              <div className="publication-list" aria-live="polite">
-                {detail.publications.map((publication) => (
-                  <article className="publication-item" key={publication.id}>
-                    <div className="field-line">
-                      <strong>{platformNames[publication.platform]}</strong>
-                      <StatusBadge status={publication.status} />
-                    </div>
-                    {publication.status === 'deferred' && publication.availableAt && (
-                      <p className="field-help">
-                        Scheduled for {new Date(publication.availableAt).toLocaleString()}
-                      </p>
-                    )}
-                    {publication.status === 'published' && (
-                      <p className="field-help">Published {relativeTime(publication.updatedAt)}</p>
-                    )}
-                    <ApiError message={publication.error} title="Publishing failed" />
-                  </article>
-                ))}
-              </div>
-              {detail.platforms.length === 0 && (
-                <EmptyState title="No destinations connected">
-                  Connect a publishing provider to see available platforms.
-                </EmptyState>
-              )}
-            </section>
+            <PublishPanel
+              latestReadyExport={latestReadyExport}
+              exports={detail.exports}
+              publications={detail.publications}
+              platforms={detail.platforms}
+              selectedPlatforms={selectedPlatforms}
+              publishPending={publishPending}
+              copyReady={copyReady}
+              onSelectedPlatformsChange={onSelectedPlatformsChange}
+              onPublish={onPublish}
+            />
           </>
         )}
         <ApiError message={error} />

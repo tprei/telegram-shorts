@@ -316,8 +316,11 @@ function publicationDto(exportId: string): PublicationDto {
     platform: 'instagram',
     status: 'queued',
     provider: null,
+    url: null,
     error: null,
+    forced: false,
     availableAt: null,
+    submittedAt: null,
     createdAt: '2026-10-16T11:10:00.000Z',
     updatedAt: '2026-10-16T11:10:00.000Z',
   };

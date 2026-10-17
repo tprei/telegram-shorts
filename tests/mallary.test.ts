@@ -5,7 +5,8 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { MallaryUploadClient, buildMallaryInstagramReelPayload, buildPublishMessage, mallaryMimeType, parseMallaryRetryAfterSeconds } from '../src/infra/mallary.js';
+import { MallaryClient, MallaryUploadClient, buildMallaryInstagramReelPayload, buildPublishMessage, mallaryMimeType, parseMallaryRetryAfterSeconds } from '../src/infra/mallary.js';
+import { ShortVideoPublishError } from '../src/infra/instagram-publisher.js';
 
 interface FakeMallary {
   baseUrl: string;
@@ -183,4 +184,127 @@ test('mallary throttle payload exposes retry-after seconds', () => {
   }));
   assert.equal(retryAfter, 234);
   assert.equal(parseMallaryRetryAfterSeconds('{"error":{"code":"other"}}'), null);
+});
+
+function withJobFetch(body: string, status: number, record: { url: string; headers: Record<string, string> }): typeof fetch {
+  return async (input, init) => {
+    record.url = String(input);
+    record.headers = { ...((init?.headers ?? {}) as Record<string, string>) };
+    return new Response(body, { status });
+  };
+}
+
+function checkJob(remoteJobId: string): Promise<unknown> {
+  return new MallaryClient('token', null, new MallaryUploadClient('token')).checkPublication({
+    provider: 'mallary',
+    platform: 'instagram',
+    remoteJobId,
+  });
+}
+
+async function withFetch(run: (restore: () => void) => Promise<void>): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  try {
+    await run(() => {
+      globalThis.fetch = originalFetch;
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+test('Mallary check maps completed jobs to live with the platform post url', async () => {
+  await withFetch(async () => {
+    const record = { url: '', headers: {} as Record<string, string> };
+    globalThis.fetch = withJobFetch(JSON.stringify({ data: { job: { status: 'completed', platform_post_url: 'https://www.instagram.com/reel/xyz/' } } }), 200, record);
+    const state = await checkJob('job_9');
+    assert.deepEqual(state, { status: 'live', url: 'https://www.instagram.com/reel/xyz/', error: null });
+    assert.equal(record.url, 'https://mallary.ai/api/v1/jobs/job_9');
+    assert.equal(record.headers.Authorization, 'Bearer token');
+  });
+});
+
+test('Mallary check maps terminal job states to failed using the first available reason', async () => {
+  const cases: Array<{ job: Record<string, unknown>; error: string }> = [
+    { job: { status: 'failed', failedReason: 'Instagram rejected the video' }, error: 'Instagram rejected the video' },
+    { job: { status: 'failed', error: 'Upload processing failed' }, error: 'Upload processing failed' },
+    { job: { status: 'action_required', action_required: { message: 'Reconnect the account' } }, error: 'Reconnect the account' },
+    { job: { status: 'cancelled', error_code: 'CANCELLED_BY_USER' }, error: 'CANCELLED_BY_USER' },
+  ];
+  await withFetch(async () => {
+    for (const testCase of cases) {
+      globalThis.fetch = withJobFetch(JSON.stringify({ data: { job: testCase.job } }), 200, { url: '', headers: {} });
+      const state = await checkJob('job_1');
+      assert.deepEqual(state, { status: 'failed', url: null, error: testCase.error });
+    }
+  });
+});
+
+test('Mallary check treats every other job status as pending', async () => {
+  await withFetch(async () => {
+    globalThis.fetch = withJobFetch(JSON.stringify({ data: { job: { status: 'processing' } } }), 200, { url: '', headers: {} });
+    const state = await checkJob('job_2');
+    assert.deepEqual(state, { status: 'pending', url: null, error: null });
+  });
+});
+
+test('Mallary check surfaces error.message from non-2xx bodies instead of the raw JSON', async () => {
+  await withFetch(async () => {
+    globalThis.fetch = withJobFetch(JSON.stringify({ error: { message: 'Job lookup failed', code: 'job_not_found' } }), 500, { url: '', headers: {} });
+    await assert.rejects(
+      checkJob('job_3'),
+      (error: unknown) => {
+        if (!(error instanceof ShortVideoPublishError)) {
+          return false;
+        }
+        assert.equal(error.message, 'Mallary job status request failed: Job lookup failed');
+        assert.equal(error.message.includes('job_not_found'), false);
+        return true;
+      },
+    );
+  });
+});
+
+test('Mallary check keeps status and raw body in the error when no error.message exists', async () => {
+  await withFetch(async () => {
+    globalThis.fetch = withJobFetch('upstream exploded', 502, { url: '', headers: {} });
+    await assert.rejects(
+      checkJob('job_4'),
+      (error: unknown) => error instanceof ShortVideoPublishError && error.message === 'Mallary job status request failed: 502 upstream exploded',
+    );
+  });
+});
+
+test('Mallary check tolerates empty strings and non-string error fields on completed jobs', async () => {
+  await withFetch(async () => {
+    globalThis.fetch = withJobFetch(JSON.stringify({
+      data: {
+        job: {
+          status: 'completed',
+          platform_post_url: '',
+          failedReason: 42,
+          error: { code: 'LEGACY', message: 'should not break parsing' },
+          error_code: '',
+          action_required: 'not-an-object',
+        },
+      },
+    }), 200, { url: '', headers: {} });
+    const state = await checkJob('job_10');
+    assert.deepEqual(state, { status: 'live', url: null, error: null });
+  });
+});
+
+test('Mallary check falls back through lenient failure reasons', async () => {
+  const cases: Array<{ job: Record<string, unknown>; error: string }> = [
+    { job: { status: 'failed', error: '', failedReason: '  ' }, error: 'Mallary job ended as failed without a reason.' },
+    { job: { status: 'failed', failedReason: 'Kept reason', error: { code: 'E1' } }, error: 'Kept reason' },
+    { job: { status: 'cancelled', error: { code: 'E2' }, error_code: 'CANCELLED' }, error: 'CANCELLED' },
+  ];
+  await withFetch(async () => {
+    for (const testCase of cases) {
+      globalThis.fetch = withJobFetch(JSON.stringify({ data: { job: testCase.job } }), 200, { url: '', headers: {} });
+      const state = await checkJob('job_11');
+      assert.deepEqual(state, { status: 'failed', url: null, error: testCase.error });
+    }
+  });
 });

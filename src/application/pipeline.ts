@@ -1,29 +1,44 @@
 import { mkdir, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { z } from 'zod';
 import { createInitialEdit, keptWordIndices, replaceAutoCrops, type ShortEdit } from '../domain/edit.js';
-import { QUEUE_LANES, type JobRecord, type PublicationRecord, type QueueLane, type QueueTask, type ShortRecord, type SourceMedia, type TranscriptWord } from '../domain/model.js';
+import { QUEUE_LANES, type ExportRecord, type JobRecord, type PublicationRecord, type PublicationStatus, type QueueLane, type QueueTask, type ShortRecord, type SourceMedia, type TranscriptWord } from '../domain/model.js';
 import { computeSourceClips, buildTimeline, type SourceClip } from '../domain/timeline.js';
 import { buildSentences, detectStrongSpeakers } from '../domain/policies.js';
 import type { ContentPanel, LayoutProfile } from '../domain/layout.js';
 import { buildPlannedShorts, diagnoseCandidatePlan, fallbackSemanticBlocks, materializeSemanticBlocks, semanticBlocksAreUsable } from '../domain/semantic.js';
 import type { CreatorProfileRepository } from '../infra/creator-profile-loader.js';
 import { buildPublishMessage } from '../infra/mallary.js';
-import { extractFrame, renderShortExport } from '../infra/render.js';
+import { extractFrame, renderCoverImage, renderShortExport } from '../infra/render.js';
 import { transcribeSource } from '../infra/transcript.js';
 import { analyzeContentCrops } from '../infra/vision.js';
 import { downloadSource } from '../infra/youtube.js';
 import type { AppConfig } from '../infra/env.js';
-import { ShortsStore } from '../infra/db.js';
-import { ShortVideoPublishError, type ShortVideoPublishProvider } from '../infra/instagram-publisher.js';
-import { createId, logError, nowIso } from '../infra/util.js';
+import { CHECK_WINDOW_MS, ShortsStore } from '../infra/db.js';
+import { ShortVideoPublishError, isTransientCheckError, type RemotePublicationState, type ShortVideoPublishProvider } from '../infra/instagram-publisher.js';
+import { createId, describeError, logError, nowIso } from '../infra/util.js';
 import type { OpenRouterClient } from '../infra/openrouter.js';
-import { mallaryCooldownKey, platformAvailability } from './platforms.js';
+import { mallaryCooldownKey, platformAvailability, platformLabel } from './platforms.js';
 
 const EmptyPayloadSchema = z.strictObject({});
 const AnalyzeCropsPayloadSchema = z.strictObject({ shortId: z.string().min(1) });
 const ExportShortPayloadSchema = z.strictObject({ exportId: z.string().min(1) });
 const PublishShortVideoPayloadSchema = z.strictObject({ publicationId: z.string().min(1) });
+const CheckPublicationPayloadSchema = z.strictObject({ publicationId: z.string().min(1) });
+
+const CHECK_PUBLISH_DELAY_MS = 15_000;
+const CHECK_RETRY_DELAY_MS = 20_000;
+const CHECK_UNCONFIRMED_DELAY_MS = 10 * 60 * 1000;
+const CHECK_DEADLINE_MS = 60 * 60 * 1000;
+
+const PRESERVED_PUBLICATION_STATUSES: readonly PublicationStatus[] = ['submitted', 'published', 'unconfirmed'];
+
+class PublicationCheckRetry extends Error {
+  constructor(readonly availableAt: string, readonly reason: string) {
+    super(reason);
+    this.name = 'PublicationCheckRetry';
+  }
+}
 
 export interface ShortsPipelineDeps {
   config: AppConfig;
@@ -69,6 +84,11 @@ export class ShortsPipeline {
     if (task.kind === 'export_short') {
       const { exportId } = ExportShortPayloadSchema.parse(task.payload);
       await this.exportShort(exportId);
+      return;
+    }
+    if (task.kind === 'check_publication') {
+      const { publicationId } = CheckPublicationPayloadSchema.parse(task.payload);
+      await this.checkPublication(publicationId);
       return;
     }
     const { publicationId } = PublishShortVideoPayloadSchema.parse(task.payload);
@@ -280,16 +300,19 @@ export class ShortsPipeline {
       layout: job.layoutProfileSnapshot,
       source: { width: media.width, height: media.height, durationSeconds: media.durationSeconds },
     });
+    const workDir = join(await this.ensureJobDir(job.id), 'exports', record.id);
     const result = await renderShortExport({
       timeline,
       layout: job.layoutProfileSnapshot,
       sourceVideoPath: media.videoPath,
-      workDir: join(await this.ensureJobDir(job.id), 'exports', record.id),
+      workDir,
       fontsDir: this.deps.config.fontsDir,
       endCardThumbnailPath: media.thumbnailPath,
     });
+    const coverPath = await this.tryRenderExportCover(job, media, record, workDir);
     record.status = 'ready';
     record.artifactPath = result.artifactPath;
+    record.coverPath = coverPath;
     record.sizeBytes = result.sizeBytes;
     record.durationSeconds = result.durationSeconds;
     record.error = null;
@@ -297,9 +320,39 @@ export class ShortsPipeline {
     this.deps.store.updateExport(record);
   }
 
+  private async tryRenderExportCover(job: JobRecord, media: SourceMedia, record: ExportRecord, workDir: string): Promise<string | null> {
+    try {
+      return await this.renderExportCover(job, media, record, workDir);
+    } catch (error) {
+      logError('Cover render failed; continuing without a cover', error, { exportId: record.id, jobId: job.id });
+      return null;
+    }
+  }
+
+  private async renderExportCover(job: JobRecord, media: SourceMedia, record: ExportRecord, workDir: string): Promise<string> {
+    let imagePath = media.thumbnailPath;
+    if (imagePath === null) {
+      const firstClip = computeSourceClips(record.edit, job.transcriptWords, media.durationSeconds)[0];
+      if (firstClip === undefined) {
+        throw new Error(`Export ${record.id} has no clips to take a cover frame from.`);
+      }
+      const clipLength = firstClip.sourceEnd - firstClip.sourceStart;
+      imagePath = join(workDir, 'cover-source.jpg');
+      await extractFrame({
+        videoPath: media.videoPath,
+        seconds: firstClip.sourceStart + Math.min(2, Math.max(0.3, clipLength / 3)),
+        width: media.width,
+        outputPath: imagePath,
+      });
+    }
+    const coverPath = join(workDir, 'cover.jpg');
+    await renderCoverImage({ imagePath, outputPath: coverPath, width: job.layoutProfileSnapshot.canvas.width, height: job.layoutProfileSnapshot.canvas.height });
+    return coverPath;
+  }
+
   private async publishShortVideo(publicationId: string): Promise<void> {
     const publication = this.requirePublication(publicationId);
-    if (publication.status === 'published' || publication.status === 'failed') {
+    if (publication.status === 'published' || publication.status === 'failed' || publication.status === 'submitted' || publication.status === 'unconfirmed') {
       return;
     }
     const exportRecord = this.deps.store.getExport(publication.exportId);
@@ -344,30 +397,58 @@ export class ShortsPipeline {
     }
     let coverPath: string | null = null;
     if (publication.platform === 'instagram') {
-      coverPath = `${exportRecord.artifactPath}.cover.jpg`;
-      await extractFrame({ videoPath: exportRecord.artifactPath, seconds: 0.6, width: 1080, outputPath: coverPath });
+      coverPath = exportRecord.coverPath;
+      if (coverPath === null) {
+        coverPath = await this.tryRenderExportCover(job, this.requireMedia(job), exportRecord, dirname(exportRecord.artifactPath));
+        if (coverPath !== null) {
+          const current = this.deps.store.getExport(exportRecord.id);
+          if (current) {
+            current.coverPath = coverPath;
+            current.updatedAt = nowIso();
+            this.deps.store.updateExport(current);
+          }
+        }
+      }
     }
     const result = await this.deps.publisher.publishShortVideo({
       platform: publication.platform,
       filePath: exportRecord.artifactPath,
       message: buildPublishMessage(copy),
       title: publication.platform === 'youtube_shorts' ? short.title : null,
-      idempotencyKey: publication.forced
-        ? `shorts-${publication.platform}-${exportRecord.id}-${publication.id}`
-        : `shorts-${publication.platform}-${exportRecord.id}`,
+      idempotencyKey: `shorts-${publication.platform}-${exportRecord.id}-${publication.id}`,
       thumbnailPath: coverPath,
       commentsUnderPost: publication.platform === 'instagram' && job.sourceUrl
         ? [`Vídeo completo: ${job.sourceUrl}`]
         : [],
     });
-    publication.status = 'published';
+    if (result.jobs.length === 0) {
+      const message = `${result.provider} accepted the post but returned no id to track; check ${platformLabel(publication.platform)} before reposting.`;
+      publication.status = 'unconfirmed';
+      publication.provider = result.provider;
+      publication.batchId = result.batchId;
+      publication.error = message;
+      publication.updatedAt = nowIso();
+      this.deps.store.updatePublication(publication);
+      this.deps.store.appendAction(job.id, 'short_video_unconfirmed', {
+        publicationId: publication.id,
+        platform: publication.platform,
+        provider: result.provider,
+        error: message,
+      });
+      return;
+    }
+    publication.status = 'submitted';
     publication.provider = result.provider;
     publication.batchId = result.batchId;
     publication.remoteJobs = result.jobs;
+    publication.submittedAt = nowIso();
     publication.error = null;
     publication.updatedAt = nowIso();
     this.deps.store.updatePublication(publication);
-    this.deps.store.appendAction(job.id, 'short_video_published', {
+    this.deps.store.enqueueTask(job.id, 'check_publication', { publicationId: publication.id }, {
+      availableAt: new Date(Date.now() + CHECK_PUBLISH_DELAY_MS).toISOString(),
+    });
+    this.deps.store.appendAction(job.id, 'short_video_submitted', {
       publicationId: publication.id,
       platform: publication.platform,
       provider: result.provider,
@@ -377,14 +458,132 @@ export class ShortsPipeline {
     });
   }
 
+  private async checkPublication(publicationId: string): Promise<void> {
+    const publication = this.requirePublication(publicationId);
+    if (publication.status !== 'submitted' && publication.status !== 'unconfirmed') {
+      return;
+    }
+    if (publication.status === 'unconfirmed' && !this.insideCheckWindowAt(publication, Date.now())) {
+      return;
+    }
+    if (!publication.provider || publication.submittedAt === null) {
+      this.markUnconfirmed(publication, `No provider result was recorded to check; check ${platformLabel(publication.platform)} before reposting.`);
+      return;
+    }
+    const remoteJob = publication.remoteJobs[0];
+    if (!remoteJob) {
+      this.markUnconfirmed(publication, `${publication.provider} accepted the post but returned no id to track; check ${platformLabel(publication.platform)} before reposting.`);
+      return;
+    }
+    let state: RemotePublicationState;
+    try {
+      state = await this.requirePublisher().checkPublication({
+        provider: publication.provider,
+        platform: publication.platform,
+        remoteJobId: remoteJob.jobId,
+      });
+    } catch (error) {
+      logError('Publication check failed', error, { publicationId: publication.id, provider: publication.provider, remoteJobId: remoteJob.jobId });
+      if (!isTransientCheckError(error)) {
+        if (publication.status === 'submitted') {
+          this.markUnconfirmed(publication, describeError(error));
+        }
+        return;
+      }
+      this.deferCheck(publication, describeError(error));
+      return;
+    }
+    if (state.status === 'live') {
+      publication.status = 'published';
+      publication.remoteUrl = state.url;
+      publication.error = null;
+      publication.updatedAt = nowIso();
+      this.deps.store.updatePublication(publication);
+      this.deps.store.appendAction(publication.jobId, 'short_video_published', {
+        publicationId: publication.id,
+        platform: publication.platform,
+        provider: publication.provider,
+        remoteUrl: state.url,
+      });
+      return;
+    }
+    if (state.status === 'failed') {
+      this.failPublication(publication, state.error ?? `No final result from ${publication.provider}; check ${platformLabel(publication.platform)} before reposting.`);
+      return;
+    }
+    this.deferCheck(publication, `Waiting for ${publication.provider} to report a final result for ${platformLabel(publication.platform)}.`);
+  }
+
+  private deferCheck(publication: PublicationRecord, reason: string): void {
+    const now = Date.now();
+    const submittedAtMs = Date.parse(publication.submittedAt ?? nowIso());
+    if (publication.status === 'submitted' && now < submittedAtMs + CHECK_DEADLINE_MS) {
+      throw new PublicationCheckRetry(new Date(now + CHECK_RETRY_DELAY_MS).toISOString(), reason);
+    }
+    if (publication.status === 'submitted') {
+      this.markUnconfirmed(publication, `No final result from ${publication.provider} after 60 minutes; check ${platformLabel(publication.platform)} before reposting.`);
+    }
+    if (this.insideCheckWindowAt(publication, now)) {
+      throw new PublicationCheckRetry(new Date(now + CHECK_UNCONFIRMED_DELAY_MS).toISOString(), reason);
+    }
+  }
+
+  private insideCheckWindowAt(publication: PublicationRecord, nowMs: number): boolean {
+    return publication.submittedAt !== null && nowMs < Date.parse(publication.submittedAt) + CHECK_WINDOW_MS;
+  }
+
+  private markUnconfirmed(publication: PublicationRecord, message: string): void {
+    if (publication.status !== 'submitted') {
+      return;
+    }
+    publication.status = 'unconfirmed';
+    publication.error = message;
+    publication.updatedAt = nowIso();
+    this.deps.store.updatePublication(publication);
+    this.deps.store.appendAction(publication.jobId, 'short_video_unconfirmed', {
+      publicationId: publication.id,
+      platform: publication.platform,
+      provider: publication.provider,
+      error: message,
+    });
+  }
+
+  private failPublication(publication: PublicationRecord, message: string): void {
+    publication.status = 'failed';
+    publication.error = message;
+    publication.updatedAt = nowIso();
+    this.deps.store.updatePublication(publication);
+    this.deps.store.appendAction(publication.jobId, 'short_video_publish_failed', {
+      publicationId: publication.id,
+      platform: publication.platform,
+      provider: publication.provider,
+      error: message,
+    });
+  }
+
+  private requirePublisher(): ShortVideoPublishProvider {
+    if (!this.deps.publisher) {
+      throw new Error('No publish provider is configured.');
+    }
+    return this.deps.publisher;
+  }
+
   private handleTaskFailure(task: QueueTask, error: unknown): boolean {
     const message = error instanceof Error ? error.message : String(error);
+    if (task.kind === 'check_publication') {
+      if (error instanceof PublicationCheckRetry) {
+        this.deps.store.rescheduleTask(task, error.availableAt, error.reason);
+        return true;
+      }
+      this.deps.store.failTask(task, message);
+      return true;
+    }
     if (task.kind === 'publish_short_video') {
       const { publicationId } = PublishShortVideoPayloadSchema.parse(task.payload);
       const publication = this.deps.store.getPublication(publicationId);
       if (error instanceof ShortVideoPublishError && error.provider === 'mallary' && error.retryAfterSeconds !== null) {
         const availableAt = new Date(Date.now() + error.retryAfterSeconds * 1000).toISOString();
-        if (publication) {
+        if (publication && !PRESERVED_PUBLICATION_STATUSES.includes(publication.status)) {
           publication.status = 'deferred';
           publication.availableAt = availableAt;
           publication.error = message;
@@ -403,7 +602,7 @@ export class ShortsPipeline {
         });
         return true;
       }
-      if (publication) {
+      if (publication && !PRESERVED_PUBLICATION_STATUSES.includes(publication.status)) {
         publication.status = 'failed';
         publication.error = message;
         publication.updatedAt = nowIso();

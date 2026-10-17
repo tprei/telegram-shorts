@@ -4,9 +4,10 @@ import { request as httpRequest, type IncomingMessage } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { basename, extname } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { z } from 'zod';
 import type { PublishCopy, ShortVideoPlatform } from '../domain/model.js';
-import type { ShortVideoPublishInput, ShortVideoPublishProvider, ShortVideoPublishResult } from './instagram-publisher.js';
-import { ShortVideoPublishError } from './instagram-publisher.js';
+import type { RemotePublicationState, ShortVideoCheckPublicationInput, ShortVideoPublishInput, ShortVideoPublishProvider, ShortVideoPublishResult, ShortVideoPublishErrorStage } from './instagram-publisher.js';
+import { ShortVideoPublishError, isTransientNetworkError as sharedIsTransientNetworkError, lenientRemoteString } from './instagram-publisher.js';
 import { logError } from './util.js';
 
 const BASE_URL = 'https://mallary.ai';
@@ -27,26 +28,29 @@ const DISALLOWED_HASHTAGS = new Set([
 
 const UPLOAD_IDLE_TIMEOUT_MS = 60_000;
 const DEFAULT_RETRY_DELAYS_MS = [2_000, 5_000];
-const TRANSIENT_NETWORK_CODES: Record<string, true> = {
-  ETIMEDOUT: true,
-  ECONNRESET: true,
-  ECONNREFUSED: true,
-  ECONNABORTED: true,
-  EPIPE: true,
-  EAI_AGAIN: true,
-  ENETUNREACH: true,
-  EHOSTUNREACH: true,
-  UND_ERR_CONNECT_TIMEOUT: true,
-  UND_ERR_HEADERS_TIMEOUT: true,
-  UND_ERR_BODY_TIMEOUT: true,
-  UND_ERR_SOCKET: true,
-};
 
 export interface MallaryUpload {
   uploadUrl: string;
   mediaUrl: string;
   headers?: Record<string, string>;
 }
+
+const MallaryJobStatusSchema = z.object({
+  data: z.object({
+    job: z.object({
+      status: z.string().min(1),
+      platform_post_url: lenientRemoteString,
+      failedReason: lenientRemoteString,
+      error: lenientRemoteString,
+      error_code: lenientRemoteString,
+      action_required: z.object({ message: lenientRemoteString }).nullish().catch(null),
+    }),
+  }),
+});
+
+const MallaryErrorBodySchema = z.object({
+  error: z.object({ message: z.string().min(1) }).partial().optional(),
+});
 
 class UploadStalledError extends Error {
   constructor(seconds: number) {
@@ -196,14 +200,7 @@ function isTransientNetworkError(error: unknown): boolean {
   if (error instanceof UploadStalledError) {
     return true;
   }
-  let current: unknown = error;
-  while (current instanceof Error) {
-    if ('code' in current && typeof current.code === 'string' && TRANSIENT_NETWORK_CODES[current.code] === true) {
-      return true;
-    }
-    current = current.cause;
-  }
-  return false;
+  return sharedIsTransientNetworkError(error);
 }
 
 export class MallaryClient implements ShortVideoPublishProvider {
@@ -218,6 +215,38 @@ export class MallaryClient implements ShortVideoPublishProvider {
 
   supports(platform: ShortVideoPlatform): boolean {
     return this.supportedPlatforms.includes(platform);
+  }
+
+  async checkPublication(input: ShortVideoCheckPublicationInput): Promise<RemotePublicationState> {
+    let response: Response;
+    try {
+      response = await fetch(`${BASE_URL}/api/v1/jobs/${encodeURIComponent(input.remoteJobId)}`, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${this.apiToken}` },
+        signal: AbortSignal.timeout(30_000),
+      });
+    } catch (error) {
+      logError('Mallary job status request failed', error, { remoteJobId: input.remoteJobId });
+      throw new ShortVideoPublishError({
+        provider: this.name,
+        stage: 'discovery',
+        message: `Mallary job status request failed for ${input.remoteJobId}.`,
+        safeToFailover: false,
+        cause: error,
+      });
+    }
+    await assertOk(this.name, 'discovery', 'Mallary job status request failed')(response);
+    const parsed = MallaryJobStatusSchema.safeParse(await response.json().catch(() => undefined));
+    if (!parsed.success) {
+      throw new ShortVideoPublishError({
+        provider: this.name,
+        stage: 'discovery',
+        message: `Mallary job status response was unexpected for ${input.remoteJobId}.`,
+        safeToFailover: false,
+        cause: parsed.error,
+      });
+    }
+    return mallaryJobToRemoteState(parsed.data.data.job);
   }
 
   async publishShortVideo(input: ShortVideoPublishInput): Promise<ShortVideoPublishResult> {
@@ -428,19 +457,52 @@ export function parseMallaryRetryAfterSeconds(bodyText: string): number | null {
   }
 }
 
-function assertOk(provider: string, stage: 'upload' | 'create', message: string) {
+function assertOk(provider: string, stage: ShortVideoPublishErrorStage, message: string) {
   return async (response: Response): Promise<Response> => {
     if (response.ok) {
       return response;
     }
     const text = await response.text().catch(() => '');
     const retryAfterSeconds = provider === 'mallary' && response.status === 429 ? parseMallaryRetryAfterSeconds(text) : null;
+    const detail = mallaryErrorMessage(text) ?? `${response.status} ${text}`.trim();
     throw new ShortVideoPublishError({
       provider,
       stage,
-      message: `${message}: ${response.status} ${text}`.trim(),
+      message: `${message}: ${detail}`,
       safeToFailover: retryAfterSeconds === null && response.status < 500,
       retryAfterSeconds,
+      httpStatus: response.status,
     });
   };
+}
+
+function mallaryErrorMessage(bodyText: string): string | null {
+  const parsed = MallaryErrorBodySchema.safeParse(safeJsonParse(bodyText));
+  if (!parsed.success) {
+    return null;
+  }
+  const message = parsed.data.error?.message;
+  return typeof message === 'string' && message.trim().length > 0 ? message : null;
+}
+
+function safeJsonParse(bodyText: string): unknown {
+  try {
+    return JSON.parse(bodyText) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+function mallaryJobToRemoteState(job: z.infer<typeof MallaryJobStatusSchema>['data']['job']): RemotePublicationState {
+  if (job.status === 'completed') {
+    return { status: 'live', url: job.platform_post_url ?? null, error: null };
+  }
+  if (job.status === 'failed' || job.status === 'cancelled' || job.status === 'action_required') {
+    return {
+      status: 'failed',
+      url: null,
+      error: job.failedReason ?? job.error ?? job.action_required?.message ?? job.error_code ?? `Mallary job ended as ${job.status} without a reason.`,
+    };
+  }
+  return { status: 'pending', url: null, error: null };
 }

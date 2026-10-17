@@ -298,6 +298,28 @@ export async function extractFrame(input: { videoPath: string; seconds: number; 
   }
 }
 
+const COVER_FOREGROUND_WIDTH_RATIO = 920 / 1080;
+
+export async function renderCoverImage(input: { imagePath: string; outputPath: string; width: number; height: number }): Promise<void> {
+  await ensureParent(input.outputPath);
+  const foreground = Math.round(input.width * COVER_FOREGROUND_WIDTH_RATIO);
+  await runProcess('ffmpeg', [
+    '-y',
+    '-i', input.imagePath,
+    '-filter_complex',
+    `[0:v]split=2[bgsrc][fgsrc];[bgsrc]scale=${input.width}:${input.height}:force_original_aspect_ratio=increase,crop=${input.width}:${input.height},boxblur=18:2[bg];[fgsrc]scale=${foreground}:${foreground}:force_original_aspect_ratio=decrease[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuvj420p[vout]`,
+    '-map', '[vout]',
+    '-frames:v', '1',
+    '-q:v', '2',
+    input.outputPath,
+  ]);
+  try {
+    await stat(input.outputPath);
+  } catch {
+    throw new Error(`ffmpeg wrote no cover to ${input.outputPath}`);
+  }
+}
+
 export function buildSubtitlesFilterArg(assPath: string, fontsDir: string): string {
   return `ass=filename=${escapeFiltergraphValue(assPath)}:fontsdir=${escapeFiltergraphValue(fontsDir)}`;
 }

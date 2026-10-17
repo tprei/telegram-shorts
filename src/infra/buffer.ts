@@ -1,8 +1,9 @@
 import { PublicAssetHost } from './public-asset-host.js';
 import type { ShortVideoPlatform } from '../domain/model.js';
-import type { ShortVideoPublishInput, ShortVideoPublishProvider, ShortVideoPublishResult } from './instagram-publisher.js';
-import { ShortVideoPublishError } from './instagram-publisher.js';
+import type { RemotePublicationState, ShortVideoCheckPublicationInput, ShortVideoPublishInput, ShortVideoPublishProvider, ShortVideoPublishResult } from './instagram-publisher.js';
+import { lenientRemoteString, ShortVideoPublishError } from './instagram-publisher.js';
 import { logError } from './util.js';
+import { z } from 'zod';
 
 interface BufferClientOptions {
   apiKey: string;
@@ -20,6 +21,12 @@ interface BufferGraphQLResponse<T> {
   data?: T;
   errors?: Array<{ message?: string }>;
 }
+
+const BufferPostStatusSchema = z.object({
+  status: z.string().min(1),
+  externalLink: lenientRemoteString,
+  error: z.object({ message: lenientRemoteString }).nullish().catch(null),
+});
 
 interface BufferChannel {
   id: string;
@@ -49,6 +56,47 @@ export class BufferClient implements ShortVideoPublishProvider {
       return this.publishTikTok(input);
     }
     return this.publishYouTubeShort(input);
+  }
+
+  async checkPublication(input: ShortVideoCheckPublicationInput): Promise<RemotePublicationState> {
+    const response = await this.callGraphQL<{ post?: unknown }>({
+      title: 'buffer-post-status',
+      stage: 'discovery',
+      query: `
+        query BufferPostStatus($id: PostId!) {
+          post(input: { id: $id }) {
+            status
+            externalLink
+            error { message }
+          }
+        }
+      `,
+      variables: { id: input.remoteJobId },
+      safeToFailover: false,
+      signal: AbortSignal.timeout(30_000),
+    });
+    const parsed = BufferPostStatusSchema.safeParse(response.data?.post ?? null);
+    if (!parsed.success) {
+      throw new ShortVideoPublishError({
+        provider: this.name,
+        stage: 'discovery',
+        message: `Buffer post status response was unexpected for ${input.remoteJobId}.`,
+        safeToFailover: false,
+        cause: parsed.error,
+      });
+    }
+    const post = parsed.data;
+    if (post.status === 'sent') {
+      return { status: 'live', url: post.externalLink ?? null, error: null };
+    }
+    if (post.status === 'error') {
+      return {
+        status: 'failed',
+        url: null,
+        error: post.error?.message ?? `Buffer reported an error without a message for ${input.remoteJobId}.`,
+      };
+    }
+    return { status: 'pending', url: null, error: null };
   }
 
   private async publishInstagram(input: ShortVideoPublishInput): Promise<ShortVideoPublishResult> {
@@ -288,6 +336,7 @@ export class BufferClient implements ShortVideoPublishProvider {
     query: string;
     variables: Record<string, unknown>;
     safeToFailover: boolean;
+    signal?: AbortSignal;
   }): Promise<BufferGraphQLResponse<T>> {
     let response: Response;
     try {
@@ -298,6 +347,7 @@ export class BufferClient implements ShortVideoPublishProvider {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ query: input.query, variables: input.variables }),
+        signal: input.signal,
       });
     } catch (error) {
       logError('Buffer API request failed', error, { title: input.title, stage: input.stage });
@@ -317,6 +367,7 @@ export class BufferClient implements ShortVideoPublishProvider {
         stage: input.stage,
         message: `Buffer request failed: ${message}`,
         safeToFailover: response.status < 500 && input.safeToFailover,
+        httpStatus: response.status,
       });
     }
     if (payload?.errors?.length) {

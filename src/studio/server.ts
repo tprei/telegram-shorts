@@ -171,6 +171,9 @@ export function createStudioApp(input: StudioAppInput): Hono {
       downloadFileName: c.req.query('download') === '1' ? path.basename(filePath) : null,
     });
   });
+  app.get('/media/exports/:exportId/cover', (c) =>
+    serveFile({ filePath: media.exportCoverPath(c.req.param('exportId')), contentType: 'image/jpeg', rangeHeader: c.req.header('range') }),
+  );
   app.get('/fonts/:file', (c) => {
     const file = c.req.param('file');
     const safe = file.length > 0 && file !== '.' && !file.includes('/') && !file.includes('\\') && !file.includes('..') && !file.includes('\0');

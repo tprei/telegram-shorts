@@ -472,6 +472,44 @@ Deepgram mishears some words ("MEI" → "mês"), and captions show whatever the 
 - Export feedback: every Export action switches the inspector to Export & publish (`EditorInspector` takes optional controlled `tab`/`onTabChange`), and the top bar shows queued, rendering, ready (with Download MP4), or failed (with the error and a retry) for the newest export of the current edit revision.
 - Wiring: `correctWord` client call; on success `setQueryData(['transcript', jobId], dto)` (the preview timeline rebuilds from it instantly) and invalidate `['short', shortId]` and `['job', jobId]`; `correctingWordIndex` comes from the pending mutation's variables; errors go to the editor toast. Corrections are not part of the edit undo stack.
 
+## Publish outcome tracking (follow-up, 2026-10-17)
+
+Incident: a publication was marked `published` as soon as Buffer or Mallary accepted the request. Buffer later reported all three Instagram posts as failed ("lost authorization") while the studio said Published, and stale failure messages plus an unconfirmed Force repost led to a duplicate TikTok post.
+
+### Contract
+
+- `PublicationStatus = 'queued' | 'publishing' | 'submitted' | 'published' | 'deferred' | 'failed'`. `submitted` = the provider accepted the post and we are waiting for the platform; `published` = the provider confirmed it is live.
+- `PublicationRecord` gains `remoteUrl: string | null` (public post URL when the provider reports one) and `submittedAt: string | null`.
+- `QueueTaskKind` gains `check_publication` (output lane) with payload `{ publicationId: string }`.
+- `src/infra/instagram-publisher.ts`: `RemotePublicationState = { status: 'pending' | 'live' | 'failed'; url: string | null; error: string | null }`; `ShortVideoPublishProvider.checkPublication(input: { provider: string; platform: ShortVideoPlatform; remoteJobId: string }): Promise<RemotePublicationState>`. The fallback provider routes to the provider whose `name === input.provider`.
+- Buffer check: GraphQL `post(input: { id }) { status externalLink error { message } }`; `sent` → live (`externalLink`), `error` → failed (`error.message`), anything else → pending.
+- Mallary check: `GET /api/v1/jobs/{id}` → `data.job.status`; `completed` → live (`platform_post_url`); `failed`, `cancelled`, `action_required` → failed (`failedReason ?? error ?? action_required.message ?? error_code`); anything else → pending. Mallary non-2xx bodies that carry `error.message` use that message instead of the raw JSON.
+- Pipeline: a successful `publishShortVideo` sets the publication `submitted` (provider, batchId, remoteJobs, `submittedAt`), and enqueues `check_publication` 15 s later. `check_publication`: no-op unless the publication is `submitted`; checks `remoteJobs[0]`; live → `published` + `remoteUrl`; failed → `failed` + error; pending, or a transient network error during the check → reschedule 20 s later; still unresolved 60 min after `submittedAt` → `failed` with "No final result from {provider} after 60 minutes; check {Platform} before reposting." A result with no remote job id → `failed` ("{provider} accepted the post but returned no id to track; check {Platform} before reposting.").
+- `findActivePublication` treats `submitted` as active. `check_publication` tasks are re-queued on restart like other read-only work.
+- Store `SCHEMA_VERSION = 4`. v3 → v4 migration: `json_set` `remoteUrl` null and `submittedAt` null on every publication; publications currently `published` with a non-empty `remoteJobs` were never verified, so they become `submitted` with `submittedAt` = migration time and get a `check_publication` task. v2 databases run v2→v3 then v3→v4.
+- `PublicationDto` gains `url: string | null`, `submittedAt: string | null`, `forced: boolean`.
+- UI (Export & publish): publications grouped by platform; the newest attempt per platform is the status line and older attempts collapse under it. Status copy: queued "Queued"; publishing "Uploading and sending"; submitted "Sent to {provider}, waiting for {Platform}"; published "Live on {Platform}" with a link to `url`; deferred "Waiting for the posting limit, retries {time}"; failed shows the first line of the error with the full text behind a Details toggle. A platform whose newest attempt for the latest ready export is queued, publishing, submitted, deferred, or published can't be selected for a normal publish (shown with the reason). Force repost only applies to platforms already published for that export, is disabled otherwise, and opens a confirmation that names the platforms and says the existing posts stay up.
+- Wiring: short detail polling also runs while any publication is `submitted`.
+
+### Hardening (after adversarial review)
+
+Rule of thumb: when we can't prove a post failed, treat it as possibly live. Only an explicit, confirmed Force repost may post a platform twice.
+
+1. `PublicationStatus` gains `unconfirmed` ("couldn't confirm; check {Platform} before reposting"). A publication becomes `unconfirmed` when: the 60-minute check deadline passes; the provider returned no remote id; a status check fails with a non-transient error (response parse failure, HTTP 4xx other than 429, GraphQL error, unknown provider name, missing provider/submittedAt on the record). Never `failed` in those cases.
+2. After the deadline the publication stays `unconfirmed` but checks continue every 10 minutes until 24 h after `submittedAt` (live → `published`, failed → `failed`, still pending at 24 h → stop). A non-transient error stops checking. Transient = network errors (same cause-chain codes as Mallary uploads; share one exported classifier) and HTTP 429/5xx from a check.
+3. Blocking rules, per short + platform across all of the short's exports. In-flight = `queued | publishing | submitted | deferred`; posted-or-unknown = `published | unconfirmed`.
+   - Normal publish: an in-flight attempt on the same export → return it (unchanged). An in-flight attempt on another export, or any posted-or-unknown attempt → `StudioError('conflict', ...)` telling the operator to use Force repost.
+   - Force: allowed only when a posted-or-unknown attempt exists and nothing is in flight; otherwise `conflict`.
+   - The publish panel mirrors these rules (normal checkboxes, Force eligibility and its confirmation list) using every publication of the short, not only the latest export's.
+4. Idempotency key is always `shorts-{platform}-{exportId}-{publicationId}`. Duplicates are prevented by rule 3, and a fresh attempt after a provider failure must not replay the cached failure.
+5. Provider status checks: zod requires only `status`; every other field is lenient (non-string or empty → null). Check requests use `AbortSignal.timeout(30_000)`.
+6. The publisher factory always returns the routing provider, even with one provider, so `checkPublication` routes by name and an unknown name is a non-transient error.
+7. On startup, after `requeueRunningTasks`, enqueue a check for every `submitted` publication, and every `unconfirmed` one still inside its 24 h window, that has no queued or running `check_publication` task.
+8. The v2/v3 → v4 migration and the `user_version` bump run inside one `BEGIN IMMEDIATE … COMMIT`. Legacy rows' first checks are staggered 10 s apart.
+9. Task-failure handling never downgrades a `submitted`, `published`, or `unconfirmed` publication.
+10. A cover render failure during export is logged and leaves `coverPath: null`; the export stays `ready` (Instagram publish renders the cover lazily).
+11. Polling: the short detail polls while a publication is `submitted` (not `unconfirmed`). Panel copy for `unconfirmed`: "Couldn't confirm. Check {Platform} before reposting." in the warning tone, with the Details toggle when there is an error.
+
 ## Verification
 
 1. `pnpm typecheck` and `pnpm test` pass with zero errors.
@@ -479,6 +517,7 @@ Deepgram mishears some words ("MEI" → "mês"), and captions show whatever the 
 3. With API keys: add a recent Filipe Boni video → shorts appear with hooks and auto crops → editor preview plays with cuts, zooms, captions, hook band → word strike and range changes update instantly → export produces a 1080×1920 mp4 whose captions, crops, and cut points match the preview.
 4. Without API keys: a throwaway script under `/tmp` seeds a job with media and a transcript, then the studio flow is exercised via a manual short and export.
 5. Word corrections: the backend tests for the rules above pass, and in the browser a corrected word shows up in the preview captions immediately and in a new export.
+6. Publish tracking: a publication only shows Published after the provider confirms it is live, and Buffer/Mallary failures that happen after submission show up as Failed with the provider's message.
 
 ## Non-goals
 

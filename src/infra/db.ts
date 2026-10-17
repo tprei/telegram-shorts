@@ -1,8 +1,10 @@
 import { DatabaseSync } from 'node:sqlite';
-import type { ExportRecord, JobRecord, JobSummaryRecord, PublicationRecord, QueueTask, QueueTaskKind, QueueTaskPayloads, ShortRecord, ShortVideoPlatform } from '../domain/model.js';
+import type { ExportRecord, JobRecord, JobSummaryRecord, PublicationRecord, QueueTask, QueueTaskKind, QueueTaskPayloads, ShortRecord } from '../domain/model.js';
 import { createId, ensureParent, nowIso, parseJson } from './util.js';
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
+
+export const CHECK_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS settings (
@@ -73,8 +75,6 @@ CREATE TABLE IF NOT EXISTS actions (
 CREATE INDEX IF NOT EXISTS idx_actions_job ON actions(job_id, created_at);
 `;
 
-const ACTIVE_PUBLICATION_STATUSES = ['queued', 'publishing', 'published', 'deferred'] as const;
-
 function payloadJsonColumn(row: unknown): string | null {
   if (row === null || typeof row !== 'object' || !('payload_json' in row)) {
     return null;
@@ -97,16 +97,27 @@ export class ShortsStore {
     if (versionRow !== null && typeof versionRow === 'object' && 'user_version' in versionRow && typeof versionRow.user_version === 'number') {
       userVersion = versionRow.user_version;
     }
-    if (userVersion !== 0 && userVersion !== 2 && userVersion !== SCHEMA_VERSION) {
+    if (userVersion !== 0 && userVersion !== 2 && userVersion !== 3 && userVersion !== SCHEMA_VERSION) {
       db.close();
       throw new Error(`Incompatible database at ${path}; delete it to start fresh`);
     }
-    if (userVersion === 2) {
-      db.exec(`UPDATE jobs SET payload_json = json_set(payload_json, '$.transcriptRevision', 0)`);
-      db.exec(`UPDATE exports SET payload_json = json_set(payload_json, '$.transcriptRevision', 0)`);
-    }
     db.exec(SCHEMA_SQL);
-    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      if (userVersion === 2) {
+        db.exec(`UPDATE jobs SET payload_json = json_set(payload_json, '$.transcriptRevision', 0)`);
+        db.exec(`UPDATE exports SET payload_json = json_set(payload_json, '$.transcriptRevision', 0)`);
+      }
+      if (userVersion === 2 || userVersion === 3) {
+        db.exec(`UPDATE exports SET payload_json = json_set(payload_json, '$.coverPath', json('null'))`);
+        migratePublicationsToV4(db);
+      }
+      db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
     return new ShortsStore(db);
   }
 
@@ -204,9 +215,19 @@ export class ShortsStore {
     return rows.map((row) => payloadJsonColumn(row)).filter((payload): payload is string => payload !== null).map((payload) => parseJson<PublicationRecord>(payload));
   }
 
-  findActivePublication(exportId: string, platform: ShortVideoPlatform): PublicationRecord | null {
-    const payload = payloadJsonColumn(this.db.prepare(`SELECT payload_json FROM publications WHERE export_id = ? AND platform = ? AND status IN (${ACTIVE_PUBLICATION_STATUSES.map(() => '?').join(', ')}) ORDER BY created_at DESC LIMIT 1`).get(exportId, platform, ...ACTIVE_PUBLICATION_STATUSES));
-    return payload ? parseJson<PublicationRecord>(payload) : null;
+  enqueueMissingPublicationChecks(): void {
+    const rows = this.db.prepare("SELECT payload_json FROM publications WHERE status IN ('submitted', 'unconfirmed') ORDER BY created_at ASC").all();
+    for (const payload of rows.map((row) => payloadJsonColumn(row)).filter((value): value is string => value !== null)) {
+      const record = parseJson<PublicationRecord>(payload);
+      if (record.status === 'unconfirmed' && (record.submittedAt === null || Date.now() >= Date.parse(record.submittedAt) + CHECK_WINDOW_MS)) {
+        continue;
+      }
+      const pending = this.db.prepare("SELECT 1 FROM queue_tasks WHERE kind = 'check_publication' AND status IN ('queued', 'running') AND json_extract(payload_json, '$.payload.publicationId') = ? LIMIT 1").get(record.id);
+      if (pending !== null && typeof pending === 'object') {
+        continue;
+      }
+      this.enqueueTask(record.jobId, 'check_publication', { publicationId: record.id });
+    }
   }
 
   enqueueTask<K extends QueueTaskKind>(jobId: string, kind: K, payload: QueueTaskPayloads[K], options: { availableAt?: string | null } = {}): QueueTask {
@@ -293,7 +314,11 @@ export class ShortsStore {
       return;
     }
     const publication = this.getPublication(payload.publicationId);
-    if (!publication || publication.status === 'published' || publication.status === 'failed') {
+    if (!publication || publication.status === 'published' || publication.status === 'failed' || publication.status === 'unconfirmed') {
+      return;
+    }
+    if (publication.status === 'submitted') {
+      this.enqueueTask(publication.jobId, 'check_publication', { publicationId: publication.id });
       return;
     }
     publication.status = 'failed';
@@ -304,5 +329,34 @@ export class ShortsStore {
 
   appendAction(jobId: string, kind: string, payload: Record<string, unknown>): void {
     this.db.prepare('INSERT INTO actions(id, job_id, kind, created_at, payload_json) VALUES(?, ?, ?, ?, ?)').run(createId('act'), jobId, kind, nowIso(), JSON.stringify(payload));
+  }
+}
+
+function migratePublicationsToV4(db: DatabaseSync): void {
+  db.exec(`UPDATE publications SET payload_json = json_set(payload_json, '$.remoteUrl', json('null'), '$.submittedAt', json('null'))`);
+  const migratedAt = nowIso();
+  const migratedAtMs = Date.parse(migratedAt);
+  const rows = db.prepare("SELECT payload_json FROM publications WHERE status = 'published' ORDER BY created_at ASC").all();
+  let staggerIndex = 0;
+  for (const payload of rows.map((row) => payloadJsonColumn(row)).filter((value): value is string => value !== null)) {
+    const record = parseJson<PublicationRecord>(payload);
+    if (record.remoteJobs.length === 0) {
+      continue;
+    }
+    const next: PublicationRecord = { ...record, status: 'submitted', submittedAt: migratedAt, updatedAt: migratedAt };
+    db.prepare('UPDATE publications SET status = ?, payload_json = ? WHERE id = ?').run(next.status, JSON.stringify(next), record.id);
+    const task: QueueTask = {
+      id: createId('task'),
+      jobId: record.jobId,
+      kind: 'check_publication',
+      status: 'queued',
+      payload: { publicationId: record.id },
+      createdAt: migratedAt,
+      availableAt: new Date(migratedAtMs + staggerIndex * 10_000).toISOString(),
+      startedAt: null,
+      error: null,
+    };
+    staggerIndex += 1;
+    db.prepare('INSERT INTO queue_tasks(id, job_id, kind, status, created_at, available_at, started_at, error, payload_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)').run(task.id, task.jobId, task.kind, task.status, task.createdAt, task.availableAt, task.startedAt, task.error, JSON.stringify(task));
   }
 }

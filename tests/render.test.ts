@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { buildEndCardAss, buildExportAss } from '../src/infra/ass.js';
-import { buildSubtitlesFilterArg, extractFrame, renderShortExport } from '../src/infra/render.js';
+import { buildSubtitlesFilterArg, extractFrame, renderCoverImage, renderShortExport } from '../src/infra/render.js';
 import { runProcess } from '../src/infra/process.js';
 import { buildTimeline } from '../src/domain/timeline.js';
 import type { LayoutProfile, PxRect } from '../src/domain/layout.js';
@@ -296,6 +296,32 @@ test('renderShortExport rejects an empty timeline before running ffmpeg', async 
     }),
     /Nothing to export: every word is cut/,
   );
+});
+
+test('cover image centers the sharp thumbnail over a blurred full-bleed copy', { timeout: 60_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'render-cover-'));
+  const thumbnailPath = join(dir, 'thumbnail.png');
+  await runProcess('ffmpeg', [
+    '-y',
+    '-f', 'lavfi', '-i', 'color=c=red:s=640x720,format=rgb24',
+    '-f', 'lavfi', '-i', 'color=c=blue:s=640x720,format=rgb24',
+    '-filter_complex', '[0][1]hstack=inputs=2',
+    '-frames:v', '1',
+    thumbnailPath,
+  ]);
+  const coverPath = join(dir, 'cover.jpg');
+  await renderCoverImage({ imagePath: thumbnailPath, outputPath: coverPath, width: 1080, height: 1920 });
+  const rawPath = join(dir, 'cover.rgb');
+  await runProcess('ffmpeg', ['-y', '-i', coverPath, '-f', 'rawvideo', '-pix_fmt', 'rgb24', rawPath]);
+  const pixels = await readFile(rawPath);
+  assert.equal(pixels.length, 1080 * 1920 * 3);
+  const pixel = (x: number, y: number): { r: number; b: number } => ({ r: pixels[(y * 1080 + x) * 3]!, b: pixels[(y * 1080 + x) * 3 + 2]! });
+  const foregroundLeft = pixel(520, 960);
+  const foregroundRight = pixel(560, 960);
+  assert.ok(foregroundLeft.r > 200 && foregroundLeft.b < 60, `foreground left ${JSON.stringify(foregroundLeft)}`);
+  assert.ok(foregroundRight.b > 200 && foregroundRight.r < 60, `foreground right ${JSON.stringify(foregroundRight)}`);
+  const backgroundEdge = pixel(530, 200);
+  assert.ok(backgroundEdge.r > 60 && backgroundEdge.b > 60, `background is blurred across the edge ${JSON.stringify(backgroundEdge)}`);
 });
 
 test('extractFrame throws when ffmpeg exits without writing the frame', { timeout: 60_000 }, async () => {

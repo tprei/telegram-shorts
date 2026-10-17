@@ -4,7 +4,7 @@ import { basename, join } from 'node:path';
 import { addRange, createInitialEdit, extendEndBySeconds, extendStartBySeconds, keptText, keptWordIndices, normalizeEdit, setWordsRemoved, trimEndBySeconds, trimStartBySeconds, type ShortEdit, type WordRange } from '../domain/edit.js';
 import { outputDurationSeconds } from '../domain/timeline.js';
 import { sentenceText } from '../domain/policies.js';
-import type { ExportRecord, JobRecord, JobSummaryRecord, PublicationRecord, ShortRecord, SourceMedia } from '../domain/model.js';
+import { IN_FLIGHT_PUBLICATION_STATUSES, POSTED_OR_UNKNOWN_PUBLICATION_STATUSES, type ExportRecord, type JobRecord, type JobSummaryRecord, type PublicationRecord, type ShortRecord, type ShortVideoPlatform, type SourceMedia } from '../domain/model.js';
 import type { RevisionIntent } from '../domain/model.js';
 import {
   MEDIA_ROUTES,
@@ -36,7 +36,7 @@ import {
 } from '../studio/api-types.js';
 import { StudioError } from './errors.js';
 import type { StudioMediaResolver } from './studio-media.js';
-import { activeMallaryCooldownUntil, platformAvailability, platformAvailabilityFromSnapshot } from './platforms.js';
+import { activeMallaryCooldownUntil, platformAvailability, platformAvailabilityFromSnapshot, platformLabel } from './platforms.js';
 import type { CreatorProfileRepository } from '../infra/creator-profile-loader.js';
 import type { AppConfig } from '../infra/env.js';
 import { ShortsStore } from '../infra/db.js';
@@ -448,6 +448,7 @@ export class StudioService implements StudioApi, StudioMediaResolver {
       title: short.title,
       status: 'queued',
       artifactPath: null,
+      coverPath: null,
       sizeBytes: null,
       durationSeconds: null,
       error: null,
@@ -502,14 +503,42 @@ export class StudioService implements StudioApi, StudioMediaResolver {
     if (unavailable.length > 0) {
       throw new StudioError('invalid', unavailable.map((entry) => entry.reason).join(' '));
     }
-    const results: PublicationDto[] = [];
+    const attemptsByShort = this.deps.store.listPublicationsForShort(exportRecord.shortId);
+    const planned: Array<{ platform: ShortVideoPlatform; existing: PublicationRecord | null }> = [];
     for (const platform of request.platforms) {
-      if (!request.force) {
-        const active = this.deps.store.findActivePublication(exportRecord.id, platform);
-        if (active) {
-          results.push(this.publicationDto(active));
-          continue;
+      const attempts = attemptsByShort.filter((entry) => entry.platform === platform);
+      const inFlight = attempts.find((entry) => IN_FLIGHT_PUBLICATION_STATUSES.includes(entry.status));
+      const posted = attempts.find((entry) => POSTED_OR_UNKNOWN_PUBLICATION_STATUSES.includes(entry.status));
+      if (request.force) {
+        if (inFlight) {
+          throw new StudioError('conflict', `Cannot force repost to ${platformLabel(platform)} while an attempt is still in flight.`);
         }
+        if (!posted) {
+          throw new StudioError('conflict', `Force repost needs an existing live or unconfirmed ${platformLabel(platform)} post; nothing was posted for this short.`);
+        }
+        planned.push({ platform, existing: null });
+        continue;
+      }
+      const sameExportInFlight = attempts.find((entry) => entry.exportId === exportRecord.id && IN_FLIGHT_PUBLICATION_STATUSES.includes(entry.status));
+      if (sameExportInFlight) {
+        planned.push({ platform, existing: sameExportInFlight });
+        continue;
+      }
+      if (inFlight) {
+        throw new StudioError('conflict', `${platformLabel(platform)} has an attempt still in flight on another export; use Force repost once it settles.`);
+      }
+      if (posted) {
+        throw new StudioError('conflict', posted.status === 'published'
+          ? `${platformLabel(platform)} is already live for this short; use Force repost to post it again.`
+          : `${platformLabel(platform)} has an unconfirmed attempt; check ${platformLabel(platform)}, then use Force repost.`);
+      }
+      planned.push({ platform, existing: null });
+    }
+    const results: PublicationDto[] = [];
+    for (const { platform, existing } of planned) {
+      if (existing) {
+        results.push(this.publicationDto(existing));
+        continue;
       }
       const cooldownUntil = activeMallaryCooldownUntil(this.deps.config, this.deps.store, platform);
       const publication: PublicationRecord = {
@@ -523,6 +552,8 @@ export class StudioService implements StudioApi, StudioMediaResolver {
         provider: null,
         batchId: null,
         remoteJobs: [],
+        remoteUrl: null,
+        submittedAt: null,
         error: null,
         availableAt: cooldownUntil,
         createdAt: nowIso(),
@@ -599,6 +630,14 @@ export class StudioService implements StudioApi, StudioMediaResolver {
       throw new StudioError('not_found', `Export has no video yet: ${exportId}`);
     }
     return record.artifactPath;
+  }
+
+  exportCoverPath(exportId: string): string {
+    const record = this.deps.store.getExport(exportId);
+    if (!record?.coverPath) {
+      throw new StudioError('not_found', `Export has no cover yet: ${exportId}`);
+    }
+    return record.coverPath;
   }
 
   private studioDefaultCreatorId(): string | null {
@@ -730,6 +769,7 @@ export class StudioService implements StudioApi, StudioMediaResolver {
       status: record.status,
       error: record.error,
       videoUrl: record.status === 'ready' && record.artifactPath ? MEDIA_ROUTES.export(record.id) : null,
+      coverUrl: record.coverPath ? MEDIA_ROUTES.exportCover(record.id) : null,
       sizeBytes: record.sizeBytes,
       durationSeconds: record.durationSeconds,
       createdAt: record.createdAt,
@@ -744,8 +784,11 @@ export class StudioService implements StudioApi, StudioMediaResolver {
       platform: record.platform,
       status: record.status,
       provider: record.provider,
+      url: record.remoteUrl,
       error: record.error,
+      forced: record.forced,
       availableAt: record.availableAt,
+      submittedAt: record.submittedAt,
       createdAt: record.createdAt,
       updatedAt: record.updatedAt,
     };

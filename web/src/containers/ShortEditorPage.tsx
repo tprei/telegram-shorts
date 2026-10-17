@@ -396,7 +396,7 @@ function ShortEditorSurface({ detail, transcript, refetchShort }: ShortEditorSur
   }, [generateCopyMutation.mutateAsync, runAction]);
 
   const onPublish = useCallback(
-    (force: boolean) => {
+    (force: boolean, platforms: ShortVideoPlatform[]) => {
       void runAction(async () => {
         const readyExport = detail.exports.find(
           (exportRecord) => exportRecord.status === 'ready',
@@ -404,11 +404,11 @@ function ShortEditorSurface({ detail, transcript, refetchShort }: ShortEditorSur
         if (readyExport === undefined) throw new Error('Export the short before publishing.');
         await publishMutation.mutateAsync({
           exportId: readyExport.id,
-          request: { platforms: selectedPlatforms, force },
+          request: { platforms, force },
         });
       });
     },
-    [detail.exports, publishMutation.mutateAsync, runAction, selectedPlatforms],
+    [detail.exports, publishMutation.mutateAsync, runAction],
   );
 
   const frameUrl = useCallback(

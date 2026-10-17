@@ -53,6 +53,7 @@ export interface ExportDto {
   status: ExportStatus;
   error: string | null;
   videoUrl: string | null;
+  coverUrl: string | null;
   sizeBytes: number | null;
   durationSeconds: number | null;
   createdAt: string;
@@ -108,8 +109,11 @@ export interface PublicationDto {
   platform: ShortVideoPlatform;
   status: PublicationStatus;
   provider: string | null;
+  url: string | null;
   error: string | null;
+  forced: boolean;
   availableAt: string | null;
+  submittedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -258,5 +262,6 @@ export const MEDIA_ROUTES = {
   thumbnail: (jobId: string) => `/media/jobs/${encodeURIComponent(jobId)}/thumbnail`,
   frame: (jobId: string, seconds: number, width: number) => `/media/jobs/${encodeURIComponent(jobId)}/frame?t=${seconds.toFixed(3)}&w=${Math.round(width)}`,
   export: (exportId: string) => `/media/exports/${encodeURIComponent(exportId)}`,
+  exportCover: (exportId: string) => `/media/exports/${encodeURIComponent(exportId)}/cover`,
   font: (fileName: string) => `/fonts/${encodeURIComponent(fileName)}`,
 } as const;

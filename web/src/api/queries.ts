@@ -44,6 +44,7 @@ const ACTIVE_EXPORT_STATUSES: Partial<Record<ExportStatus, true>> = {
 const ACTIVE_PUBLICATION_STATUSES: Partial<Record<PublicationStatus, true>> = {
   queued: true,
   publishing: true,
+  submitted: true,
   deferred: true,
 };
 

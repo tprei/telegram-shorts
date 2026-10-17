@@ -81,7 +81,7 @@ export async function platformAvailability(job: JobRecord, publisher: ShortVideo
   return availabilityForProfile(profile, `Creator profile ${job.creatorProfileId} no longer exists.`, configured);
 }
 
-function platformLabel(platform: ShortVideoPlatform): string {
+export function platformLabel(platform: ShortVideoPlatform): string {
   if (platform === 'instagram') {
     return 'Instagram';
   }

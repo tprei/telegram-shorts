@@ -2121,47 +2121,330 @@
     padding: 4px;
     font-size: 10px;
   }
-  .platform-list {
-    display: flex;
-    flex-direction: column;
-    gap: 15px;
-    margin-bottom: 20px;
+  .publish-panel {
+    padding-bottom: max(24px, env(safe-area-inset-bottom));
   }
-  .platform-row {
+  .publish-panel-heading {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 6px 12px;
+  }
+  .publish-panel-heading h3 {
+    font-size: 15px;
+  }
+  .publish-panel-heading > span {
+    color: var(--muted);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+  }
+  .publish-panel-intro {
+    margin: 8px 0 18px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.6;
+  }
+  .publish-platforms {
+    display: grid;
+    gap: 12px;
+  }
+  .publish-platform {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: #14181d;
+  }
+  .publish-platform-choice {
     display: flex;
     align-items: center;
     gap: 10px;
+    min-height: 48px;
+    padding: 11px 14px;
     cursor: pointer;
   }
-  .platform-row strong {
-    font-size: 12px;
-    font-weight: 500;
+  .publish-platform-choice input {
+    margin: 0;
   }
-  .platform-row.is-disabled {
+  .publish-platform-choice strong {
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 1.4;
+  }
+  .publish-platform-choice.is-disabled {
     cursor: not-allowed;
   }
-  .platform-row.is-disabled strong {
-    color: #8b95a2;
+  .publish-platform-choice input:disabled {
+    opacity: 0.55;
   }
-  .force-repost {
+  .publish-platform-body {
+    padding: 0 14px 12px;
+  }
+  .publish-outcome {
+    min-width: 0;
+    color: var(--muted);
+  }
+  .publish-outcome-line {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 12px;
+    font-weight: 500;
+    line-height: 1.6;
+  }
+  .publish-outcome-mark {
+    display: grid;
+    place-items: center;
+    width: 15px;
+    height: 19px;
+    flex-shrink: 0;
+  }
+  .publish-outcome-mark > span {
+    width: 7px;
+    height: 7px;
+    border: 1.5px solid currentColor;
+    border-radius: 50%;
+  }
+  .publish-outcome--queued,
+  .publish-outcome--publishing,
+  .publish-outcome--submitted {
+    color: #b2ccf7;
+  }
+  .publish-outcome--published {
+    color: var(--accent);
+  }
+  .publish-outcome--unconfirmed,
+  .publish-outcome--deferred {
+    color: var(--warning);
+  }
+  .publish-outcome--failed {
+    color: var(--danger);
+  }
+  .publish-attempt-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px 0;
     margin-top: 6px;
-    text-align: center;
-  }
-  .force-repost .warning-note {
-    text-align: left;
-  }
-  .force-repost .button-group {
-    justify-content: center;
-    margin-top: 8px;
-  }
-  .publication-item {
-    margin-top: 16px;
-    padding-top: 16px;
-    border-top: 1px solid var(--line);
-  }
-  .publication-item .field-help {
+    color: var(--muted);
     font-size: 10px;
-    margin-bottom: 0;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.6;
+  }
+  .publish-attempt-meta > * + *::before {
+    content: '·';
+    padding: 0 6px;
+  }
+  .publish-post-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 32px;
+    margin: 3px 0 0 23px;
+    color: var(--accent);
+    font-size: 11px;
+    line-height: 1.4;
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+  .publish-post-link:hover {
+    color: var(--accent-hover);
+  }
+  .publish-no-attempt,
+  .publish-selection-reason,
+  .publish-action-help,
+  .publish-force-help {
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.6;
+  }
+  .publish-selection-reason {
+    margin-top: 10px;
+    padding-top: 9px;
+    border-top: 1px solid var(--line-soft);
+  }
+  .publish-history {
+    margin-top: 10px;
+    border-top: 1px solid var(--line-soft);
+  }
+  .publish-history > summary,
+  .publish-error-details > summary {
+    width: fit-content;
+    min-height: 32px;
+    padding: 8px 2px;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 11px;
+    line-height: 1.5;
+  }
+  .publish-history > summary:hover,
+  .publish-error-details > summary:hover {
+    color: var(--text);
+  }
+  .publish-history > summary > span {
+    font-size: 10px;
+  }
+  .publish-history-list {
+    display: grid;
+    gap: 14px;
+    padding: 7px 0 2px 11px;
+    border-left: 1px solid var(--line);
+  }
+  .publish-outcome--historical {
+    color: var(--muted);
+  }
+  .publish-error-details {
+    margin-top: 3px;
+  }
+  .publish-error-details > p {
+    max-height: 240px;
+    overflow: auto;
+    overscroll-behavior: contain;
+    padding: 12px;
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--bg);
+    font-size: 11px;
+    font-weight: 400;
+    line-height: 1.7;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .publish-actions {
+    margin-top: 18px;
+  }
+  .publish-action-help {
+    margin-bottom: 10px;
+  }
+  .publish-force-button {
+    margin-top: 7px;
+  }
+  .publish-force-help {
+    text-align: center;
+    font-size: 10px;
+  }
+  .publish-force-confirmation {
+    margin-top: 16px;
+    padding: 15px;
+    border: 1px solid #73553c;
+    border-radius: 8px;
+    background: #29231e;
+    scroll-margin-block: 20px;
+    animation: publish-confirm-in 140ms ease-out;
+  }
+  .publish-force-heading {
+    display: flex;
+    align-items: flex-start;
+    gap: 9px;
+    color: var(--warning);
+  }
+  .publish-force-heading h4 {
+    margin: 0;
+    color: #f1dbc0;
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+  }
+  .publish-force-heading svg {
+    margin-top: 1px;
+  }
+  .publish-force-confirmation > p {
+    margin-top: 9px;
+    color: #d7c9bc;
+    font-size: 12px;
+    line-height: 1.65;
+  }
+  .publish-force-targets {
+    margin: 14px 0;
+    padding: 0;
+    border: 0;
+  }
+  .publish-force-targets legend {
+    margin-bottom: 5px;
+    color: #d7c9bc;
+    font-size: 10px;
+    line-height: 1.5;
+  }
+  .publish-force-targets label {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    min-height: 36px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .publish-force-targets input {
+    margin: 0;
+  }
+  .publish-force-confirmation .button-group {
+    justify-content: flex-end;
+    gap: 7px;
+  }
+  .publish-force-confirmation .button {
+    white-space: normal;
+  }
+  .publish-sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
+  @keyframes publish-confirm-in {
+    from {
+      opacity: 0;
+      transform: translateY(-4px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  @media (max-width: 700px) {
+    .publish-panel-heading h3 {
+      font-size: 17px;
+    }
+    .publish-platform-choice strong,
+    .publish-outcome-line,
+    .publish-force-heading h4 {
+      font-size: 15px;
+    }
+    .publish-panel-intro,
+    .publish-selection-reason,
+    .publish-action-help,
+    .publish-no-attempt,
+    .publish-force-confirmation > p {
+      font-size: 14px;
+    }
+    .publish-attempt-meta,
+    .publish-force-help,
+    .publish-force-targets legend,
+    .publish-panel-heading > span {
+      font-size: 12px;
+    }
+    .publish-history > summary,
+    .publish-error-details > summary,
+    .publish-post-link,
+    .publish-force-targets label {
+      min-height: 44px;
+      font-size: 14px;
+    }
+    .publish-history > summary > span,
+    .publish-error-details > p {
+      font-size: 12px;
+    }
+    .publish-outcome-mark {
+      height: 24px;
+    }
+    .publish-force-confirmation .button {
+      flex: 1;
+    }
   }
   .inspector-section .empty-state {
     padding: 20px 10px;
@@ -2684,12 +2967,6 @@
     .hashtag-chip button {
       min-width: 28px;
       min-height: 28px;
-    }
-    .platform-row {
-      min-height: 44px;
-    }
-    .platform-row strong {
-      font-size: 14px;
     }
   }
   @media (max-width: 380px) {

@@ -60,6 +60,7 @@ async function main(): Promise<void> {
     void shutdown().then(() => process.exit(0));
   });
   store.requeueRunningTasks();
+  store.enqueueMissingPublicationChecks();
   const openRouter = new OpenRouterClient(config);
   const profiles = new CreatorProfileRepository({
     rootDir: config.rootDir,

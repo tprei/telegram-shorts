@@ -72,13 +72,13 @@ export interface SourceMedia {
 
 export type JobStatus = 'queued' | 'downloading' | 'transcribing' | 'awaiting_speaker' | 'planning' | 'ready' | 'failed';
 
-export type QueueTaskKind = 'process_source' | 'plan_shorts' | 'analyze_crops' | 'export_short' | 'publish_short_video';
+export type QueueTaskKind = 'process_source' | 'plan_shorts' | 'analyze_crops' | 'export_short' | 'publish_short_video' | 'check_publication';
 
 export type QueueLane = 'ingest' | 'output';
 
 export const QUEUE_LANES: Record<QueueLane, readonly QueueTaskKind[]> = {
   ingest: ['process_source', 'plan_shorts', 'analyze_crops'],
-  output: ['export_short', 'publish_short_video'],
+  output: ['export_short', 'publish_short_video', 'check_publication'],
 };
 
 export interface QueueTaskPayloads {
@@ -87,6 +87,7 @@ export interface QueueTaskPayloads {
   analyze_crops: { shortId: string };
   export_short: { exportId: string };
   publish_short_video: { publicationId: string };
+  check_publication: { publicationId: string };
 }
 
 export interface QueueTask {
@@ -170,6 +171,7 @@ export interface ExportRecord {
   title: string;
   status: ExportStatus;
   artifactPath: string | null;
+  coverPath: string | null;
   sizeBytes: number | null;
   durationSeconds: number | null;
   error: string | null;
@@ -177,7 +179,11 @@ export interface ExportRecord {
   updatedAt: string;
 }
 
-export type PublicationStatus = 'queued' | 'publishing' | 'published' | 'deferred' | 'failed';
+export type PublicationStatus = 'queued' | 'publishing' | 'submitted' | 'published' | 'unconfirmed' | 'deferred' | 'failed';
+
+export const IN_FLIGHT_PUBLICATION_STATUSES: readonly PublicationStatus[] = ['queued', 'publishing', 'submitted', 'deferred'];
+
+export const POSTED_OR_UNKNOWN_PUBLICATION_STATUSES: readonly PublicationStatus[] = ['published', 'unconfirmed'];
 
 export interface PublicationRecord {
   id: string;
@@ -190,6 +196,8 @@ export interface PublicationRecord {
   provider: string | null;
   batchId: string | null;
   remoteJobs: Array<{ platform: string; jobId: string }>;
+  remoteUrl: string | null;
+  submittedAt: string | null;
   error: string | null;
   availableAt: string | null;
   createdAt: string;
