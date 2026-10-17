@@ -248,6 +248,34 @@ test('opportunity planner repairs malformed model JSON and fills missing hook_te
   }
 });
 
+test('opportunity planner drops opportunities with fewer than two blocks instead of failing the plan', async () => {
+  const opportunity = (id: string, blockIds: string[]) => ({
+    id, title: `Título ${id}`, summary: 'Resumo', hook: 'Gancho', hook_text: 'Manchete', payoff: 'Payoff',
+    rationale: 'Racional', thesis: 'Tese', viewer_promise: 'Promessa', tension: 'Tensão',
+    why_this_short: 'Porque', risk: 'low', block_ids: blockIds,
+    steps: blockIds.map((blockId, index) => ({ kind: index === 0 ? 'hook' : 'payoff', label: `Passo ${index + 1}`, block_ids: [blockId] })),
+  });
+  let calls = 0;
+  const fetchStub = installFetch(() => {
+    calls += 1;
+    return JSON.stringify({ opportunities: [opportunity('opp_1', ['b_001']), opportunity('opp_2', ['b_001', 'b_002'])] });
+  });
+  try {
+    const client = new OpenRouterClient(baseConfig);
+    const plan = await client.findOpportunities({
+      title: 'Teste',
+      blocks: [
+        { id: 'b_001', kind: 'hook', summary: 's1', start_seconds: 0, end_seconds: 5, text: 'Abertura' },
+        { id: 'b_002', kind: 'payoff', summary: 's2', start_seconds: 5, end_seconds: 10, text: 'Fechamento' },
+      ],
+    });
+    assert.equal(calls, 1);
+    assert.deepEqual(plan.opportunities.map((entry) => entry.id), ['opp_2']);
+  } finally {
+    fetchStub.restore();
+  }
+});
+
 test('revision parser normalizes invented conclusion actions into safe extend_end', async () => {
   const fetchStub = installFetch(() => JSON.stringify({
     actions: [{ kind: 'extend_conclusion', reason: 'o vídeo acaba do nada' }],
@@ -504,6 +532,41 @@ test('revision parser keeps retitle, trim and extend defaults and drops a retitl
     ]);
   } finally {
     fetchStub.restore();
+  }
+});
+
+test('a provider that fails mid-response is retried once, and requests require capable providers', async () => {
+  const originalFetch = globalThis.fetch;
+  const bodies: Array<{ provider?: { require_parameters?: boolean } }> = [];
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    bodies.push(JSON.parse(typeof init?.body === 'string' ? init.body : '{}'));
+    const choice = bodies.length === 1
+      ? { finish_reason: 'error', message: { content: '' } }
+      : { finish_reason: 'stop', message: { content: JSON.stringify({ options: ['Um', 'Dois', 'Três'] }) } };
+    return new Response(JSON.stringify({ provider: 'Somewhere', choices: [choice] }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+  try {
+    const options = await new OpenRouterClient(baseConfig).suggestHooks({ title: 'Título', summary: 'Resumo', transcriptText: 'texto', current: 'atual' });
+    assert.deepEqual(options, ['Um', 'Dois', 'Três']);
+    assert.equal(bodies.length, 2);
+    assert.ok(bodies.every((body) => body.provider?.require_parameters === true));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('a token-limit empty response is not retried', async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ choices: [{ finish_reason: 'length', message: { content: '' } }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+  try {
+    await assert.rejects(new OpenRouterClient(baseConfig).suggestHooks({ title: 'Título', summary: 'Resumo', transcriptText: 'texto', current: 'atual' }), /finish_reason length/);
+    assert.equal(calls, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 

@@ -9,6 +9,7 @@ type ReasoningOptions = { effort: ReasoningEffort; maxTokens: number };
 type PlannerBlock = { id: string; kind: SemanticBlockKind; summary: string; start_seconds: number; end_seconds: number; text: string };
 
 const EDITORIAL_TEMPERATURE = 0.2;
+const PROVIDER_ERROR_ATTEMPTS = 2;
 const HOOK_TEXT_RULE = 'hook_text: manchete curta para a faixa no topo do short (ideal até 45 caracteres, máx. 90), provocativa, específica, sem clickbait vazio, em PT-BR.';
 const FIRST_BLOCK_RULE = 'O primeiro bloco precisa prender nos primeiros 3 segundos sem depender de contexto anterior.';
 const DURATION_RULE = 'Duração ideal de 40 a 75 segundos somando os blocos escolhidos (use start_seconds e end_seconds); passe de 90 segundos só quando o argumento realmente exigir; nunca menos de 30 nem mais de 180.';
@@ -466,49 +467,58 @@ async function requestCompletionContent(config: AppConfig, input: {
   temperature: number;
   responseFormat: ResponseFormat;
 }): Promise<string> {
-  let response: Response;
-  try {
-    response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${config.OPENROUTER_API_KEY}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': 'http://127.0.0.1',
-        'X-Title': input.title,
-      },
-      body: JSON.stringify({
-        model: input.model,
-        temperature: input.temperature,
-        ...(input.reasoning ? { reasoning: { effort: input.reasoning.effort }, max_tokens: input.reasoning.maxTokens } : {}),
-        response_format: {
-          type: 'json_schema',
-          json_schema: {
-            name: input.responseFormat.name,
-            strict: true,
-            schema: input.responseFormat.schema,
-          },
+  for (let attempt = 1; ; attempt += 1) {
+    let response: Response;
+    try {
+      response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${config.OPENROUTER_API_KEY}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'http://127.0.0.1',
+          'X-Title': input.title,
         },
-        plugins: [{ id: 'response-healing' }],
-        messages: [
-          { role: 'system', content: input.system },
-          { role: 'user', content: input.user },
-        ],
-      }),
-    });
-  } catch (error) {
-    logError('OpenRouter request failed', error, { title: input.title, model: input.model });
-    throw error;
+        body: JSON.stringify({
+          model: input.model,
+          temperature: input.temperature,
+          ...(input.reasoning ? { reasoning: { effort: input.reasoning.effort }, max_tokens: input.reasoning.maxTokens } : {}),
+          response_format: {
+            type: 'json_schema',
+            json_schema: {
+              name: input.responseFormat.name,
+              strict: true,
+              schema: input.responseFormat.schema,
+            },
+          },
+          provider: { require_parameters: true },
+          plugins: [{ id: 'response-healing' }],
+          messages: [
+            { role: 'system', content: input.system },
+            { role: 'user', content: input.user },
+          ],
+        }),
+      });
+    } catch (error) {
+      logError('OpenRouter request failed', error, { title: input.title, model: input.model });
+      throw error;
+    }
+    if (!response.ok) {
+      throw new Error(`OpenRouter request failed: ${response.status} ${await response.text()}`);
+    }
+    const payload = await response.json() as { provider?: string; choices?: Array<{ finish_reason?: string; message?: { content?: string } }>; usage?: { completion_tokens?: number; completion_tokens_details?: { reasoning_tokens?: number } } };
+    const choice = payload.choices?.[0];
+    const content = choice?.message?.content;
+    if (content) {
+      return content;
+    }
+    const finishReason = choice?.finish_reason ?? 'missing';
+    const message = `OpenRouter response was empty (${input.title}, provider ${payload.provider ?? 'unknown'}, finish_reason ${finishReason}, completion tokens ${payload.usage?.completion_tokens ?? 'n/a'}, reasoning tokens ${payload.usage?.completion_tokens_details?.reasoning_tokens ?? 'n/a'}).`;
+    if (finishReason === 'error' && attempt < PROVIDER_ERROR_ATTEMPTS) {
+      logError('OpenRouter provider failed mid-response; retrying', new Error(message), { title: input.title, model: input.model, attempt });
+      continue;
+    }
+    throw new Error(message);
   }
-  if (!response.ok) {
-    throw new Error(`OpenRouter request failed: ${response.status} ${await response.text()}`);
-  }
-  const payload = await response.json() as { choices?: Array<{ finish_reason?: string; message?: { content?: string } }>; usage?: { completion_tokens?: number; completion_tokens_details?: { reasoning_tokens?: number } } };
-  const choice = payload.choices?.[0];
-  const content = choice?.message?.content;
-  if (!content) {
-    throw new Error(`OpenRouter response was empty (${input.title}, finish_reason ${choice?.finish_reason ?? 'missing'}, completion tokens ${payload.usage?.completion_tokens ?? 'n/a'}, reasoning tokens ${payload.usage?.completion_tokens_details?.reasoning_tokens ?? 'n/a'}).`);
-  }
-  return content;
 }
 
 function parseLocatedSpan(raw: unknown, query: string, sentences: TranscriptSentence[]): TranscriptSpanLocate {
@@ -557,13 +567,15 @@ function normalizeOpportunityPlanPayload(raw: unknown): unknown {
           ? record.items
           : [];
   return {
-    opportunities: opportunities.map((opportunity, index) => normalizeOpportunityCandidate(opportunity, index)).filter((value): value is Record<string, unknown> => Boolean(value)),
+    opportunities: opportunities
+      .map((opportunity, index) => normalizeOpportunityCandidate(opportunity, index))
+      .filter((opportunity) => opportunity.block_ids.length > 1),
   };
 }
 
-function normalizeOpportunityCandidate(raw: unknown, index: number): Record<string, unknown> | null {
+function normalizeOpportunityCandidate(raw: unknown, index: number): Record<string, unknown> & { block_ids: string[] } {
   const record = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
-  const normalizedCandidate = normalizeArcCandidate(raw) as Record<string, unknown>;
+  const normalizedCandidate = normalizeArcCandidate(raw) as Record<string, unknown> & { block_ids: string[] };
   const viewerPromise = stringValue(record.viewer_promise) ?? stringValue(record.viewerPromise) ?? stringValue(record.promise) ?? stringValue(record.thesis) ?? stringValue(record.summary) ?? 'Ideia principal do short';
   const tension = stringValue(record.tension) ?? stringValue(record.conflict) ?? stringValue(record.problem) ?? stringValue(record.hook) ?? 'Há um conflito ou transformação relevante.';
   const whyThisShort = stringValue(record.why_this_short) ?? stringValue(record.whyThisShort) ?? stringValue(record.why) ?? stringValue(record.rationale) ?? 'É uma ideia forte, completa e publicável.';

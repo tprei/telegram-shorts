@@ -10,25 +10,24 @@ Status: approved direction, implementation in progress.
 
 ## Models (OpenRouter)
 
-Picked from the OpenRouter catalog on 2026-10-16; both are env-configurable.
+Picked from the OpenRouter catalog; both are env-configurable.
 
 | Role | Env var | Default | Price per 1M tokens (in / out) | Why |
 |---|---|---|---|---|
-| Editorial (semantic blocks, opportunities, plan, hooks, revisions, publish copy) | `OPENROUTER_MODEL` + `OPENROUTER_REASONING_EFFORT` + `OPENROUTER_MAX_TOKENS` | `anthropic/claude-haiku-5.5` at `max`, 128000 tokens | $0.10 / $0.50 | Chosen by the user over `google/gemini-4-argon` ($2 / $10) on cost. Every schema verified live with structured outputs at `max` effort. |
+| Editorial (semantic blocks, opportunities, plan, hooks, revisions, publish copy) | `OPENROUTER_MODEL` + `OPENROUTER_REASONING_EFFORT` + `OPENROUTER_MAX_TOKENS` | `deepseek/deepseek-v4.1-flash` at `max`, 128000 tokens | $0.15 / $0.60 | Fastest option in the planning benchmark below; hook suggestions return in ~4 s. Replaced `anthropic/claude-haiku-5.5` at `max`, which in one of two full planning runs spent its whole 128k-token budget reasoning on two of the three calls and returned nothing. |
 | Vision crops | `OPENROUTER_VISION_MODEL` | `google/gemini-3.8-flash` | $0.83 / $4.12 | Gemini models return native `box_2d` grounding; ~$0.002 per frame. Vision calls send no reasoning effort. |
 
-`OPENROUTER_REASONING_EFFORT` (`max` | `xhigh` | `high` | `medium` | `low` | `minimal` | `none`) goes out as OpenRouter's unified `reasoning.effort` on editorial calls only, together with `max_tokens = OPENROUTER_MAX_TOKENS`. Anthropic and OpenAI models on OpenRouter don't accept `temperature`; OpenRouter drops unsupported parameters, so requests keep sending it.
+`OPENROUTER_REASONING_EFFORT` (`max` | `xhigh` | `high` | `medium` | `low` | `minimal` | `none`) goes out as OpenRouter's unified `reasoning.effort` on editorial calls only, together with `max_tokens = OPENROUTER_MAX_TOKENS`. Every request sends `provider: { require_parameters: true }` so OpenRouter only routes to endpoints that support structured outputs and reasoning; a response that ends with `finish_reason: "error"` (provider failure) is retried once, while `length` is not.
 
-Measured on the semantic-block call for a 24-minute Filipe Boni video (246 sentences, 19.8k prompt tokens), Haiku 5.5:
+Full planning benchmark (semantic blocks → opportunities → candidate plan) on the same 24-minute Filipe Boni transcript, 2026-10-17:
 
-| Effort | max_tokens | Result | Time | Reasoning tokens | Cost |
-|---|---|---|---|---|---|
-| `max` | default (65,536) | empty content, `finish_reason: length` | 270 s | 65,536 | $0.035 |
-| `max` | 128,000 | ok | 355 s | 92,887 | $0.052 |
-| `xhigh` | default | ok | 44 s | 7,076 | $0.007 |
-| `high` | default | ok | 28 s | 2,370 | $0.005 |
+| Model, effort | Result | Total time | Cost | Shorts |
+|---|---|---|---|---|
+| `deepseek/deepseek-v4.1-flash`, `max` | ok (3 calls, 55 s / 90 s / 127 s) | 4.5 min | $0.064 | 4, 49–64 s |
+| `anthropic/claude-haiku-5.5`, `xhigh` | ok (151 s / 146 s / 163 s) | 7.7 min | $0.063 | 5, 50–64 s |
+| `anthropic/claude-haiku-5.5`, `max` | 1 of 2 runs ok (21 min, $0.17); the other exhausted all 128k tokens reasoning on blocks and on the plan | — | — | — |
 
-At `max` the model reasons until it nearly fills the budget, so `max_tokens` must be the model's ceiling (128,000 for Haiku 5.5) or the call returns no JSON.
+An earlier DeepSeek run failed once with a provider-side `finish_reason: "error"`; that case is now retried.
 
 ## Architecture
 

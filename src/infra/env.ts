@@ -11,7 +11,7 @@ export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
 
 const EnvSchema = z.object({
   OPENROUTER_API_KEY: z.string().min(1),
-  OPENROUTER_MODEL: z.string().min(1).default('anthropic/claude-haiku-5.5'),
+  OPENROUTER_MODEL: z.string().min(1).default('deepseek/deepseek-v4.1-flash'),
   OPENROUTER_REASONING_EFFORT: z.enum(REASONING_EFFORTS).default('max'),
   OPENROUTER_MAX_TOKENS: z.coerce.number().int().positive().default(128000),
   OPENROUTER_VISION_MODEL: z.string().min(1).default('google/gemini-3.8-flash'),
