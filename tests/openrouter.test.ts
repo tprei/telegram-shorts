@@ -198,15 +198,17 @@ test('planner request schemas require hook_text on opportunities and candidates'
   try {
     const client = new OpenRouterClient(baseConfig);
     const blocks = [
-      { id: 'b_001', kind: 'hook' as const, summary: 's1', start_seconds: 0, end_seconds: 5, text: 'Abertura' },
-      { id: 'b_002', kind: 'payoff' as const, summary: 's2', start_seconds: 5, end_seconds: 10, text: 'Fechamento' },
+      { id: 'b_001', kind: 'hook' as const, summary: 's1', start_seconds: 0, on_screen_seconds: 5, continues_previous: false, text: 'Abertura' },
+      { id: 'b_002', kind: 'payoff' as const, summary: 's2', start_seconds: 5, on_screen_seconds: 10, continues_previous: true, text: 'Fechamento' },
     ];
-    const opportunities = await client.findOpportunities({ title: 'Teste', blocks });
+    const opportunities = await client.findOpportunities({ title: 'Teste', blocks, speed: 1.5 });
     assert.ok(itemsRequired(fetchStub.calls[0]!, 'opportunities').includes('hook_text'));
+    assert.equal(JSON.parse(userTextOf(fetchStub.calls[0]!)).playback_speed, 1.5);
     assert.equal(opportunities.opportunities[0]?.hook_text, 'MANCHETE');
 
-    await client.planCandidates({ title: 'Teste', blocks, opportunities: opportunities.opportunities });
+    await client.planCandidates({ title: 'Teste', blocks, opportunities: opportunities.opportunities, speed: 1.5 });
     assert.ok(itemsRequired(fetchStub.calls[1]!, 'candidates').includes('hook_text'));
+    assert.equal(JSON.parse(userTextOf(fetchStub.calls[1]!)).playback_speed, 1.5);
   } finally {
     fetchStub.restore();
   }
@@ -235,9 +237,10 @@ test('opportunity planner repairs malformed model JSON and fills missing hook_te
     const client = new OpenRouterClient(baseConfig);
     const plan = await client.findOpportunities({
       title: 'Teste',
+      speed: 1.5,
       blocks: [
-        { id: 'b_001', kind: 'hook', summary: 's1', start_seconds: 0, end_seconds: 5, text: 'Abertura' },
-        { id: 'b_002', kind: 'payoff', summary: 's2', start_seconds: 5, end_seconds: 10, text: 'Fechamento' },
+        { id: 'b_001', kind: 'hook', summary: 's1', start_seconds: 0, on_screen_seconds: 5, continues_previous: false, text: 'Abertura' },
+        { id: 'b_002', kind: 'payoff', summary: 's2', start_seconds: 5, on_screen_seconds: 10, continues_previous: true, text: 'Fechamento' },
       ],
     });
     assert.equal(calls, 2);
@@ -264,9 +267,10 @@ test('opportunity planner drops opportunities with fewer than two blocks instead
     const client = new OpenRouterClient(baseConfig);
     const plan = await client.findOpportunities({
       title: 'Teste',
+      speed: 1.5,
       blocks: [
-        { id: 'b_001', kind: 'hook', summary: 's1', start_seconds: 0, end_seconds: 5, text: 'Abertura' },
-        { id: 'b_002', kind: 'payoff', summary: 's2', start_seconds: 5, end_seconds: 10, text: 'Fechamento' },
+        { id: 'b_001', kind: 'hook', summary: 's1', start_seconds: 0, on_screen_seconds: 5, continues_previous: false, text: 'Abertura' },
+        { id: 'b_002', kind: 'payoff', summary: 's2', start_seconds: 5, on_screen_seconds: 10, continues_previous: true, text: 'Fechamento' },
       ],
     });
     assert.equal(calls, 1);
@@ -434,9 +438,10 @@ test('planCandidates inherits hook_text and payoff from the source opportunity',
     const client = new OpenRouterClient(baseConfig);
     const planned = await client.planCandidates({
       title: 'Teste',
+      speed: 1.5,
       blocks: [
-        { id: 'b_001', kind: 'hook', summary: 's1', start_seconds: 0, end_seconds: 5, text: 'Abertura' },
-        { id: 'b_002', kind: 'payoff', summary: 's2', start_seconds: 5, end_seconds: 10, text: 'Fechamento' },
+        { id: 'b_001', kind: 'hook', summary: 's1', start_seconds: 0, on_screen_seconds: 5, continues_previous: false, text: 'Abertura' },
+        { id: 'b_002', kind: 'payoff', summary: 's2', start_seconds: 5, on_screen_seconds: 10, continues_previous: true, text: 'Fechamento' },
       ],
       opportunities: [{
         id: 'opp_1', title: 'Argumento central', summary: 'Resumo', hook: 'Gancho', hook_text: 'Manchete da oportunidade',

@@ -535,6 +535,68 @@ Problem: the host panel crop used a fixed anchor tuned on one video. The host co
 - Callers of `buildTimeline` pass `hostFraming`: export uses `record.hostFraming`; the editor uses `detail.job.hostFraming`.
 - OpenRouter requests retry transient network errors (connect timeout/reset; same cause-chain classifier as uploads) twice with 2 s and 5 s backoff. A request on the operator's hotspot failed with `ETIMEDOUT` on connect.
 
+## Planner pacing and story rules (follow-up, 2026-10-17)
+
+Problem: Filipe speaks slowly, so his shorts should always play at 1.5×. The planner measured clips in raw source seconds (critic bounds 30–180 s, prompt ideal 40–75 s), so a faster playback never let it fit more argument into the same on-screen time. The prompts asked for "publishable opportunities" without saying what makes a short worth sharing, and nothing told the model to cut warm-up, repetition, or digressions.
+
+### Speed
+
+- `profiles/filipe_boni_layout.json`: `defaultSpeed` 1.1 → 1.5 (the existing maximum, `EDIT_LIMITS.maxSpeed`). New jobs snapshot it; planned and manual shorts start at 1.5.
+- Existing Filipe jobs: an operator data fix sets `layoutProfileSnapshot.defaultSpeed = 1.5` in their stored payloads so replans use it. Existing shorts keep their own `edit.speed`.
+
+### Duration in on-screen seconds (`src/domain/semantic.ts`)
+
+- `export const SHORT_DURATION = { minSeconds: 20, idealMinSeconds: 35, idealMaxSeconds: 60, stretchMaxSeconds: 75, maxSeconds: 90 } as const;` (on-screen seconds).
+- `export const MAX_SHORT_SPANS = 4;` (contiguous spans after `mergeBlocksIntoSpans`).
+- `export interface PlanningPace { speed: number; words: TranscriptWord[]; sourceDurationSeconds: number }`.
+- `export function estimateOnScreenSeconds(ranges: WordRange[], pace: PlanningPace): number` = `outputDurationSeconds(createInitialEdit({ ranges, words: pace.words, speed: pace.speed, hookText: '' }), pace.words, pace.sourceDurationSeconds)`, rounded to 0.1 s. It reuses the editor's real rules (filler removal, pause tightening, clip padding, speed), so the planner's number matches what the editor shows.
+- `export function blockOnScreenSeconds(block: SemanticBlock, sentences: TranscriptSentence[], pace: PlanningPace): number`: the block's word range (start sentence `startWord` to end sentence `endWord`) through `estimateOnScreenSeconds`.
+- `diagnoseCandidatePlan(sentences, blocks, plan, pace: PlanningPace)` and `buildPlannedShorts({ sentences, blocks, plan, pace })` replace the `speed` parameter (no default). The diagnostic `durationSeconds` is `estimateOnScreenSeconds` of the merged spans. Reasons: `on-screen duration {d}s is below minimum 20s`, `on-screen duration {d}s exceeds maximum 90s`, `uses {n} separate cuts; maximum is 4`. `MIN_DURATION_SECONDS`/`MAX_DURATION_SECONDS` are removed.
+- `PlannedShort.rawDurationSeconds` → `onScreenSeconds` (same estimate).
+
+### Planner payload and prompts (`src/infra/openrouter.ts`)
+
+- `PlannerBlock = { id, kind, summary, start_seconds, on_screen_seconds, text }` (`end_seconds` removed; `start_seconds` stays for chronology).
+- `findOpportunities`, `repairOpportunityPlan`, and `planCandidates` take `speed: number`; the user payload adds `playback_speed`.
+- Shared prompt constants (exact PT-BR text below) replace `FIRST_BLOCK_RULE` and `DURATION_RULE`; `durationRule(speed)` reads `SHORT_DURATION` and `MAX_SHORT_SPANS` from the domain.
+
+`SHORT_BRIEF`:
+> Um bom short deste canal é uma história curta e completa sobre uma ideia só, que faz o espectador pensar. Quem assiste sai com algo que consegue repetir para outra pessoa: um número que muda a conversa, um mecanismo de causa e consequência, uma contradição exposta ou uma pergunta difícil de responder. É o vídeo que alguém manda para um amigo para provar um ponto ou começar uma discussão.
+
+`STORY_RULE`:
+> Estrutura obrigatória: (1) gancho nos primeiros 3 segundos com a tensão (afirmação surpreendente, número, contradição ou pergunta), sem aquecimento e sem depender de contexto anterior; (2) o raciocínio: o passo de mecanismo, evidência ou comparação que faz a ideia fazer sentido; (3) aterrissagem: a conclusão que cumpre a promessa do gancho, reenquadra o tema ou deixa uma implicação para o espectador pensar. Termine na frase mais forte; nunca em transição, lista aberta, "e aí" ou chamada para outro assunto.
+
+`CONCISION_RULE`:
+> Concisão: cada bloco precisa merecer o lugar. Pule aquecimento, repetição, digressão, apartes, autorreferência ("como eu falei", "vou mostrar"), leitura longa de texto na tela e pedidos de engajamento. Prefira pular um bloco fraco a mantê-lo, desde que o corte continue fluido: nenhum pronome ou referência ("isso", "ele", "esse número") pode ficar sem o antecedente dentro do short. No máximo {MAX_SHORT_SPANS} trechos contínuos; o ideal é de 1 a 3.
+
+`STANDALONE_RULE`:
+> O short precisa se sustentar sozinho para quem nunca viu o canal: quem é quem e do que se fala tem que estar no próprio short. Não corte qualificações que mudam o sentido (negações, ressalvas, condições, a base de um número) e não monte trechos que façam o autor parecer dizer o que não disse; se houver esse risco, marque risk high.
+
+`DIVERSITY_RULE`:
+> Cada proposta traz uma ideia diferente e não repete blocos de outra proposta. Ordene da mais compartilhável para a menos.
+
+`HOOK_TEXT_RULE`:
+> hook_text: manchete curta para a faixa no topo do short (ideal até 45 caracteres, máx. 90), específica e provocativa, que promete exatamente o que o short entrega; sem clickbait vazio; em PT-BR.
+
+`durationRule(speed)`:
+> O vídeo final roda a {speed}x com as pausas encurtadas; on_screen_seconds de cada bloco já é o tempo que ele ocupa na tela. Some on_screen_seconds dos blocos escolhidos: ideal de {idealMinSeconds} a {idealMaxSeconds} s; até {stretchMaxSeconds} s só quando o raciocínio realmente exige; nunca menos de {minSeconds} nem mais de {maxSeconds} s. Como a fala é acelerada, cabe mais argumento por segundo: use esse espaço para o passo do raciocínio e para a aterrissagem, nunca para aquecimento.
+
+System prompts, joined with spaces in this order:
+- `semantic-block-builder`: unchanged, plus before the final JSON line: "Separe em blocos próprios digressões, repetições, apartes, leitura longa de texto e transições, para que o editor consiga pulá-los sem quebrar o raciocínio."
+- `editorial-opportunity-planner`: "Você é diretor editorial de shorts em PT-BR." · `SHORT_BRIEF` · "Objetivo: encontrar de 3 a 6 oportunidades que realmente merecem virar short. Uma oportunidade é uma ideia publicável com promessa ao espectador, tensão, raciocínio e ponto de chegada; não é um capítulo solto nem um resumo do assunto." · "Priorize contradição entre discurso e números, mecanismo que explica um efeito, consequência que o espectador não tinha percebido, caso concreto que revela a tese maior e comparação que muda a escala do problema." · `STORY_RULE` · `CONCISION_RULE` · `STANDALONE_RULE` · `DIVERSITY_RULE` · "Ordem cronológica estrita dentro de cada proposta; use apenas os blocos fornecidos." · the existing "Cada oportunidade já deve vir como proposta de short: …" line · `HOOK_TEXT_RULE` · `durationRule(speed)` · "Retorne apenas JSON válido com a chave opportunities."
+- `editorial-opportunity-repair`: its first three existing lines · `SHORT_BRIEF` · `STORY_RULE` · `CONCISION_RULE` · `STANDALONE_RULE` · `DIVERSITY_RULE` · the existing "Cada oportunidade já deve vir…" line · `HOOK_TEXT_RULE` · `durationRule(speed)` · "Retorne apenas JSON válido com a chave opportunities." (the existing "Evite duplicar blocos…" line is dropped; the shared rules cover it).
+- `argument-arc-planner`: "Você é diretor editorial de shorts em PT-BR." · `SHORT_BRIEF` · "Objetivo: transformar as oportunidades em no máximo 5 shorts finais, prontos para publicar. Para cada um, escolha o menor conjunto de blocos que entrega a promessa ao espectador com o raciocínio completo; corte o que não move o argumento." · `STORY_RULE` · `CONCISION_RULE` · `STANDALONE_RULE` · `DIVERSITY_RULE` · "Ordem cronológica estrita; use apenas os blocos fornecidos." · "O título descreve o argumento do short, não só o assunto." · `HOOK_TEXT_RULE` · `durationRule(speed)` · "Retorne apenas JSON válido com a chave candidates."
+
+### Pipeline (`src/application/pipeline.ts` `planShorts`)
+
+`const pace: PlanningPace = { speed: layout.defaultSpeed, words, sourceDurationSeconds: this.requireMedia(job).durationSeconds }`; the block payload uses `on_screen_seconds: blockOnScreenSeconds(block, sentences, pace)` and `continues_previous: blockContinuesPrevious(...)`; the three planner calls pass `speed: pace.speed`; diagnostics and `buildPlannedShorts` take `pace`. Candidate order stays the rank order.
+
+### Cut counting (after adversarial review)
+
+- A "cut" is a jump in the source, the same thing the editor shows as separate ranges. The critic counts `createInitialEdit({ ranges, … }).ranges.length` (ranges merge when their words touch, whatever the pause), not `mergeBlocksIntoSpans` spans (which split on pauses over 1.2 s). A continuous passage with long pauses is one cut.
+- `export function blockContinuesPrevious(blocks: SemanticBlock[], index: number, sentences: TranscriptSentence[]): boolean` in `semantic.ts`: true when block `index > 0` starts at the word right after the previous block's last word. `PlannerBlock` gains `continues_previous: boolean`, and `CONCISION_RULE` gains a sentence after the span limit: "Blocos com continues_previous true emendam no anterior sem corte; cada bloco escolhido com continues_previous false (ou cujo anterior não foi escolhido) abre um trecho novo."
+- Pipeline test: a stubbed planner returning one candidate produces a short whose `edit.speed` equals the job snapshot's `defaultSpeed`, and every planner call receives that speed.
+
 ## Verification
 
 1. `pnpm typecheck` and `pnpm test` pass with zero errors.

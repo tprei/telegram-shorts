@@ -4,7 +4,7 @@
   "layoutId": "screen-top-host-bottom-v2",
   "canvas": { "width": 1080, "height": 1920, "fps": 30 },
   "background": "#101010",
-  "defaultSpeed": 1.1,
+  "defaultSpeed": 1.5,
   "font": { "family": "Montserrat ExtraBold", "file": "assets/fonts/Montserrat-ExtraBold.ttf", "assSizeScale": 1.562 },
   "panels": [
     { "id": "screen", "role": "content", "sourceRect": { "x": 0, "y": 0, "w": 0.632, "h": 1 }, "canvasRect": { "x": 0, "y": 0.1146, "w": 1, "h": 0.4375 } },

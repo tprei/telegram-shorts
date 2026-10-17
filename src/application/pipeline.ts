@@ -6,7 +6,7 @@ import { QUEUE_LANES, type ExportRecord, type HostFraming, type JobRecord, type 
 import { computeSourceClips, buildTimeline, type SourceClip } from '../domain/timeline.js';
 import { buildSentences, detectStrongSpeakers } from '../domain/policies.js';
 import type { ContentPanel, HostPanel, LayoutProfile } from '../domain/layout.js';
-import { buildPlannedShorts, diagnoseCandidatePlan, fallbackSemanticBlocks, materializeSemanticBlocks, semanticBlocksAreUsable } from '../domain/semantic.js';
+import { blockContinuesPrevious, blockOnScreenSeconds, buildPlannedShorts, diagnoseCandidatePlan, fallbackSemanticBlocks, materializeSemanticBlocks, semanticBlocksAreUsable, type PlanningPace } from '../domain/semantic.js';
 import type { CreatorProfileRepository } from '../infra/creator-profile-loader.js';
 import { buildPublishMessage } from '../infra/mallary.js';
 import { extractFrame, renderCoverImage, renderShortExport } from '../infra/render.js';
@@ -182,7 +182,7 @@ export class ShortsPipeline {
     }
     job.transcriptSentences = sentences;
     const layout = job.layoutProfileSnapshot;
-    const speed = layout.defaultSpeed;
+    const pace: PlanningPace = { speed: layout.defaultSpeed, words, sourceDurationSeconds: this.requireMedia(job).durationSeconds };
     let blocks = fallbackSemanticBlocks(sentences);
     try {
       const response = await this.deps.openRouter.buildSemanticBlocks({ title: job.sourceTitle, sentences });
@@ -195,28 +195,30 @@ export class ShortsPipeline {
     }
     job.semanticBlocks = blocks;
     this.deps.store.updateJob(job);
-    const blockPayload = blocks.map((block) => ({
+    const blockPayload = blocks.map((block, index) => ({
       id: block.id,
       kind: block.kind,
       summary: block.summary,
       start_seconds: block.startSeconds,
-      end_seconds: block.endSeconds,
+      on_screen_seconds: blockOnScreenSeconds(block, sentences, pace),
+      continues_previous: blockContinuesPrevious(blocks, index, sentences),
       text: block.text,
     }));
-    let opportunities = await this.deps.openRouter.findOpportunities({ title: job.sourceTitle, blocks: blockPayload });
-    let plan = await this.deps.openRouter.planCandidates({ title: job.sourceTitle, blocks: blockPayload, opportunities: opportunities.opportunities });
-    let diagnostics = diagnoseCandidatePlan(sentences, blocks, plan, speed);
-    let planned = buildPlannedShorts({ sentences, blocks, plan, speed });
+    let opportunities = await this.deps.openRouter.findOpportunities({ title: job.sourceTitle, blocks: blockPayload, speed: pace.speed });
+    let plan = await this.deps.openRouter.planCandidates({ title: job.sourceTitle, blocks: blockPayload, opportunities: opportunities.opportunities, speed: pace.speed });
+    let diagnostics = diagnoseCandidatePlan(sentences, blocks, plan, pace);
+    let planned = buildPlannedShorts({ sentences, blocks, plan, pace });
     if (planned.length === 0) {
       opportunities = await this.deps.openRouter.repairOpportunityPlan({
         title: job.sourceTitle,
         blocks: blockPayload,
         opportunities: opportunities.opportunities,
         diagnostics,
+        speed: pace.speed,
       });
-      plan = await this.deps.openRouter.planCandidates({ title: job.sourceTitle, blocks: blockPayload, opportunities: opportunities.opportunities });
-      diagnostics = diagnoseCandidatePlan(sentences, blocks, plan, speed);
-      planned = buildPlannedShorts({ sentences, blocks, plan, speed });
+      plan = await this.deps.openRouter.planCandidates({ title: job.sourceTitle, blocks: blockPayload, opportunities: opportunities.opportunities, speed: pace.speed });
+      diagnostics = diagnoseCandidatePlan(sentences, blocks, plan, pace);
+      planned = buildPlannedShorts({ sentences, blocks, plan, pace });
     }
     if (planned.length === 0) {
       const summary = diagnostics.map((entry) => `#${entry.index + 1} ${entry.title}: ${entry.reasons.join('; ') || 'no diagnostic reason'}`).join(' | ');
@@ -226,7 +228,7 @@ export class ShortsPipeline {
     const existing = this.deps.store.listShortsForJob(job.id);
     let nextRank = existing.reduce((max, short) => Math.max(max, short.rank), 0);
     for (const item of planned) {
-      const edit = createInitialEdit({ ranges: item.ranges, words, speed, hookText: item.hookText });
+      const edit = createInitialEdit({ ranges: item.ranges, words, speed: pace.speed, hookText: item.hookText });
       const kept = keptWordIndices(edit, words.length);
       if (overlapsExistingShort(kept, existing, words.length)) {
         continue;

@@ -4,19 +4,27 @@ import type { AppConfig, ReasoningEffort } from './env.js';
 import { isTransientNetworkError } from './instagram-publisher.js';
 import { HookSuggestionsResponse, HookSuggestionsResponseSchema, OpportunityPlanResponse, OpportunityPlanResponseSchema, PlannedCandidateResponse, PlannedCandidateResponseSchema, PublishCopyResponse, PublishCopyResponseSchema, RevisionIntent, RevisionIntentSchema, SemanticBlockKind, SemanticBlockResponseSet, SemanticBlockResponseSetSchema, TranscriptSentence, TranscriptSpanLocate, TranscriptSpanLocateSchema } from '../domain/model.js';
 import { logError } from './util.js';
+import { MAX_SHORT_SPANS, SHORT_DURATION } from '../domain/semantic.js';
 
 type ImageInput = { mimeType: 'image/jpeg' | 'image/png'; base64: string };
 type ResponseFormat = { name: string; schema: Record<string, unknown> };
 type ChatPart = { type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } };
 type ReasoningOptions = { effort: ReasoningEffort; maxTokens: number };
-type PlannerBlock = { id: string; kind: SemanticBlockKind; summary: string; start_seconds: number; end_seconds: number; text: string };
+type PlannerBlock = { id: string; kind: SemanticBlockKind; summary: string; start_seconds: number; on_screen_seconds: number; continues_previous: boolean; text: string };
 
 const EDITORIAL_TEMPERATURE = 0.2;
 const PROVIDER_ERROR_ATTEMPTS = 2;
 const NETWORK_RETRY_DELAYS_MS = [2000, 5000];
-const HOOK_TEXT_RULE = 'hook_text: manchete curta para a faixa no topo do short (ideal até 45 caracteres, máx. 90), provocativa, específica, sem clickbait vazio, em PT-BR.';
-const FIRST_BLOCK_RULE = 'O primeiro bloco precisa prender nos primeiros 3 segundos sem depender de contexto anterior.';
-const DURATION_RULE = 'Duração ideal de 40 a 75 segundos somando os blocos escolhidos (use start_seconds e end_seconds); passe de 90 segundos só quando o argumento realmente exigir; nunca menos de 30 nem mais de 180.';
+const HOOK_TEXT_RULE = 'hook_text: manchete curta para a faixa no topo do short (ideal até 45 caracteres, máx. 90), específica e provocativa, que promete exatamente o que o short entrega; sem clickbait vazio; em PT-BR.';
+const SHORT_BRIEF = 'Um bom short deste canal é uma história curta e completa sobre uma ideia só, que faz o espectador pensar. Quem assiste sai com algo que consegue repetir para outra pessoa: um número que muda a conversa, um mecanismo de causa e consequência, uma contradição exposta ou uma pergunta difícil de responder. É o vídeo que alguém manda para um amigo para provar um ponto ou começar uma discussão.';
+const STORY_RULE = 'Estrutura obrigatória: (1) gancho nos primeiros 3 segundos com a tensão (afirmação surpreendente, número, contradição ou pergunta), sem aquecimento e sem depender de contexto anterior; (2) o raciocínio: o passo de mecanismo, evidência ou comparação que faz a ideia fazer sentido; (3) aterrissagem: a conclusão que cumpre a promessa do gancho, reenquadra o tema ou deixa uma implicação para o espectador pensar. Termine na frase mais forte; nunca em transição, lista aberta, "e aí" ou chamada para outro assunto.';
+const CONCISION_RULE = `Concisão: cada bloco precisa merecer o lugar. Pule aquecimento, repetição, digressão, apartes, autorreferência ("como eu falei", "vou mostrar"), leitura longa de texto na tela e pedidos de engajamento. Prefira pular um bloco fraco a mantê-lo, desde que o corte continue fluido: nenhum pronome ou referência ("isso", "ele", "esse número") pode ficar sem o antecedente dentro do short. No máximo ${MAX_SHORT_SPANS} trechos contínuos; o ideal é de 1 a 3. Blocos com continues_previous true emendam no anterior sem corte; cada bloco escolhido com continues_previous false (ou cujo anterior não foi escolhido) abre um trecho novo.`;
+const STANDALONE_RULE = 'O short precisa se sustentar sozinho para quem nunca viu o canal: quem é quem e do que se fala tem que estar no próprio short. Não corte qualificações que mudam o sentido (negações, ressalvas, condições, a base de um número) e não monte trechos que façam o autor parecer dizer o que não disse; se houver esse risco, marque risk high.';
+const DIVERSITY_RULE = 'Cada proposta traz uma ideia diferente e não repete blocos de outra proposta. Ordene da mais compartilhável para a menos.';
+
+function durationRule(speed: number): string {
+  return `O vídeo final roda a ${speed}x com as pausas encurtadas; on_screen_seconds de cada bloco já é o tempo que ele ocupa na tela. Some on_screen_seconds dos blocos escolhidos: ideal de ${SHORT_DURATION.idealMinSeconds} a ${SHORT_DURATION.idealMaxSeconds} s; até ${SHORT_DURATION.stretchMaxSeconds} s só quando o raciocínio realmente exige; nunca menos de ${SHORT_DURATION.minSeconds} nem mais de ${SHORT_DURATION.maxSeconds} s. Como a fala é acelerada, cabe mais argumento por segundo: use esse espaço para o passo do raciocínio e para a aterrissagem, nunca para aquecimento.`;
+}
 const JSON_REPAIR_SYSTEM = [
   'Você corrige JSON malformado produzido por outro modelo.',
   'Preserve a estrutura e os valores pretendidos o máximo possível.',
@@ -199,6 +207,7 @@ export class OpenRouterClient {
         'Cada bloco deve cobrir um pequeno movimento argumentativo relevante, em ordem cronológica estrita, usando IDs de frases já fornecidos.',
         'Use payoff não só para encerramento final do vídeo, mas também para síntese, consequência, conclusão local, tese que aterrissa ou por-que-isso-importa.',
         'Ignore CTA, pedido de like, propaganda do canal e housekeeping, a menos que sejam realmente parte do argumento.',
+        'Separe em blocos próprios digressões, repetições, apartes, leitura longa de texto e transições, para que o editor consiga pulá-los sem quebrar o raciocínio.',
         'Retorne apenas JSON válido com a chave blocks.',
       ].join(' '),
       userText: JSON.stringify({
@@ -217,22 +226,27 @@ export class OpenRouterClient {
     });
   }
 
-  async findOpportunities(input: { title: string | null; blocks: PlannerBlock[] }): Promise<OpportunityPlanResponse> {
+  async findOpportunities(input: { title: string | null; blocks: PlannerBlock[]; speed: number }): Promise<OpportunityPlanResponse> {
     return requestStructuredJson<OpportunityPlanResponse>(this.config, {
       title: 'editorial-opportunity-planner',
       system: [
         'Você é diretor editorial de shorts em PT-BR.',
-        'Objetivo: identificar de 3 a 6 oportunidades editoriais que realmente merecem virar short.',
-        'Uma oportunidade é uma ideia publicável com promessa ao espectador, tensão, desenvolvimento e um ponto de chegada; não é um capítulo solto nem um resumo do assunto.',
-        'Priorize tese, contraste, mecanismo, consequência, caso absurdo que revela a tese maior, ou payoff explicativo forte.',
-        'Ordem cronológica estrita; use apenas os blocos fornecidos; poucos saltos; CTA, propaganda, housekeeping e glossário não entram.',
+        SHORT_BRIEF,
+        'Objetivo: encontrar de 3 a 6 oportunidades que realmente merecem virar short. Uma oportunidade é uma ideia publicável com promessa ao espectador, tensão, raciocínio e ponto de chegada; não é um capítulo solto nem um resumo do assunto.',
+        'Priorize contradição entre discurso e números, mecanismo que explica um efeito, consequência que o espectador não tinha percebido, caso concreto que revela a tese maior e comparação que muda a escala do problema.',
+        STORY_RULE,
+        CONCISION_RULE,
+        STANDALONE_RULE,
+        DIVERSITY_RULE,
+        'Ordem cronológica estrita dentro de cada proposta; use apenas os blocos fornecidos.',
         'Cada oportunidade já deve vir como proposta de short: título, resumo, hook, hook_text, payoff, rationale, thesis, viewer_promise, tension, why_this_short, risk, block_ids e steps.',
         HOOK_TEXT_RULE,
-        DURATION_RULE,
+        durationRule(input.speed),
         'Retorne apenas JSON válido com a chave opportunities.',
       ].join(' '),
       userText: JSON.stringify({
         source_title: input.title,
+        playback_speed: input.speed,
         blocks: input.blocks,
       }),
       reasoning: this.reasoning,
@@ -247,6 +261,7 @@ export class OpenRouterClient {
     blocks: PlannerBlock[];
     opportunities: OpportunityPlanResponse['opportunities'];
     diagnostics: Array<{ title: string; reasons: string[]; durationSeconds: number | null }>;
+    speed: number;
   }): Promise<OpportunityPlanResponse> {
     return requestStructuredJson<OpportunityPlanResponse>(this.config, {
       title: 'editorial-opportunity-repair',
@@ -254,14 +269,19 @@ export class OpenRouterClient {
         'Você está reparando um plano de shorts que falhou no crítico local.',
         'Gere uma nova lista de oportunidades publicáveis a partir dos blocos, preservando ordem cronológica estrita e usando apenas os blocos fornecidos.',
         'Cada oportunidade deve aterrissar num ponto que resolve, sintetiza, revela a consequência ou responde por-que-isso-importa. Não dependa só de blocos explicitamente rotulados como payoff.',
-        'Evite duplicar blocos, evite capítulos locais sem tese, evite terminar em abertura de lista, CTA, merchandising ou continuação.',
+        SHORT_BRIEF,
+        STORY_RULE,
+        CONCISION_RULE,
+        STANDALONE_RULE,
+        DIVERSITY_RULE,
         'Cada oportunidade já deve vir como proposta de short: título, resumo, hook, hook_text, payoff, rationale, thesis, viewer_promise, tension, why_this_short, risk, block_ids e steps.',
         HOOK_TEXT_RULE,
-        DURATION_RULE,
+        durationRule(input.speed),
         'Retorne apenas JSON válido com a chave opportunities.',
       ].join(' '),
       userText: JSON.stringify({
         source_title: input.title,
+        playback_speed: input.speed,
         blocks: input.blocks,
         rejected_opportunities: input.opportunities,
         critic_findings: input.diagnostics,
@@ -273,22 +293,26 @@ export class OpenRouterClient {
     });
   }
 
-  async planCandidates(input: { title: string | null; blocks: PlannerBlock[]; opportunities: OpportunityPlanResponse['opportunities'] }): Promise<PlannedCandidateResponse> {
+  async planCandidates(input: { title: string | null; blocks: PlannerBlock[]; opportunities: OpportunityPlanResponse['opportunities']; speed: number }): Promise<PlannedCandidateResponse> {
     return requestStructuredJson<PlannedCandidateResponse>(this.config, {
       title: 'argument-arc-planner',
       system: [
         'Você é diretor editorial de shorts em PT-BR.',
-        'Objetivo: transformar oportunidades editoriais em no máximo 5 candidatos de short bem compostos.',
-        'Regras obrigatórias: ordem cronológica estrita; usar apenas os blocos fornecidos; poucos saltos; priorizar transformação argumentativa completa por segundo; cada candidato deve cumprir claramente a promessa ao espectador da oportunidade escolhida.',
-        FIRST_BLOCK_RULE,
-        'Não devolva capítulo local sem tese. Prefira ideias grandes do vídeo, bons casos reveladores, ou conclusões explicativas fortes.',
-        'O título deve descrever o argumento do short, não apenas o assunto ou capítulo local.',
+        SHORT_BRIEF,
+        'Objetivo: transformar as oportunidades em no máximo 5 shorts finais, prontos para publicar. Para cada um, escolha o menor conjunto de blocos que entrega a promessa ao espectador com o raciocínio completo; corte o que não move o argumento.',
+        STORY_RULE,
+        CONCISION_RULE,
+        STANDALONE_RULE,
+        DIVERSITY_RULE,
+        'Ordem cronológica estrita; use apenas os blocos fornecidos.',
+        'O título descreve o argumento do short, não só o assunto.',
         HOOK_TEXT_RULE,
-        DURATION_RULE,
+        durationRule(input.speed),
         'Retorne apenas JSON válido com a chave candidates.',
       ].join(' '),
       userText: JSON.stringify({
         source_title: input.title,
+        playback_speed: input.speed,
         blocks: input.blocks,
         opportunities: input.opportunities,
       }),

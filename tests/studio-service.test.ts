@@ -726,6 +726,82 @@ test('a failed replan keeps the job ready with its shorts and offers retry', asy
   }
 });
 
+test('planShorts runs at the layout snapshot speed and passes it to every planner call', async () => {
+  const longWords: TranscriptWord[] = Array.from({ length: 60 }, (_, index) => ({
+    id: `w_${String(index + 1).padStart(6, '0')}`,
+    text: `palavra${index + 1}`,
+    startSeconds: index * 0.6,
+    endSeconds: index * 0.6 + 0.5,
+    speakerId: 'speaker_0',
+    confidence: 0.99,
+  }));
+  const plannerCalls: Array<{ method: string; speed: number; blocks: Array<Record<string, unknown>> }> = [];
+  const planner = {
+    buildSemanticBlocks: async () => ({ blocks: [] }),
+    findOpportunities: async (input: { speed: number; blocks: Array<{ id: string }> }) => {
+      plannerCalls.push({ method: 'findOpportunities', speed: input.speed, blocks: input.blocks });
+      const blockIds = input.blocks.slice(0, 3).map((block) => block.id);
+      return {
+        opportunities: [{
+          id: 'opp_1', title: 'Argumento', summary: 'Resumo', hook: 'Gancho', hook_text: 'MANCHETE', payoff: 'Payoff',
+          rationale: 'Racional', thesis: 'Tese', viewer_promise: 'Promessa', tension: 'Tensão', why_this_short: 'Porque',
+          risk: 'medium' as const, block_ids: blockIds,
+          steps: [
+            { kind: 'hook' as const, label: 'gancho', block_ids: [blockIds[0]!] },
+            { kind: 'explain' as const, label: 'mecanismo', block_ids: [blockIds[1]!] },
+            { kind: 'payoff' as const, label: 'aterrissagem', block_ids: [blockIds[2]!] },
+          ],
+        }],
+      };
+    },
+    planCandidates: async (input: { speed: number; blocks: Array<{ id: string }> }) => {
+      plannerCalls.push({ method: 'planCandidates', speed: input.speed, blocks: input.blocks });
+      const blockIds = input.blocks.slice(0, 3).map((block) => block.id);
+      return {
+        candidates: [{
+          opportunity_id: 'opp_1', title: 'Argumento', summary: 'Resumo', hook: 'Gancho', hook_text: 'MANCHETE',
+          payoff: 'Payoff', rationale: 'Racional', thesis: 'Tese', risk: 'medium' as const, block_ids: blockIds,
+          steps: [
+            { kind: 'hook' as const, label: 'gancho', block_ids: [blockIds[0]!] },
+            { kind: 'explain' as const, label: 'mecanismo', block_ids: [blockIds[1]!] },
+            { kind: 'payoff' as const, label: 'aterrissagem', block_ids: [blockIds[2]!] },
+          ],
+        }],
+      };
+    },
+  } as unknown as OpenRouterClient;
+  const context = await makeContext(planner);
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir, longWords);
+    context.service.replan(seeded.jobId);
+    const pipeline = new ShortsPipeline({
+      config: testConfig(context.rootDir),
+      store: context.store,
+      openRouter: planner,
+      profiles: new CreatorProfileRepository({ rootDir: context.rootDir, manifestPath: join(context.rootDir, 'creator-profiles.json') }),
+      publisher: null,
+    });
+    assert.equal(await pipeline.runNext('ingest'), true);
+    const storedJob = context.store.getJob(seeded.jobId);
+    assert.equal(storedJob?.status, 'ready');
+    const expectedSpeed = storedJob!.layoutProfileSnapshot.defaultSpeed;
+    const shorts = context.store.listShortsForJob(seeded.jobId);
+    assert.equal(shorts.length, 1);
+    assert.equal(shorts[0]?.edit.speed, expectedSpeed);
+    assert.ok(plannerCalls.length >= 2);
+    for (const call of plannerCalls) {
+      assert.equal(call.speed, expectedSpeed);
+      assert.ok(call.blocks.length > 0);
+      for (const block of call.blocks) {
+        assert.equal(typeof block.on_screen_seconds, 'number');
+        assert.equal(typeof block.continues_previous, 'boolean');
+      }
+    }
+  } finally {
+    await cleanup(context);
+  }
+});
+
 test('exportShort rejects when every word is cut', async () => {
   const context = await makeContext();
   try {

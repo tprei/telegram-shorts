@@ -1,8 +1,39 @@
-import type { WordRange } from './edit.js';
-import type { CandidateArc, CandidateArcStep, OpportunityPlanResponse, PlannedCandidateResponse, SemanticBlock, SemanticBlockKind, SemanticBlockResponseSet, TranscriptSentence } from './model.js';
+import { createInitialEdit, type WordRange } from './edit.js';
+import { outputDurationSeconds } from './timeline.js';
+import type { CandidateArc, CandidateArcStep, OpportunityPlanResponse, PlannedCandidateResponse, SemanticBlock, SemanticBlockKind, SemanticBlockResponseSet, TranscriptSentence, TranscriptWord } from './model.js';
 
-const MIN_DURATION_SECONDS = 30;
-const MAX_DURATION_SECONDS = 180;
+export const SHORT_DURATION = { minSeconds: 20, idealMinSeconds: 35, idealMaxSeconds: 60, stretchMaxSeconds: 75, maxSeconds: 90 } as const;
+
+export const MAX_SHORT_SPANS = 4;
+
+export interface PlanningPace {
+  speed: number;
+  words: TranscriptWord[];
+  sourceDurationSeconds: number;
+}
+
+export function estimateOnScreenSeconds(ranges: WordRange[], pace: PlanningPace): number {
+  const edit = createInitialEdit({ ranges, words: pace.words, speed: pace.speed, hookText: '' });
+  return Math.round(outputDurationSeconds(edit, pace.words, pace.sourceDurationSeconds) * 10) / 10;
+}
+
+export function blockOnScreenSeconds(block: SemanticBlock, sentences: TranscriptSentence[], pace: PlanningPace): number {
+  const start = sentences.find((sentence) => sentence.id === block.startSentenceId);
+  const end = sentences.find((sentence) => sentence.id === block.endSentenceId);
+  if (!start || !end) {
+    throw new Error(`Semantic block ${block.id} references sentences missing from the transcript.`);
+  }
+  return estimateOnScreenSeconds([{ startWord: start.startWord, endWord: end.endWord }], pace);
+}
+
+export function blockContinuesPrevious(blocks: SemanticBlock[], index: number, sentences: TranscriptSentence[]): boolean {
+  if (index <= 0 || index >= blocks.length) {
+    return false;
+  }
+  const previousEnd = sentences.find((sentence) => sentence.id === blocks[index - 1]!.endSentenceId);
+  const start = sentences.find((sentence) => sentence.id === blocks[index]!.startSentenceId);
+  return previousEnd !== undefined && start !== undefined && start.startWord === previousEnd.endWord + 1;
+}
 
 export function fallbackSemanticBlocks(sentences: TranscriptSentence[]): SemanticBlock[] {
   const blocks: SemanticBlock[] = [];
@@ -113,8 +144,8 @@ export interface CandidatePlanDiagnostic {
   reasons: string[];
 }
 
-export function diagnoseCandidatePlan(sentences: TranscriptSentence[], blocks: SemanticBlock[], plan: PlannedCandidateResponse, speed = 1): CandidatePlanDiagnostic[] {
-  return plan.candidates.map((candidate, index) => diagnoseCandidateFromBlocks(sentences, blocks, candidate, index, speed));
+export function diagnoseCandidatePlan(sentences: TranscriptSentence[], blocks: SemanticBlock[], plan: PlannedCandidateResponse, pace: PlanningPace): CandidatePlanDiagnostic[] {
+  return plan.candidates.map((candidate, index) => diagnoseCandidateFromBlocks(sentences, blocks, candidate, index, pace));
 }
 
 export interface PlannedShort {
@@ -127,17 +158,17 @@ export interface PlannedShort {
   risk: 'low' | 'medium' | 'high';
   arc: CandidateArc | null;
   ranges: WordRange[];
-  rawDurationSeconds: number;
+  onScreenSeconds: number;
 }
 
-export function buildPlannedShorts(input: { sentences: TranscriptSentence[]; blocks: SemanticBlock[]; plan: PlannedCandidateResponse; speed: number }): PlannedShort[] {
+export function buildPlannedShorts(input: { sentences: TranscriptSentence[]; blocks: SemanticBlock[]; plan: PlannedCandidateResponse; pace: PlanningPace }): PlannedShort[] {
   const shorts: PlannedShort[] = [];
   const seenSignatures = new Set<string>();
   for (const raw of input.plan.candidates) {
     if (shorts.length >= 5) {
       break;
     }
-    const diagnostic = diagnoseCandidateFromBlocks(input.sentences, input.blocks, raw, shorts.length, input.speed);
+    const diagnostic = diagnoseCandidateFromBlocks(input.sentences, input.blocks, raw, shorts.length, input.pace);
     if (diagnostic.reasons.length > 0) {
       continue;
     }
@@ -160,13 +191,13 @@ export function buildPlannedShorts(input: { sentences: TranscriptSentence[]; blo
       risk: raw.risk,
       arc: arc.steps.length > 0 ? arc : null,
       ranges,
-      rawDurationSeconds: roundSeconds(spans.reduce((sum, span) => sum + (span.last.endSeconds - span.first.startSeconds), 0)),
+      onScreenSeconds: estimateOnScreenSeconds(ranges, input.pace),
     });
   }
   return shorts;
 }
 
-function diagnoseCandidateFromBlocks(sentences: TranscriptSentence[], blocks: SemanticBlock[], raw: PlannedCandidateResponse['candidates'][number], index: number, speed = 1): CandidatePlanDiagnostic {
+function diagnoseCandidateFromBlocks(sentences: TranscriptSentence[], blocks: SemanticBlock[], raw: PlannedCandidateResponse['candidates'][number], index: number, pace: PlanningPace): CandidatePlanDiagnostic {
   const byBlockId = new Map(blocks.map((block) => [block.id, block]));
   const reasons: string[] = [];
   const missingBlockIds = raw.block_ids.filter((id) => !byBlockId.has(id));
@@ -192,13 +223,17 @@ function diagnoseCandidateFromBlocks(sentences: TranscriptSentence[], blocks: Se
   if (spans.length === 0) {
     reasons.push('blocks could not be converted into renderable segments');
   }
-  const rawDurationSeconds = spans.length > 0 ? spans.reduce((sum, span) => sum + (span.last.endSeconds - span.first.startSeconds), 0) : null;
-  const durationSeconds = rawDurationSeconds !== null ? roundSeconds(rawDurationSeconds / Math.max(speed, 1)) : null;
-  if (rawDurationSeconds !== null && rawDurationSeconds < MIN_DURATION_SECONDS) {
-    reasons.push(`duration ${roundSeconds(rawDurationSeconds)}s is below minimum ${MIN_DURATION_SECONDS}s`);
+  const ranges: WordRange[] = spans.map((span) => ({ startWord: span.first.startWord, endWord: span.last.endWord }));
+  const edit = createInitialEdit({ ranges, words: pace.words, speed: pace.speed, hookText: '' });
+  const durationSeconds = ranges.length > 0 ? Math.round(outputDurationSeconds(edit, pace.words, pace.sourceDurationSeconds) * 10) / 10 : null;
+  if (durationSeconds !== null && durationSeconds < SHORT_DURATION.minSeconds) {
+    reasons.push(`on-screen duration ${durationSeconds}s is below minimum ${SHORT_DURATION.minSeconds}s`);
   }
-  if (rawDurationSeconds !== null && rawDurationSeconds > MAX_DURATION_SECONDS) {
-    reasons.push(`duration ${roundSeconds(rawDurationSeconds)}s exceeds maximum ${MAX_DURATION_SECONDS}s`);
+  if (durationSeconds !== null && durationSeconds > SHORT_DURATION.maxSeconds) {
+    reasons.push(`on-screen duration ${durationSeconds}s exceeds maximum ${SHORT_DURATION.maxSeconds}s`);
+  }
+  if (edit.ranges.length > MAX_SHORT_SPANS) {
+    reasons.push(`uses ${edit.ranges.length} separate cuts; maximum is ${MAX_SHORT_SPANS}`);
   }
   if (selectedBlocks.length >= 2) {
     const resolvedSteps = resolveCandidateArcSteps(orderedBlocks, raw.steps);
@@ -407,8 +442,4 @@ function summarize(text: string, maxLength: number): string {
     return compact;
   }
   return `${compact.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
-}
-
-function roundSeconds(value: number): number {
-  return Math.round(value * 1000) / 1000;
 }
