@@ -587,3 +587,70 @@ test('HTTP failures propagate without a repair request', async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test('a transient connect timeout is retried once and the retry succeeds', async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    if (calls === 1) {
+      const error = new Error('connect timed out');
+      (error as Error & { code: string }).code = 'ETIMEDOUT';
+      throw error;
+    }
+    return new Response(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content: '{"options":["Um","Dois","Três"]}' } }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+  try {
+    const options = await new OpenRouterClient(baseConfig).suggestHooks({ title: 'Título', summary: 'Resumo', transcriptText: 'texto', current: 'atual' });
+    assert.deepEqual(options, ['Um', 'Dois', 'Três']);
+    assert.equal(calls, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('a transient error hidden in a cause chain is retried, a non-transient code is not', { timeout: 30_000 }, async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    if (calls === 1) {
+      throw new Error('fetch failed', { cause: Object.assign(new Error('connection reset'), { code: 'ECONNRESET' }) });
+    }
+    if (calls === 2) {
+      return new Response(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content: '{"options":["Um","Dois","Três"]}' } }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    const error = new Error('name resolution failed');
+    (error as Error & { code: string }).code = 'ENOTFOUND';
+    throw error;
+  }) as typeof fetch;
+  try {
+    const options = await new OpenRouterClient(baseConfig).suggestHooks({ title: 'Título', summary: 'Resumo', transcriptText: 'texto', current: 'atual' });
+    assert.deepEqual(options, ['Um', 'Dois', 'Três']);
+    await assert.rejects(
+      () => new OpenRouterClient(baseConfig).suggestHooks({ title: 'Título', summary: 'Resumo', transcriptText: 'texto', current: 'atual' }),
+      /ENOTFOUND|name resolution failed/,
+    );
+    assert.equal(calls, 3);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('an HTTP 4xx response is never retried', async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    return new Response('chave inválida', { status: 401 });
+  }) as typeof fetch;
+  try {
+    await assert.rejects(
+      () => new OpenRouterClient(baseConfig).suggestHooks({ title: 'Título', summary: 'Resumo', transcriptText: 'texto', current: 'atual' }),
+      /OpenRouter request failed: 401/,
+    );
+    assert.equal(calls, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

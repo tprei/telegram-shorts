@@ -1,4 +1,7 @@
+import { setTimeout as sleep } from 'node:timers/promises';
+
 import type { AppConfig, ReasoningEffort } from './env.js';
+import { isTransientNetworkError } from './instagram-publisher.js';
 import { HookSuggestionsResponse, HookSuggestionsResponseSchema, OpportunityPlanResponse, OpportunityPlanResponseSchema, PlannedCandidateResponse, PlannedCandidateResponseSchema, PublishCopyResponse, PublishCopyResponseSchema, RevisionIntent, RevisionIntentSchema, SemanticBlockKind, SemanticBlockResponseSet, SemanticBlockResponseSetSchema, TranscriptSentence, TranscriptSpanLocate, TranscriptSpanLocateSchema } from '../domain/model.js';
 import { logError } from './util.js';
 
@@ -10,6 +13,7 @@ type PlannerBlock = { id: string; kind: SemanticBlockKind; summary: string; star
 
 const EDITORIAL_TEMPERATURE = 0.2;
 const PROVIDER_ERROR_ATTEMPTS = 2;
+const NETWORK_RETRY_DELAYS_MS = [2000, 5000];
 const HOOK_TEXT_RULE = 'hook_text: manchete curta para a faixa no topo do short (ideal até 45 caracteres, máx. 90), provocativa, específica, sem clickbait vazio, em PT-BR.';
 const FIRST_BLOCK_RULE = 'O primeiro bloco precisa prender nos primeiros 3 segundos sem depender de contexto anterior.';
 const DURATION_RULE = 'Duração ideal de 40 a 75 segundos somando os blocos escolhidos (use start_seconds e end_seconds); passe de 90 segundos só quando o argumento realmente exigir; nunca menos de 30 nem mais de 180.';
@@ -468,9 +472,38 @@ async function requestCompletionContent(config: AppConfig, input: {
   responseFormat: ResponseFormat;
 }): Promise<string> {
   for (let attempt = 1; ; attempt += 1) {
-    let response: Response;
+    const response = await postCompletion(config, input);
+    if (!response.ok) {
+      throw new Error(`OpenRouter request failed: ${response.status} ${await response.text()}`);
+    }
+    const payload = await response.json() as { provider?: string; choices?: Array<{ finish_reason?: string; message?: { content?: string } }>; usage?: { completion_tokens?: number; completion_tokens_details?: { reasoning_tokens?: number } } };
+    const choice = payload.choices?.[0];
+    const content = choice?.message?.content;
+    if (content) {
+      return content;
+    }
+    const finishReason = choice?.finish_reason ?? 'missing';
+    const message = `OpenRouter response was empty (${input.title}, provider ${payload.provider ?? 'unknown'}, finish_reason ${finishReason}, completion tokens ${payload.usage?.completion_tokens ?? 'n/a'}, reasoning tokens ${payload.usage?.completion_tokens_details?.reasoning_tokens ?? 'n/a'}).`;
+    if (finishReason === 'error' && attempt < PROVIDER_ERROR_ATTEMPTS) {
+      logError('OpenRouter provider failed mid-response; retrying', new Error(message), { title: input.title, model: input.model, attempt });
+      continue;
+    }
+    throw new Error(message);
+  }
+}
+
+async function postCompletion(config: AppConfig, input: {
+  title: string;
+  model: string;
+  reasoning?: ReasoningOptions;
+  system: string;
+  user: string | ChatPart[];
+  temperature: number;
+  responseFormat: ResponseFormat;
+}): Promise<Response> {
+  for (let attempt = 0; ; attempt += 1) {
     try {
-      response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      return await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${config.OPENROUTER_API_KEY}`,
@@ -499,25 +532,14 @@ async function requestCompletionContent(config: AppConfig, input: {
         }),
       });
     } catch (error) {
-      logError('OpenRouter request failed', error, { title: input.title, model: input.model });
-      throw error;
+      const delay = NETWORK_RETRY_DELAYS_MS[attempt];
+      if (delay === undefined || !isTransientNetworkError(error)) {
+        logError('OpenRouter request failed', error, { title: input.title, model: input.model });
+        throw error;
+      }
+      logError(`OpenRouter request failed; retrying in ${delay / 1000}s`, error, { title: input.title, model: input.model, attempt: attempt + 1 });
+      await sleep(delay);
     }
-    if (!response.ok) {
-      throw new Error(`OpenRouter request failed: ${response.status} ${await response.text()}`);
-    }
-    const payload = await response.json() as { provider?: string; choices?: Array<{ finish_reason?: string; message?: { content?: string } }>; usage?: { completion_tokens?: number; completion_tokens_details?: { reasoning_tokens?: number } } };
-    const choice = payload.choices?.[0];
-    const content = choice?.message?.content;
-    if (content) {
-      return content;
-    }
-    const finishReason = choice?.finish_reason ?? 'missing';
-    const message = `OpenRouter response was empty (${input.title}, provider ${payload.provider ?? 'unknown'}, finish_reason ${finishReason}, completion tokens ${payload.usage?.completion_tokens ?? 'n/a'}, reasoning tokens ${payload.usage?.completion_tokens_details?.reasoning_tokens ?? 'n/a'}).`;
-    if (finishReason === 'error' && attempt < PROVIDER_ERROR_ATTEMPTS) {
-      logError('OpenRouter provider failed mid-response; retrying', new Error(message), { title: input.title, model: input.model, attempt });
-      continue;
-    }
-    throw new Error(message);
   }
 }
 
