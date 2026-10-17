@@ -108,7 +108,7 @@ export function EditorInspector(props: EditorInspectorProps) {
     ?.sourceRect ?? { x: 0, y: 0, w: 1, h: 1 };
   const analyzing =
     detail.short.cropAnalysis === 'queued' || detail.short.cropAnalysis === 'running';
-  const currentExport = newestExport(detail.exports, detail.short.editRevision);
+  const currentExport = newestExport(detail.exports);
   const latestReadyExport = detail.exports.find((item) => item.status === 'ready') ?? null;
   const rendering = detail.exports.some(
     (item) => item.status === 'queued' || item.status === 'rendering',

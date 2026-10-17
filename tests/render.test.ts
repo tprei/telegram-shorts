@@ -55,8 +55,8 @@ const hostSourceZoom125: PxRect = { x: 1292, y: 232, w: 556, h: 442 };
 
 function panels(hostSource: PxRect): TimelinePanelPlacement[] {
   return [
-    { panelId: 'screen', role: 'content', source: contentSource, canvas: screenCanvas },
-    { panelId: 'host', role: 'host', source: hostSource, canvas: hostCanvas },
+    { panelId: 'screen', role: 'content', source: contentSource, canvas: screenCanvas, fill: 'cover' },
+    { panelId: 'host', role: 'host', source: hostSource, canvas: hostCanvas, fill: 'cover' },
   ];
 }
 
@@ -72,6 +72,7 @@ const fixtureEndCard: TimelineEndCard = {
   link: { text: 'Link na descrição', centerX: 540, centerY: 1700, sizePx: 44 },
   textOutlinePx: 2,
   textOutlineColor: '#000000',
+  audio: null,
 };
 
 const fixtureCues: CaptionCue[] = [
@@ -158,7 +159,7 @@ function endCardTimeline(title: string): Timeline {
     zoom: { enabled: false, strength: 1.12 },
     endCard: { enabled: true },
   };
-  return buildTimeline({ edit, words: transcriptWords(3), layout, title, source: { width: 1920, height: 1080, durationSeconds: 180 } });
+  return buildTimeline({ edit, words: transcriptWords(3), layout, title, source: { width: 1920, height: 1080, durationSeconds: 180 }, hostFraming: null });
 }
 
 async function generateSource(target: string, seconds: number): Promise<void> {
@@ -342,12 +343,14 @@ test('renders through a work dir containing ffmpeg-hostile characters', { timeou
     role: 'content',
     source: { x: 0, y: 22, w: 404, h: 314 },
     canvas: { x: 0, y: 114, w: 1080, h: 840 },
+    fill: 'cover',
   };
   const hostPlacement: TimelinePanelPlacement = {
     panelId: 'host',
     role: 'host',
     source: { x: 408, y: 60, w: 232, h: 184 },
     canvas: hostCanvas,
+    fill: 'cover',
   };
   const timeline: Timeline = {
     canvas: { width: 1080, height: 1920, fps: 30 },
@@ -413,6 +416,7 @@ test('renders frame-accurate audio and video across many crop-split clips', { ti
     layout: smallLayout,
     title: 'Um titulo de teste para o cartao final do short',
     source: { width: 640, height: 360, durationSeconds: 40 },
+    hostFraming: null,
   });
   assert.ok(timeline.clips.length >= 60, `clips ${timeline.clips.length}`);
   assert.ok(timeline.clips.some((clip) => clip.joinsPrevious));
@@ -464,4 +468,94 @@ test('renders frame-accurate audio and video across many crop-split clips', { ti
   const tail = rms(main + timeline.endCard!.durationSeconds - 0.08, main + timeline.endCard!.durationSeconds - 0.01);
   assert.ok(ducked > body * 0.15 && ducked < body * 0.7, `end card audio ${ducked} vs body ${body}`);
   assert.ok(tail < body * 0.15, `end card tail ${tail} vs body ${body}`);
+});
+
+test('renderShortExport with a blur host panel produces the right output size and centered foreground', { timeout: 120_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'render-blur-'));
+  const sourcePath = join(dir, 'source.mp4');
+  await runProcess('ffmpeg', [
+    '-y',
+    '-f', 'lavfi', '-i', 'color=c=red:s=320x360,format=rgb24',
+    '-f', 'lavfi', '-i', 'color=c=blue:s=320x360,format=rgb24',
+    '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
+    '-filter_complex', '[0][1]hstack=inputs=2[v]',
+    '-map', '[v]', '-map', '2:a',
+    '-t', '1',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-pix_fmt', 'yuv420p',
+    '-ac', '2', '-c:a', 'aac', '-b:a', '96k',
+    sourcePath,
+  ]);
+  const hostPlacement: TimelinePanelPlacement = {
+    panelId: 'host',
+    role: 'host',
+    source: { x: 220, y: 0, w: 200, h: 360 },
+    canvas: hostCanvas,
+    fill: 'blur',
+  };
+  const timeline: Timeline = {
+    canvas: { width: 1080, height: 1920, fps: 30 },
+    speed: 1,
+    durationSeconds: 0.5,
+    clips: [
+      {
+        index: 0,
+        sourceStart: 0.1,
+        sourceEnd: 0.6,
+        outputStart: 0,
+        outputEnd: 0.5,
+        joinsPrevious: false,
+        zoom: 1,
+        panels: [hostPlacement],
+      },
+    ],
+    cues: [],
+    hook: null,
+    endCard: null,
+  };
+  const result = await renderShortExport({
+    timeline,
+    layout,
+    sourceVideoPath: sourcePath,
+    workDir: join(dir, 'export'),
+    fontsDir: join(import.meta.dirname, '..', 'assets', 'fonts'),
+    endCardThumbnailPath: null,
+  });
+  assert.ok(result.sizeBytes > 1_000);
+  assert.ok(Math.abs(result.durationSeconds - 0.5) < 1 / 30, `duration ${result.durationSeconds}`);
+
+  const probe = await runProcess('ffprobe', [
+    '-v', 'error',
+    '-select_streams', 'v:0',
+    '-show_entries', 'stream=width,height',
+    '-of', 'json',
+    result.artifactPath,
+  ]);
+  const streamInfo = JSON.parse(probe.stdout) as { streams: Array<{ width: number; height: number }> };
+  assert.equal(streamInfo.streams[0]?.width, 1080);
+  assert.equal(streamInfo.streams[0]?.height, 1920);
+
+  const rawPath = join(dir, 'frame.rgb');
+  await runProcess('ffmpeg', [
+    '-y',
+    '-i', result.artifactPath,
+    '-vframes', '1',
+    '-f', 'rawvideo',
+    '-pix_fmt', 'rgb24',
+    rawPath,
+  ]);
+  const pixels = await readFile(rawPath);
+  assert.equal(pixels.length, 1080 * 1920 * 3);
+  const pixel = (x: number, y: number): { r: number; b: number } => {
+    const offset = (y * 1080 + x) * 3;
+    return { r: pixels[offset]!, b: pixels[offset + 2]! };
+  };
+  const sampleY = 1489;
+  const fgLeft = pixel(500, sampleY);
+  const fgRight = pixel(580, sampleY);
+  assert.ok(fgLeft.r > 150 && fgLeft.b < 80, `foreground left should be red, got ${JSON.stringify(fgLeft)}`);
+  assert.ok(fgRight.b > 150 && fgRight.r < 80, `foreground right should be blue, got ${JSON.stringify(fgRight)}`);
+  const bgLeft = pixel(100, sampleY);
+  const bgRight = pixel(980, sampleY);
+  assert.ok(bgLeft.r < 200 && bgLeft.r > 30, `blurred left should be darkened red, got ${JSON.stringify(bgLeft)}`);
+  assert.ok(bgRight.b < 200 && bgRight.b > 30, `blurred right should be darkened blue, got ${JSON.stringify(bgRight)}`);
 });

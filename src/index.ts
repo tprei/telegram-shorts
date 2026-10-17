@@ -61,6 +61,7 @@ async function main(): Promise<void> {
   });
   store.requeueRunningTasks();
   store.enqueueMissingPublicationChecks();
+  store.enqueueMissingHostHeadAnalyses();
   const openRouter = new OpenRouterClient(config);
   const profiles = new CreatorProfileRepository({
     rootDir: config.rootDir,

@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import type { ExportRecord, JobRecord, JobSummaryRecord, PublicationRecord, QueueTask, QueueTaskKind, QueueTaskPayloads, ShortRecord } from '../domain/model.js';
 import { createId, ensureParent, nowIso, parseJson } from './util.js';
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 export const CHECK_WINDOW_MS = 24 * 60 * 60 * 1000;
 
@@ -97,7 +97,7 @@ export class ShortsStore {
     if (versionRow !== null && typeof versionRow === 'object' && 'user_version' in versionRow && typeof versionRow.user_version === 'number') {
       userVersion = versionRow.user_version;
     }
-    if (userVersion !== 0 && userVersion !== 2 && userVersion !== 3 && userVersion !== SCHEMA_VERSION) {
+    if (userVersion !== 0 && userVersion !== 2 && userVersion !== 3 && userVersion !== 4 && userVersion !== SCHEMA_VERSION) {
       db.close();
       throw new Error(`Incompatible database at ${path}; delete it to start fresh`);
     }
@@ -111,6 +111,10 @@ export class ShortsStore {
       if (userVersion === 2 || userVersion === 3) {
         db.exec(`UPDATE exports SET payload_json = json_set(payload_json, '$.coverPath', json('null'))`);
         migratePublicationsToV4(db);
+      }
+      if (userVersion >= 2 && userVersion <= 4) {
+        db.exec(`UPDATE jobs SET payload_json = json_set(payload_json, '$.hostFraming', json('null'), '$.hostFramingAnalyzedAt', json('null'))`);
+        db.exec(`UPDATE exports SET payload_json = json_set(payload_json, '$.hostFraming', json('null'))`);
       }
       db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
       db.exec('COMMIT');
@@ -227,6 +231,21 @@ export class ShortsStore {
         continue;
       }
       this.enqueueTask(record.jobId, 'check_publication', { publicationId: record.id });
+    }
+  }
+
+  enqueueMissingHostHeadAnalyses(): void {
+    const rows = this.db.prepare("SELECT payload_json FROM jobs WHERE json_extract(payload_json, '$.media') IS NOT NULL AND json_extract(payload_json, '$.hostFramingAnalyzedAt') IS NULL").all();
+    for (const payload of rows.map((row) => payloadJsonColumn(row)).filter((value): value is string => value !== null)) {
+      const job = parseJson<JobRecord>(payload);
+      if (!job.layoutProfileSnapshot.panels.some((panel) => panel.role === 'host')) {
+        continue;
+      }
+      const pending = this.db.prepare("SELECT 1 FROM queue_tasks WHERE kind = 'analyze_host' AND status IN ('queued', 'running') AND job_id = ? LIMIT 1").get(job.id);
+      if (pending !== null && typeof pending === 'object') {
+        continue;
+      }
+      this.enqueueTask(job.id, 'analyze_host', {});
     }
   }
 

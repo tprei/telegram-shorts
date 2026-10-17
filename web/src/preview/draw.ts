@@ -1,5 +1,6 @@
 import type { HookBandStyle, LayoutProfile } from '@domain/layout.js';
-import type { CaptionCue, Timeline, TimelineClip, TimelineEndCard, TimelineHook } from '@domain/timeline.js';
+import type { CaptionCue, Timeline, TimelineClip, TimelineEndCard, TimelineHook, TimelinePanelPlacement } from '@domain/timeline.js';
+import { HOST_BLUR_DARKEN, HOST_BLUR_SIGMA_PX } from '@domain/timeline.js';
 import { parseHexColor } from '@domain/text.js';
 
 export interface RgbaColorChannels {
@@ -20,6 +21,10 @@ export function drawBackground(ctx: CanvasRenderingContext2D, layout: LayoutProf
 
 export function drawClipPanels(ctx: CanvasRenderingContext2D, clip: TimelineClip, video: CanvasImageSource): void {
   for (const panel of clip.panels) {
+    if (panel.fill === 'blur') {
+      drawBlurredPanel(ctx, panel, video);
+      continue;
+    }
     ctx.drawImage(
       video,
       panel.source.x,
@@ -32,6 +37,45 @@ export function drawClipPanels(ctx: CanvasRenderingContext2D, clip: TimelineClip
       panel.canvas.h,
     );
   }
+}
+
+function drawBlurredPanel(ctx: CanvasRenderingContext2D, panel: TimelinePanelPlacement, video: CanvasImageSource): void {
+  const cropAspect = panel.source.w / panel.source.h;
+  const panelAspect = panel.canvas.w / panel.canvas.h;
+  const coverWidth = cropAspect > panelAspect ? panel.canvas.h * cropAspect : panel.canvas.w;
+  const coverHeight = cropAspect > panelAspect ? panel.canvas.h : panel.canvas.w / cropAspect;
+  const foregroundWidth = panel.canvas.h * cropAspect;
+  const foregroundX = panel.canvas.x + (panel.canvas.w - foregroundWidth) / 2;
+  const overscan = HOST_BLUR_SIGMA_PX;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(panel.canvas.x, panel.canvas.y, panel.canvas.w, panel.canvas.h);
+  ctx.clip();
+  ctx.filter = `blur(${HOST_BLUR_SIGMA_PX}px) brightness(${HOST_BLUR_DARKEN})`;
+  ctx.drawImage(
+    video,
+    panel.source.x,
+    panel.source.y,
+    panel.source.w,
+    panel.source.h,
+    panel.canvas.x + (panel.canvas.w - coverWidth) / 2 - overscan,
+    panel.canvas.y + (panel.canvas.h - coverHeight) / 2 - overscan,
+    coverWidth + overscan * 2,
+    coverHeight + overscan * 2,
+  );
+  ctx.filter = 'none';
+  ctx.drawImage(
+    video,
+    panel.source.x,
+    panel.source.y,
+    panel.source.w,
+    panel.source.h,
+    foregroundX,
+    panel.canvas.y,
+    foregroundWidth,
+    panel.canvas.h,
+  );
+  ctx.restore();
 }
 
 export function drawHookBand(

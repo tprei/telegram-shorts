@@ -66,36 +66,72 @@ export function contentSourceCrop(
   return toEvenPxRect(fitRectToAspect(focusRect, aspect, bounds, minWidth));
 }
 
+export type HostPanelFill = 'cover' | 'blur';
+
+export interface HostSourceCrop {
+  source: PxRect;
+  fill: HostPanelFill;
+}
+
+export const HOST_HEAD_FILL = 0.62;
+export const HOST_HEAD_MAX_FILL = 0.9;
+export const HOST_HEADROOM_SHARE = 0.35;
+
+function coverSize(bounds: Rect, aspect: number): Rect {
+  if (bounds.w / bounds.h > aspect) {
+    return { x: bounds.x, y: bounds.y, w: bounds.h * aspect, h: bounds.h };
+  }
+  return { x: bounds.x, y: bounds.y, w: bounds.w, h: bounds.w / aspect };
+}
+
 export function hostSourceCrop(
   panel: HostPanel,
   zoom: number,
   source: { width: number; height: number },
   aspect: number,
-): PxRect {
+  headBox: NormRect | null,
+): HostSourceCrop {
   const bounds = normToPx(panel.sourceRect, source.width, source.height);
-  const anchorX = bounds.x + panel.anchor.x * bounds.w;
-  const anchorY = bounds.y + panel.anchor.y * bounds.h;
-  let baseW: number;
-  let baseH: number;
-  if (bounds.w / bounds.h > aspect) {
-    baseH = bounds.h;
-    baseW = baseH * aspect;
-  } else {
-    baseW = bounds.w;
-    baseH = baseW / aspect;
+  const base = coverSize(bounds, aspect);
+  if (headBox === null) {
+    const anchorX = bounds.x + panel.anchor.x * bounds.w;
+    const anchorY = bounds.y + panel.anchor.y * bounds.h;
+    const baseX = clamp(anchorX - base.w / 2, bounds.x, bounds.x + bounds.w - base.w);
+    const baseY = clamp(anchorY - base.h / 2, bounds.y, bounds.y + bounds.h - base.h);
+    const zoomW = base.w / zoom;
+    const zoomH = base.h / zoom;
+    const relativeX = (anchorX - baseX) / base.w;
+    const relativeY = (anchorY - baseY) / base.h;
+    return {
+      source: toEvenPxRect({
+        x: clamp(anchorX - relativeX * zoomW, bounds.x, bounds.x + bounds.w - zoomW),
+        y: clamp(anchorY - relativeY * zoomH, bounds.y, bounds.y + bounds.h - zoomH),
+        w: zoomW,
+        h: zoomH,
+      }),
+      fill: 'cover',
+    };
   }
-  const baseX = clamp(anchorX - baseW / 2, bounds.x, bounds.x + bounds.w - baseW);
-  const baseY = clamp(anchorY - baseH / 2, bounds.y, bounds.y + bounds.h - baseH);
-  const zoomW = baseW / zoom;
-  const zoomH = baseH / zoom;
-  const relativeX = (anchorX - baseX) / baseW;
-  const relativeY = (anchorY - baseY) / baseH;
-  return toEvenPxRect({
-    x: clamp(anchorX - relativeX * zoomW, bounds.x, bounds.x + bounds.w - zoomW),
-    y: clamp(anchorY - relativeY * zoomH, bounds.y, bounds.y + bounds.h - zoomH),
-    w: zoomW,
-    h: zoomH,
-  });
+  const head = normToPx(headBox, source.width, source.height);
+  let height: number;
+  let width: number;
+  if (head.h <= base.h) {
+    height = Math.min(base.h, Math.max(base.h / zoom, head.h / HOST_HEAD_MAX_FILL));
+    width = height * aspect;
+  } else {
+    height = Math.min(bounds.h, Math.max(head.h / HOST_HEAD_FILL / zoom, head.h / HOST_HEAD_MAX_FILL));
+    width = Math.min(bounds.w, height * aspect);
+  }
+  const fill: HostPanelFill = width < height * aspect - 1 ? 'blur' : 'cover';
+  return {
+    source: toEvenPxRect({
+      x: clamp(head.x + head.w / 2 - width / 2, bounds.x, bounds.x + bounds.w - width),
+      y: clamp(head.y - HOST_HEADROOM_SHARE * (height - head.h), bounds.y, bounds.y + bounds.h - height),
+      w: width,
+      h: height,
+    }),
+    fill,
+  };
 }
 
 function clamp(value: number, min: number, max: number): number {

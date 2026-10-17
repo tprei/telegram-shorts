@@ -509,6 +509,32 @@ Rule of thumb: when we can't prove a post failed, treat it as possibly live. Onl
 10. A cover render failure during export is logged and leaves `coverPath: null`; the export stays `ready` (Instagram publish renders the cover lazily).
 11. Polling: the short detail polls while a publication is `submitted` (not `unconfirmed`). Panel copy for `unconfirmed`: "Couldn't confirm. Check {Platform} before reposting." in the warning tone, with the Details toggle when there is an error.
 
+## Head-aware host framing (follow-up, 2026-10-17)
+
+Problem: the host panel crop used a fixed anchor tuned on one video. The host column is 697×1080 px (portrait) while the host panel is 1080×860 (landscape), so a cover crop can be at most 697×555 px. In the 2026-10-17 video Filipe sits closer to the camera: his head (hair to chin) is 768 px tall, so every crop cut him off between the eyebrows and the mouth. Measured head heights with Gemini on two frames each: older video 0.45–0.47 of frame height, newer video 0.70–0.71.
+
+### Contract
+
+- `src/domain/model.ts`: `export interface HostFraming { headBox: NormRect }` (head from top of hair to chin, ear to ear, normalized to the full source frame). `JobRecord.hostFraming: HostFraming | null`, `JobRecord.hostFramingAnalyzedAt: string | null` (set on success and on failure). `ExportRecord.hostFraming: HostFraming | null` (snapshot at export creation; export reuse also requires `JSON.stringify` equality). `QueueTaskKind` gains `analyze_host` (ingest lane, payload `{}`).
+- `src/domain/timeline.ts`: `TimelinePanelPlacement.fill: 'cover' | 'blur'` (content panels always `cover`). `buildTimeline` input gains `hostFraming: HostFraming | null`. New exported constants `HOST_BLUR_SIGMA_PX = 30`, `HOST_BLUR_DARKEN = 0.6`.
+- `src/domain/geometry.ts`: `hostSourceCrop(panel, zoom, source, aspect, headBox: NormRect | null): { source: PxRect; fill: 'cover' | 'blur' }`.
+  - `headBox === null`: today's anchor logic, `fill: 'cover'`.
+  - Otherwise, with B = host bounds px, Hd = head px, A = aspect, and (baseW, baseH) the anchor path's unzoomed cover size. The head is never cropped, and videos whose head already fits keep a full-width cover crop:
+    - Cover regime when `Hd.h ≤ baseH`: `H = min(baseH, max(baseH / zoom, Hd.h / HOST_HEAD_MAX_FILL))`, `W = H × A`.
+    - Blur regime otherwise: `H = min(B.h, max(Hd.h / HOST_HEAD_FILL / zoom, Hd.h / HOST_HEAD_MAX_FILL))`, `W = min(B.w, H × A)`.
+    - `fill = W < H × A − 1 ? 'blur' : 'cover'`; `x = clamp(Hd.cx − W/2, B.x, B.x + B.w − W)`; `y = clamp(Hd.y − HOST_HEADROOM_SHARE × (H − Hd.h), B.y, B.y + B.h − H)`; `toEvenPxRect`.
+    - Constants: `HOST_HEAD_FILL = 0.62`, `HOST_HEAD_MAX_FILL = 0.9`, `HOST_HEADROOM_SHARE = 0.35`.
+    - Effect: the older Filipe video (head 0.47 of frame, fits in the 555 px cover crop) stays a full-width cover crop and zoom stops where it would cut the head; the close-up video (head 0.69) gets the blurred-sides framing; the host-only Jones Manoel layout (cover crop = full column height) keeps its framing, centered on the head.
+- Rendering `blur` (export and preview identical): the panel gets the crop scaled to cover the panel, Gaussian-blurred (`HOST_BLUR_SIGMA_PX`; canvas `blur(30px)`), darkened (`HOST_BLUR_DARKEN`; ffmpeg `colorchannelmixer`, canvas `brightness(0.6)`), then the crop scaled to the panel height and centered horizontally on top. `cover` is unchanged.
+- `src/infra/vision.ts`: `detectHostHead({ config, videoPath, source, panel: HostPanel, durationSeconds, workDir }): Promise<NormRect>`. Five frames at 10/30/50/70/90% of the video, cropped to the host column, scaled to 720 px tall, JPEG. Gemini (`OPENROUTER_VISION_MODEL`, temperature 0.1) prompt: locate the main speaker's head, top of the hair to the bottom of the chin, ear to ear, excluding neck, shoulders, and microphone; `box_2d` [ymin, xmin, ymax, xmax] 0–1000 (reuse `CropFocusResponseSchema`). Map each box to source-normalized coordinates via the panel `sourceRect`; take the median of each edge (left, top, right, bottom) across successful samples; fewer than 3 successes → throw with the last sample error as `cause`.
+- Pipeline: `process_source` enqueues `analyze_host` before `plan_shorts` when the layout has a host panel. `analyze_host` sets `hostFraming` on success. On failure it logs, keeps any previous `hostFraming`, and sets `hostFramingAnalyzedAt` only when the error is not a transient network error (so the next startup backfill retries after a network outage). It reloads the job right before writing and only touches those two fields.
+- Startup backfill: enqueue `analyze_host` for every job with media, a host panel, `hostFramingAnalyzedAt === null`, and no queued/running `analyze_host`.
+- Store `SCHEMA_VERSION = 5`; migration (inside the existing transaction) sets `hostFraming` and `hostFramingAnalyzedAt` to null on jobs and `hostFraming` to null on exports.
+- Service/DTO: `ShortDetailDto.job.hostFraming: HostFraming | null`; `POST /api/jobs/:jobId/host-framing/analyze` re-runs analysis (clears `hostFramingAnalyzedAt`, enqueues `analyze_host`; job must be `ready`). Operator endpoint; no UI.
+- `ExportDto.current: boolean`, computed by the same predicate the export reuse uses (edit revision, title, transcript revision, host framing). The web app's "current export" is the newest export with `current === true`, so a framing, title, or transcript change shows the export as outdated.
+- Callers of `buildTimeline` pass `hostFraming`: export uses `record.hostFraming`; the editor uses `detail.job.hostFraming`.
+- OpenRouter requests retry transient network errors (connect timeout/reset; same cause-chain classifier as uploads) twice with 2 s and 5 s backoff. A request on the operator's hotspot failed with `ETIMEDOUT` on connect.
+
 ## Verification
 
 1. `pnpm typecheck` and `pnpm test` pass with zero errors.

@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import type { ShortEdit } from '../src/domain/edit.js';
 import type { TranscriptWord } from '../src/domain/model.js';
-import type { LayoutProfile } from '../src/domain/layout.js';
+import type { HostPanel, LayoutProfile, NormRect, PxRect } from '../src/domain/layout.js';
 import {
   END_CARD_SECONDS,
   activeCueAt,
@@ -178,8 +179,8 @@ test('clips join when the pad lands exactly on the shared midpoint of a cut word
 
 test('speed scales output times and outputDurationSeconds', () => {
   const words = studioWords();
-  const fast = buildTimeline({ edit: { ...baseEdit(), speed: 2 }, words, layout, title: testTitle, source });
-  const slow = buildTimeline({ edit: baseEdit(), words, layout, title: testTitle, source });
+  const fast = buildTimeline({ edit: { ...baseEdit(), speed: 2 }, words, layout, title: testTitle, source, hostFraming: null });
+  const slow = buildTimeline({ edit: baseEdit(), words, layout, title: testTitle, source, hostFraming: null });
   assert.equal(fast.speed, 2);
   approx(fast.durationSeconds, slow.durationSeconds / 2, 1 / layout.canvas.fps);
   approx(outputDurationSeconds(baseEdit(), words, source.durationSeconds), slow.durationSeconds, 0.06);
@@ -197,7 +198,7 @@ test('crop keyframes split clips into joinsPrevious sub-clips inside the margin 
       { sourceSeconds: 2, focus: { x: 0.6, y: 0.6, w: 0.1, h: 0.1 }, origin: 'manual' },
     ],
   };
-  const timeline = buildTimeline({ edit, words, layout, title: testTitle, source });
+  const timeline = buildTimeline({ edit, words, layout, title: testTitle, source, hostFraming: null });
   const expected: Array<[number, number, boolean]> = [
     [0, 1, false],
     [1.49, 1.99, false],
@@ -215,7 +216,7 @@ test('crop keyframes split clips into joinsPrevious sub-clips inside the margin 
   const last = timeline.clips[timeline.clips.length - 1]!;
   assert.equal(last.joinsPrevious, true);
 
-  const insideMargin = buildTimeline({ edit: { ...baseEdit(), crops: [{ sourceSeconds: 1.7, focus: { x: 0, y: 0, w: 0.5, h: 0.5 }, origin: 'auto' }] }, words, layout, title: testTitle, source });
+  const insideMargin = buildTimeline({ edit: { ...baseEdit(), crops: [{ sourceSeconds: 1.7, focus: { x: 0, y: 0, w: 0.5, h: 0.5 }, origin: 'auto' }] }, words, layout, title: testTitle, source, hostFraming: null });
   assert.equal(insideMargin.clips.length, 3);
 });
 
@@ -228,18 +229,20 @@ test('zoom toggles only at real cuts and persists across joined clips', () => {
       { sourceSeconds: 2, focus: { x: 0.6, y: 0.6, w: 0.1, h: 0.1 }, origin: 'auto' },
     ],
   };
-  const timeline = buildTimeline({ edit, words, layout, title: testTitle, source });
+  const timeline = buildTimeline({ edit, words, layout, title: testTitle, source, hostFraming: null });
   assert.deepEqual(
     timeline.clips.map((clip) => clip.zoom),
     [1, 1.12, 1.12, 1, 1],
   );
-  const disabled = buildTimeline({ edit: { ...edit, zoom: { enabled: false, strength: 1.12 } }, words, layout, title: testTitle, source });
+  const disabled = buildTimeline({ edit: { ...edit, zoom: { enabled: false, strength: 1.12 } }, words, layout, title: testTitle, source, hostFraming: null });
   assert.ok(disabled.clips.every((clip) => clip.zoom === 1));
   const joined = buildTimeline({
     edit: { ...baseEdit(), ranges: [{ startWord: 0, endWord: 2 }], removedWords: [1] },
     words: [word('a', 0, 0.5, 0), word('b', 0.5, 0.5, 1), word('c', 0.5, 0.98, 2)],
     layout,
+    title: testTitle,
     source,
+    hostFraming: null,
   });
   assert.deepEqual(
     joined.clips.map((clip) => clip.zoom),
@@ -256,7 +259,7 @@ test('panel placements keep aspect, stay in bounds and follow the active crop fo
       { sourceSeconds: 2, focus: { x: 0.6, y: 0.6, w: 0.1, h: 0.1 }, origin: 'auto' },
     ],
   };
-  const timeline = buildTimeline({ edit, words, layout, title: testTitle, source });
+  const timeline = buildTimeline({ edit, words, layout, title: testTitle, source, hostFraming: null });
   assert.equal(timeline.clips.length, 5);
   for (const clip of timeline.clips) {
     assert.deepEqual(clip.panels.map((panel) => panel.panelId), ['screen', 'host']);
@@ -284,7 +287,7 @@ test('panel placements keep aspect, stay in bounds and follow the active crop fo
 
 test('outputToSource and sourceToOutput round-trip and null inside cuts', () => {
   const words = studioWords();
-  const timeline = buildTimeline({ edit: baseEdit(), words, layout, title: testTitle, source });
+  const timeline = buildTimeline({ edit: baseEdit(), words, layout, title: testTitle, source, hostFraming: null });
   for (const t of [0, 0.5, 0.99, 1.5, 2.7, 5.7]) {
     const { clipIndex, sourceSeconds } = outputToSource(timeline, t);
     assert.ok(sourceToOutput(timeline, sourceSeconds) !== null);
@@ -307,7 +310,7 @@ test('outputToSource and sourceToOutput round-trip and null inside cuts', () => 
 test('empty edits produce an empty timeline and safe mapping', () => {
   const words = studioWords();
   const edit = { ...baseEdit(), ranges: [{ startWord: 0, endWord: 1 }], removedWords: [0, 1] };
-  const timeline = buildTimeline({ edit, words, layout, title: testTitle, source });
+  const timeline = buildTimeline({ edit, words, layout, title: testTitle, source, hostFraming: null });
   assert.deepEqual(timeline.clips, []);
   assert.equal(timeline.durationSeconds, 0);
   assert.deepEqual(timeline.cues, []);
@@ -319,7 +322,7 @@ test('empty edits produce an empty timeline and safe mapping', () => {
 
 function captionTimeline(texts: string[]): Timeline {
   const words = contiguousWords(texts);
-  return buildTimeline({ edit: singleRangeEdit(words), words, layout, title: testTitle, source });
+  return buildTimeline({ edit: singleRangeEdit(words), words, layout, title: testTitle, source, hostFraming: null });
 }
 
 test('cues break on max words, punctuation, gaps and line overflow', () => {
@@ -349,6 +352,7 @@ test('cues break on max words, punctuation, gaps and line overflow', () => {
     layout,
     title: testTitle,
     source,
+    hostFraming: null,
   });
   assert.deepEqual(
     gapped.cues.map((cue) => cue.lines.flat().map((entry) => entry.wordIndex)),
@@ -364,7 +368,7 @@ test('cues break on max words, punctuation, gaps and line overflow', () => {
 
 test('captions disabled produce no cues', () => {
   const words = contiguousWords(['um', 'dois', 'três']);
-  const timeline = buildTimeline({ edit: { ...singleRangeEdit(words), captions: { enabled: false } }, words, layout, title: testTitle, source });
+  const timeline = buildTimeline({ edit: { ...singleRangeEdit(words), captions: { enabled: false } }, words, layout, title: testTitle, source, hostFraming: null });
   assert.deepEqual(timeline.cues, []);
 });
 
@@ -382,20 +386,20 @@ test('activeCueAt selects the cue and the last started word', () => {
 
 test('hook renders when enabled with a band and text, otherwise null', () => {
   const words = contiguousWords(['um', 'dois', 'três']);
-  const enabled = buildTimeline({ edit: { ...singleRangeEdit(words), hook: { enabled: true, text: 'o segredo do focus' } }, words, layout, title: testTitle, source });
+  const enabled = buildTimeline({ edit: { ...singleRangeEdit(words), hook: { enabled: true, text: 'o segredo do focus' } }, words, layout, title: testTitle, source, hostFraming: null });
   assert.deepEqual(enabled.hook, { lines: ['O SEGREDO DO FOCUS'], canvas: { x: 0, y: 0, w: 1080, h: 220 }, sizePx: 58 });
-  const disabled = buildTimeline({ edit: { ...singleRangeEdit(words), hook: { enabled: false, text: 'o segredo do focus' } }, words, layout, title: testTitle, source });
+  const disabled = buildTimeline({ edit: { ...singleRangeEdit(words), hook: { enabled: false, text: 'o segredo do focus' } }, words, layout, title: testTitle, source, hostFraming: null });
   assert.equal(disabled.hook, null);
-  const empty = buildTimeline({ edit: { ...singleRangeEdit(words), hook: { enabled: true, text: '   ' } }, words, layout, title: testTitle, source });
+  const empty = buildTimeline({ edit: { ...singleRangeEdit(words), hook: { enabled: true, text: '   ' } }, words, layout, title: testTitle, source, hostFraming: null });
   assert.equal(empty.hook, null);
-  const noBand = buildTimeline({ edit: { ...singleRangeEdit(words), hook: { enabled: true, text: 'o segredo do focus' } }, words, layout: { ...layout, hookBand: null }, title: testTitle, source });
+  const noBand = buildTimeline({ edit: { ...singleRangeEdit(words), hook: { enabled: true, text: 'o segredo do focus' } }, words, layout: { ...layout, hookBand: null }, title: testTitle, source, hostFraming: null });
   assert.equal(noBand.hook, null);
 });
 
 test('end card carries the full layout and is excluded from durationSeconds', () => {
   const words = contiguousWords(['um', 'dois', 'três']);
-  const withCard = buildTimeline({ edit: { ...singleRangeEdit(words), endCard: { enabled: true } }, words, layout, title: testTitle, source });
-  const withoutCard = buildTimeline({ edit: singleRangeEdit(words), words, layout, title: testTitle, source });
+  const withCard = buildTimeline({ edit: { ...singleRangeEdit(words), endCard: { enabled: true } }, words, layout, title: testTitle, source, hostFraming: null });
+  const withoutCard = buildTimeline({ edit: singleRangeEdit(words), words, layout, title: testTitle, source, hostFraming: null });
   const lastClip = withCard.clips.at(-1)!;
   assert.deepEqual(withCard.endCard, {
     durationSeconds: END_CARD_SECONDS,
@@ -420,19 +424,19 @@ test('end card carries the full layout and is excluded from durationSeconds', ()
 test('end card audio continues the source after the last clip, clamped to the source end', () => {
   const words = contiguousWords(['um', 'dois', 'três']);
   const edit = { ...singleRangeEdit(words), endCard: { enabled: true }, speed: 1.2 };
-  const nearEnd = buildTimeline({ edit, words, layout, title: testTitle, source: { ...source, durationSeconds: 2 } });
+  const nearEnd = buildTimeline({ edit, words, layout, title: testTitle, source: { ...source, durationSeconds: 2 }, hostFraming: null });
   const audio = nearEnd.endCard!.audio!;
   approx(audio.sourceStart, nearEnd.clips.at(-1)!.sourceEnd);
   assert.equal(audio.sourceEnd, 2);
-  const atSourceEnd = buildTimeline({ edit: singleRangeEdit(words), words, layout, title: testTitle, source: { ...source, durationSeconds: 1.5 } });
-  const endsAtSource = buildTimeline({ edit: { ...singleRangeEdit(words), endCard: { enabled: true } }, words, layout, title: testTitle, source: { ...source, durationSeconds: 1.5 } });
+  const atSourceEnd = buildTimeline({ edit: singleRangeEdit(words), words, layout, title: testTitle, source: { ...source, durationSeconds: 1.5 }, hostFraming: null });
+  const endsAtSource = buildTimeline({ edit: { ...singleRangeEdit(words), endCard: { enabled: true } }, words, layout, title: testTitle, source: { ...source, durationSeconds: 1.5 }, hostFraming: null });
   assert.equal(atSourceEnd.clips.at(-1)!.sourceEnd, 1.5);
   assert.equal(endsAtSource.endCard!.audio, null);
 });
 
 test('end card audio ducks under the card and fades to silence by its end', () => {
   const words = contiguousWords(['um', 'dois', 'três']);
-  const endCard = buildTimeline({ edit: { ...singleRangeEdit(words), endCard: { enabled: true } }, words, layout, title: testTitle, source }).endCard!;
+  const endCard = buildTimeline({ edit: { ...singleRangeEdit(words), endCard: { enabled: true } }, words, layout, title: testTitle, source, hostFraming: null }).endCard!;
   approx(endCardAudioGain(endCard, 0), 1);
   approx(endCardAudioGain(endCard, 0.25), 1 - 0.65 / 2);
   approx(endCardAudioGain(endCard, 1), 0.35);
@@ -444,7 +448,7 @@ test('end card audio ducks under the card and fades to silence by its end', () =
 test('clip indices stay contiguous when a sub-frame clip is dropped mid-timeline', () => {
   const words = [word('a', 0, 0.5, 0), word('x', 0.5, 0.6, 1), word('b', 0.6, 0.605, 2), word('y', 0.605, 1.0, 3), word('c', 1.0, 1.5, 4)];
   const edit: ShortEdit = { ...baseEdit(), ranges: [{ startWord: 0, endWord: 4 }], removedWords: [1, 3] };
-  const timeline = buildTimeline({ edit, words, layout, title: testTitle, source });
+  const timeline = buildTimeline({ edit, words, layout, title: testTitle, source, hostFraming: null });
   assert.equal(timeline.clips.length, 2);
   assert.deepEqual(timeline.clips.map((clip) => clip.index), [0, 1]);
 });
@@ -452,7 +456,7 @@ test('clip indices stay contiguous when a sub-frame clip is dropped mid-timeline
 test('clip output lengths snap to whole frames and sub-frame clips are dropped', () => {
   const words = studioWords();
   const fps = layout.canvas.fps;
-  const timeline = buildTimeline({ edit: baseEdit(), words, layout, title: testTitle, source });
+  const timeline = buildTimeline({ edit: baseEdit(), words, layout, title: testTitle, source, hostFraming: null });
   for (const clip of timeline.clips) {
     const frames = (clip.outputEnd - clip.outputStart) * fps;
     assert.ok(Math.abs(frames - Math.round(frames)) < 1e-9, `clip ${clip.index} spans ${frames} frames`);
@@ -467,7 +471,7 @@ test('clip output lengths snap to whole frames and sub-frame clips are dropped',
     removedWords: [0, 2],
     tightenPauses: { enabled: false, maxGapSeconds: 0.35 },
   };
-  const tiny = buildTimeline({ edit: tinyEdit, words: tinyWords, layout, title: testTitle, source });
+  const tiny = buildTimeline({ edit: tinyEdit, words: tinyWords, layout, title: testTitle, source, hostFraming: null });
   assert.deepEqual(tiny.clips, []);
   assert.equal(tiny.durationSeconds, 0);
 });
@@ -475,7 +479,7 @@ test('clip output lengths snap to whole frames and sub-frame clips are dropped',
 test('hook auto-fit shrinks the font until the wrapped lines fit the band', () => {
   const words = contiguousWords(['um', 'dois']);
   const edit = { ...singleRangeEdit(words), hook: { enabled: true, text: 'aaaaaaaaa bbbbbbbbb ccccccccc ddddddddd eeeeeeeee' } };
-  const timeline = buildTimeline({ edit, words, layout, title: testTitle, source });
+  const timeline = buildTimeline({ edit, words, layout, title: testTitle, source, hostFraming: null });
   assert.deepEqual(timeline.hook, {
     lines: ['AAAAAAAAA BBBBBBBBB CCCCCCCCC', 'DDDDDDDDD EEEEEEEEE'],
     canvas: { x: 0, y: 0, w: 1080, h: 220 },
@@ -486,7 +490,7 @@ test('hook auto-fit shrinks the font until the wrapped lines fit the band', () =
 test('hook auto-fit keeps the smallest size when no size fits', () => {
   const words = contiguousWords(['um', 'dois']);
   const edit = { ...singleRangeEdit(words), hook: { enabled: true, text: 'aaaaaaaaaaaa bbbbbbbbbbbb cccccccccccc dddddddddddd eeeeeeeeeeee' } };
-  const timeline = buildTimeline({ edit, words, layout, title: testTitle, source });
+  const timeline = buildTimeline({ edit, words, layout, title: testTitle, source, hostFraming: null });
   assert.deepEqual(timeline.hook, {
     lines: ['AAAAAAAAAAAA BBBBBBBBBBBB', 'CCCCCCCCCCCC DDDDDDDDDDDD', 'EEEEEEEEEEEE'],
     canvas: { x: 0, y: 0, w: 1080, h: 220 },
@@ -503,7 +507,7 @@ test('split sub-clips resolve crop keyframes at their own source start', () => {
       { sourceSeconds: 6.2, focus: { x: 0.6, y: 0.6, w: 0.1, h: 0.1 }, origin: 'manual' },
     ],
   };
-  const timeline = buildTimeline({ edit, words, layout, title: testTitle, source });
+  const timeline = buildTimeline({ edit, words, layout, title: testTitle, source, hostFraming: null });
   const expected: Array<[number, number, boolean]> = [
     [0, 1, false],
     [1.49, 3.09, false],
@@ -548,12 +552,111 @@ test('contentSourceCrop respects bounds and the maximum zoom-out floor', () => {
   assert.deepEqual(full, { x: 0, y: 68, w: 1212, h: 942 });
 });
 
-test('hostSourceCrop anchors, clamps and zooms around the anchor', () => {
+test('hostSourceCrop null keeps the anchor behaviour', () => {
   const panel = layout.panels[1];
   if (panel.role !== 'host') {
     throw new Error('expected host panel');
   }
   const aspect = layout.canvas.width / panelCanvasRect(panel, layout.canvas).h;
-  assert.deepEqual(hostSourceCrop(panel, 1, source, aspect), { x: 1222, y: 176, w: 696, h: 552 });
-  assert.deepEqual(hostSourceCrop(panel, 1.12, source, aspect), { x: 1260, y: 206, w: 622, h: 494 });
+  assert.deepEqual(hostSourceCrop(panel, 1, source, aspect, null), {
+    source: { x: 1222, y: 176, w: 696, h: 552 },
+    fill: 'cover',
+  });
+  assert.deepEqual(hostSourceCrop(panel, 1.12, source, aspect, null), {
+    source: { x: 1260, y: 206, w: 622, h: 494 },
+    fill: 'cover',
+  });
+});
+
+function profileLayout(name: string): LayoutProfile {
+  return JSON.parse(readFileSync(new URL(`../profiles/${name}`, import.meta.url), 'utf8')) as LayoutProfile;
+}
+
+function hostPanelOf(layout: LayoutProfile): HostPanel {
+  const panel = layout.panels.find((candidate) => candidate.role === 'host');
+  if (panel === undefined || panel.role !== 'host') {
+    throw new Error('expected host panel');
+  }
+  return panel;
+}
+
+function assertEvenInsideBounds(crop: PxRect, panel: HostPanel): void {
+  for (const value of [crop.x, crop.y, crop.w, crop.h]) {
+    assert.equal(value % 2, 0, `crop component not even: ${JSON.stringify(crop)}`);
+  }
+  const bounds = toEvenPxRect(normToPx(panel.sourceRect, source.width, source.height));
+  assert.ok(crop.x >= bounds.x && crop.y >= bounds.y, `crop origin outside bounds: ${JSON.stringify(crop)} vs ${JSON.stringify(bounds)}`);
+  assert.ok(
+    crop.x + crop.w <= bounds.x + bounds.w && crop.y + crop.h <= bounds.y + bounds.h,
+    `crop exceeds bounds: ${JSON.stringify(crop)} vs ${JSON.stringify(bounds)}`,
+  );
+}
+
+function assertHeadInside(crop: PxRect, head: NormRect): void {
+  const headPx = normToPx(head, source.width, source.height);
+  assert.ok(headPx.x >= crop.x && headPx.y >= crop.y, `head left/top outside crop: ${JSON.stringify(headPx)} vs ${JSON.stringify(crop)}`);
+  assert.ok(
+    headPx.x + headPx.w <= crop.x + crop.w && headPx.y + headPx.h <= crop.y + crop.h,
+    `head right/bottom outside crop: ${JSON.stringify(headPx)} vs ${JSON.stringify(crop)}`,
+  );
+}
+
+test('hostSourceCrop keeps the fitting head in a full-width cover crop and stops zoom before cropping it', () => {
+  const layout = profileLayout('filipe_boni_layout.json');
+  const panel = hostPanelOf(layout);
+  const aspect = layout.canvas.width / panelCanvasRect(panel, layout.canvas).h;
+  const columnWidth = toEvenPxRect(normToPx(panel.sourceRect, source.width, source.height)).w;
+  const head: NormRect = { x: 0.7281, y: 0.176, w: 0.2011, h: 0.481 };
+  const zoomOne = hostSourceCrop(panel, 1, source, aspect, head);
+  for (const zoom of [1, 1.12, 1.3]) {
+    const result = hostSourceCrop(panel, zoom, source, aspect, head);
+    assert.equal(result.fill, 'cover', `zoom ${zoom}`);
+    assert.equal(result.source.w, columnWidth, `zoom ${zoom}`);
+    assertHeadInside(result.source, head);
+    assertEvenInsideBounds(result.source, panel);
+  }
+  assert.deepEqual(hostSourceCrop(panel, 1.12, source, aspect, head).source, zoomOne.source);
+  assert.deepEqual(hostSourceCrop(panel, 1.3, source, aspect, head).source, zoomOne.source);
+});
+
+test('hostSourceCrop uses the blur regime for a close-up head and keeps it fully inside at every zoom', () => {
+  const layout = profileLayout('filipe_boni_layout.json');
+  const panel = hostPanelOf(layout);
+  const aspect = layout.canvas.width / panelCanvasRect(panel, layout.canvas).h;
+  const columnWidth = toEvenPxRect(normToPx(panel.sourceRect, source.width, source.height)).w;
+  const head: NormRect = { x: 0.6871, y: 0.136, w: 0.2686, h: 0.691 };
+  for (const zoom of [1, 1.12, 1.3]) {
+    const result = hostSourceCrop(panel, zoom, source, aspect, head);
+    assert.equal(result.fill, 'blur', `zoom ${zoom}`);
+    assert.equal(result.source.w, columnWidth, `zoom ${zoom}`);
+    assertHeadInside(result.source, head);
+    assertEvenInsideBounds(result.source, panel);
+  }
+  const extreme: NormRect = { x: 0.65, y: 0.08, w: 0.3, h: 0.85 };
+  for (const zoom of [1, 1.12, 1.3]) {
+    const result = hostSourceCrop(panel, zoom, source, aspect, extreme);
+    assert.equal(result.fill, 'blur', `zoom ${zoom}`);
+    assertHeadInside(result.source, extreme);
+    assertEvenInsideBounds(result.source, panel);
+  }
+});
+
+test('hostSourceCrop keeps the Jones layout anchor crop height and centers a fitting head', () => {
+  const layout = profileLayout('jones_manoel_layout.json');
+  const panel = hostPanelOf(layout);
+  const aspect = layout.canvas.width / panelCanvasRect(panel, layout.canvas).h;
+  const head: NormRect = { x: 0.4, y: 0.15, w: 0.2, h: 0.46 };
+  const anchor = hostSourceCrop(panel, 1, source, aspect, null);
+  const result = hostSourceCrop(panel, 1, source, aspect, head);
+  assert.equal(result.fill, 'cover');
+  assert.equal(result.source.h, anchor.source.h);
+  assertHeadInside(result.source, head);
+  assertEvenInsideBounds(result.source, panel);
+  const bounds = normToPx(panel.sourceRect, source.width, source.height);
+  const headPx = normToPx(head, source.width, source.height);
+  const center = Math.min(
+    bounds.x + bounds.w - result.source.w / 2,
+    Math.max(bounds.x + result.source.w / 2, headPx.x + headPx.w / 2),
+  );
+  assert.ok(Math.abs(result.source.x + result.source.w / 2 - center) <= 2);
 });

@@ -109,6 +109,8 @@ export class StudioService implements StudioApi, StudioMediaResolver {
       semanticBlocks: [],
       strongSpeakers: [],
       chosenSpeakerId: null,
+      hostFraming: null,
+      hostFramingAnalyzedAt: null,
       failedTaskKind: null,
       error: null,
       createdAt: nowIso(),
@@ -223,6 +225,21 @@ export class StudioService implements StudioApi, StudioMediaResolver {
     job.updatedAt = nowIso();
     this.deps.store.updateJob(job);
     this.deps.store.enqueueTask(job.id, 'plan_shorts', {});
+    return this.getJob(job.id);
+  }
+
+  analyzeHostFraming(jobId: string): JobDetailDto {
+    const job = this.requireJob(jobId);
+    if (job.status !== 'ready') {
+      throw new StudioError('conflict', 'Job must be ready to analyze host framing.');
+    }
+    if (!job.layoutProfileSnapshot.panels.some((panel) => panel.role === 'host')) {
+      throw new StudioError('invalid', 'This layout has no host panel to analyze.');
+    }
+    job.hostFramingAnalyzedAt = null;
+    job.updatedAt = nowIso();
+    this.deps.store.updateJob(job);
+    this.deps.store.enqueueTask(job.id, 'analyze_host', {});
     return this.getJob(job.id);
   }
 
@@ -434,7 +451,7 @@ export class StudioService implements StudioApi, StudioMediaResolver {
     }
     const reusable = this.deps.store
       .listExportsForShort(short.id)
-      .find((record) => record.editRevision === short.editRevision && record.title === short.title && record.transcriptRevision === job.transcriptRevision && (record.status === 'queued' || record.status === 'rendering' || record.status === 'ready'));
+      .find((record) => this.exportIsCurrent(record, short, job) && (record.status === 'queued' || record.status === 'rendering' || record.status === 'ready'));
     if (reusable) {
       return this.shortDetailWithAvailability(job, short);
     }
@@ -446,6 +463,7 @@ export class StudioService implements StudioApi, StudioMediaResolver {
       transcriptRevision: job.transcriptRevision,
       edit: short.edit,
       title: short.title,
+      hostFraming: job.hostFraming,
       status: 'queued',
       artifactPath: null,
       coverPath: null,
@@ -756,16 +774,24 @@ export class StudioService implements StudioApi, StudioMediaResolver {
       durationSeconds: outputDurationSeconds(short.edit, job.transcriptWords, job.media?.durationSeconds ?? 0),
       hookText: short.edit.hook.text,
       cropAnalysis: short.cropAnalysis,
-      latestExport: latestExport ? this.exportDto(latestExport) : null,
+      latestExport: latestExport ? this.exportDto(latestExport, short, job) : null,
       updatedAt: short.updatedAt,
     };
   }
 
-  private exportDto(record: ExportRecord): ExportDto {
+  private exportIsCurrent(record: ExportRecord, short: ShortRecord, job: JobRecord): boolean {
+    return record.editRevision === short.editRevision
+      && record.title === short.title
+      && record.transcriptRevision === job.transcriptRevision
+      && JSON.stringify(record.hostFraming) === JSON.stringify(job.hostFraming);
+  }
+
+  private exportDto(record: ExportRecord, short: ShortRecord, job: JobRecord): ExportDto {
     return {
       id: record.id,
       shortId: record.shortId,
       editRevision: record.editRevision,
+      current: this.exportIsCurrent(record, short, job),
       status: record.status,
       error: record.error,
       videoUrl: record.status === 'ready' && record.artifactPath ? MEDIA_ROUTES.export(record.id) : null,
@@ -823,9 +849,10 @@ export class StudioService implements StudioApi, StudioMediaResolver {
         thumbnailUrl: job.media?.thumbnailPath ? MEDIA_ROUTES.thumbnail(job.id) : null,
         media,
         layout: job.layoutProfileSnapshot,
+        hostFraming: job.hostFraming,
         fontUrl: MEDIA_ROUTES.font(basename(job.layoutProfileSnapshot.font.file)),
       },
-      exports: this.deps.store.listExportsForShort(short.id).map((record) => this.exportDto(record)),
+      exports: this.deps.store.listExportsForShort(short.id).map((record) => this.exportDto(record, short, job)),
       publications: this.deps.store.listPublicationsForShort(short.id).map((record) => this.publicationDto(record)),
       platforms,
     };

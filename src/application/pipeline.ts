@@ -2,20 +2,20 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { z } from 'zod';
 import { createInitialEdit, keptWordIndices, replaceAutoCrops, type ShortEdit } from '../domain/edit.js';
-import { QUEUE_LANES, type ExportRecord, type JobRecord, type PublicationRecord, type PublicationStatus, type QueueLane, type QueueTask, type ShortRecord, type SourceMedia, type TranscriptWord } from '../domain/model.js';
+import { QUEUE_LANES, type ExportRecord, type HostFraming, type JobRecord, type PublicationRecord, type PublicationStatus, type QueueLane, type QueueTask, type ShortRecord, type SourceMedia, type TranscriptWord } from '../domain/model.js';
 import { computeSourceClips, buildTimeline, type SourceClip } from '../domain/timeline.js';
 import { buildSentences, detectStrongSpeakers } from '../domain/policies.js';
-import type { ContentPanel, LayoutProfile } from '../domain/layout.js';
+import type { ContentPanel, HostPanel, LayoutProfile } from '../domain/layout.js';
 import { buildPlannedShorts, diagnoseCandidatePlan, fallbackSemanticBlocks, materializeSemanticBlocks, semanticBlocksAreUsable } from '../domain/semantic.js';
 import type { CreatorProfileRepository } from '../infra/creator-profile-loader.js';
 import { buildPublishMessage } from '../infra/mallary.js';
 import { extractFrame, renderCoverImage, renderShortExport } from '../infra/render.js';
 import { transcribeSource } from '../infra/transcript.js';
-import { analyzeContentCrops } from '../infra/vision.js';
+import { analyzeContentCrops, detectHostHead } from '../infra/vision.js';
 import { downloadSource } from '../infra/youtube.js';
 import type { AppConfig } from '../infra/env.js';
 import { CHECK_WINDOW_MS, ShortsStore } from '../infra/db.js';
-import { ShortVideoPublishError, isTransientCheckError, type RemotePublicationState, type ShortVideoPublishProvider } from '../infra/instagram-publisher.js';
+import { ShortVideoPublishError, isTransientCheckError, isTransientNetworkError, type RemotePublicationState, type ShortVideoPublishProvider } from '../infra/instagram-publisher.js';
 import { createId, describeError, logError, nowIso } from '../infra/util.js';
 import type { OpenRouterClient } from '../infra/openrouter.js';
 import { mallaryCooldownKey, platformAvailability, platformLabel } from './platforms.js';
@@ -71,6 +71,11 @@ export class ShortsPipeline {
       await this.processSource(task);
       return;
     }
+    if (task.kind === 'analyze_host') {
+      EmptyPayloadSchema.parse(task.payload);
+      await this.analyzeHost(task);
+      return;
+    }
     if (task.kind === 'plan_shorts') {
       EmptyPayloadSchema.parse(task.payload);
       await this.planShorts(task);
@@ -117,6 +122,9 @@ export class ShortsPipeline {
     job.transcriptWords = words;
     await writeFile(join(jobDir, 'transcript.words.json'), `${JSON.stringify(words, null, 2)}\n`, 'utf-8');
     job.strongSpeakers = detectStrongSpeakers(words);
+    if (hostPanelOf(job.layoutProfileSnapshot)) {
+      this.deps.store.enqueueTask(job.id, 'analyze_host', {});
+    }
     if (job.strongSpeakers.length > 1 && !job.chosenSpeakerId) {
       job.status = 'awaiting_speaker';
       job.updatedAt = nowIso();
@@ -128,6 +136,39 @@ export class ShortsPipeline {
     job.updatedAt = nowIso();
     this.deps.store.updateJob(job);
     this.deps.store.enqueueTask(job.id, 'plan_shorts', {});
+  }
+
+  private async analyzeHost(task: QueueTask): Promise<void> {
+    const job = this.requireJob(task.jobId);
+    const panel = hostPanelOf(job.layoutProfileSnapshot);
+    if (!panel) {
+      throw new Error(`Layout for job ${job.id} has no host panel for host head detection.`);
+    }
+    const media = this.requireMedia(job);
+    let framing: HostFraming | null = null;
+    let failure: unknown = null;
+    try {
+      const headBox = await detectHostHead({
+        config: this.deps.config,
+        videoPath: media.videoPath,
+        source: { width: media.width, height: media.height },
+        panel,
+        durationSeconds: media.durationSeconds,
+        workDir: await this.ensureJobDir(job.id),
+      });
+      framing = { headBox };
+    } catch (error) {
+      failure = error;
+      logError('Host head detection failed', error, { jobId: job.id });
+    }
+    const current = this.requireJob(task.jobId);
+    if (framing !== null) {
+      current.hostFraming = framing;
+      current.hostFramingAnalyzedAt = nowIso();
+    } else if (!isTransientNetworkError(failure)) {
+      current.hostFramingAnalyzedAt = nowIso();
+    }
+    this.deps.store.updateJob(current);
   }
 
   private async planShorts(task: QueueTask): Promise<void> {
@@ -299,6 +340,7 @@ export class ShortsPipeline {
       words: job.transcriptWords,
       layout: job.layoutProfileSnapshot,
       source: { width: media.width, height: media.height, durationSeconds: media.durationSeconds },
+      hostFraming: record.hostFraming,
     });
     const workDir = join(await this.ensureJobDir(job.id), 'exports', record.id);
     const result = await renderShortExport({
@@ -637,6 +679,10 @@ export class ShortsPipeline {
       }
       return true;
     }
+    if (task.kind === 'analyze_host') {
+      this.deps.store.failTask(task, message);
+      return true;
+    }
     const { exportId } = ExportShortPayloadSchema.parse(task.payload);
     const record = this.deps.store.getExport(exportId);
     if (record) {
@@ -688,6 +734,11 @@ export class ShortsPipeline {
 
 function contentPanelOf(layout: LayoutProfile): ContentPanel | null {
   const panel = layout.panels.find((entry): entry is ContentPanel => entry.role === 'content');
+  return panel ?? null;
+}
+
+function hostPanelOf(layout: LayoutProfile): HostPanel | null {
+  const panel = layout.panels.find((entry): entry is HostPanel => entry.role === 'host');
   return panel ?? null;
 }
 

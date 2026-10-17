@@ -1,7 +1,8 @@
 import { stat, writeFile } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import type { LayoutProfile } from '../domain/layout.js';
-import type { Timeline, TimelineClip, TimelineEndCard } from '../domain/timeline.js';
+import type { Timeline, TimelineClip, TimelineEndCard, TimelinePanelPlacement } from '../domain/timeline.js';
+import { HOST_BLUR_DARKEN, HOST_BLUR_SIGMA_PX } from '../domain/timeline.js';
 import { buildEndCardAss, buildExportAss } from './ass.js';
 import { runProcess } from './process.js';
 import { ensureParent } from './util.js';
@@ -140,17 +141,15 @@ function buildChunkFilterGraph(input: {
     parts.push(
       `[vsrc${index}]trim=start=${num(trimStart)}:end=${num(trimEnd)},setpts=(PTS-STARTPTS)/${num(input.speed)},fps=${input.fps},split=${clip.panels.length}${splitLabels(`vcrop${index}`, clip.panels.length, '_')}`,
     );
-    clip.panels.forEach((panel, panelIndex) => {
-      parts.push(
-        `[vcrop${index}_${panelIndex}]crop=${panel.source.w}:${panel.source.h}:${panel.source.x}:${panel.source.y},scale=${panel.canvas.w}:${panel.canvas.h}:flags=lanczos,setsar=1[vscaled${index}_${panelIndex}]`,
-      );
-    });
+    const overlayInputs = clip.panels.flatMap((panel, panelIndex) =>
+      panelScaleChains(parts, index, panelIndex, panel),
+    );
     parts.push(`color=c=${input.background}:s=${input.width}x${input.height}:r=${input.fps}:d=${num(outputDuration)}[vbase${index}]`);
     let previousLabel = `[vbase${index}]`;
-    clip.panels.forEach((panel, panelIndex) => {
-      const last = panelIndex === clip.panels.length - 1;
-      const label = last ? `[vclip${index}]` : `[vover${index}_${panelIndex}]`;
-      parts.push(`${previousLabel}[vscaled${index}_${panelIndex}]overlay=x=${panel.canvas.x}:y=${panel.canvas.y}${last ? ',format=yuv420p' : ''}${label}`);
+    overlayInputs.forEach((overlayInput, inputIndex) => {
+      const last = inputIndex === overlayInputs.length - 1;
+      const label = last ? `[vclip${index}]` : `[vover${index}_${inputIndex}]`;
+      parts.push(`${previousLabel}${overlayInput.label}overlay=x=${overlayInput.x}:y=${overlayInput.y}${last ? ',format=yuv420p' : ''}${label}`);
       previousLabel = label;
     });
     const audioChain = [`[asrc${index}]atrim=start=${num(trimStart)}:end=${num(trimEnd)},asetpts=PTS-STARTPTS,aresample=${AUDIO_SAMPLE_RATE}`];
@@ -352,6 +351,42 @@ function chunkClips(clips: TimelineClip[]): TimelineClip[][] {
 
 function splitLabels(prefix: string, count: number, separator: string): string {
   return Array.from({ length: count }, (_, index) => `[${prefix}${separator}${index}]`).join('');
+}
+
+interface PanelOverlayInput {
+  label: string;
+  x: number;
+  y: number;
+}
+
+function panelScaleChains(
+  parts: string[],
+  clipIndex: number,
+  panelIndex: number,
+  panel: TimelinePanelPlacement,
+): PanelOverlayInput[] {
+  const cropStream = `[vcrop${clipIndex}_${panelIndex}]`;
+  const cropArgs = `crop=${panel.source.w}:${panel.source.h}:${panel.source.x}:${panel.source.y}`;
+  if (panel.fill === 'cover') {
+    parts.push(`${cropStream}${cropArgs},scale=${panel.canvas.w}:${panel.canvas.h}:flags=lanczos,setsar=1[vscaled${clipIndex}_${panelIndex}]`);
+    return [{ label: `[vscaled${clipIndex}_${panelIndex}]`, x: panel.canvas.x, y: panel.canvas.y }];
+  }
+  const cropAspect = panel.source.w / panel.source.h;
+  const panelAspect = panel.canvas.w / panel.canvas.h;
+  const coverWidth = cropAspect > panelAspect ? Math.ceil((panel.canvas.h * cropAspect) / 2) * 2 : panel.canvas.w;
+  const coverHeight = cropAspect > panelAspect ? panel.canvas.h : Math.ceil((panel.canvas.w / cropAspect) / 2) * 2;
+  const foregroundWidth = Math.max(2, Math.floor((panel.canvas.h * cropAspect) / 2) * 2);
+  parts.push(`${cropStream}${cropArgs},split=2${splitLabels(`hblur${clipIndex}_${panelIndex}`, 2, '')}`);
+  parts.push(
+    `[hblur${clipIndex}_${panelIndex}0]scale=${coverWidth}:${coverHeight}:flags=lanczos,gblur=sigma=${num(HOST_BLUR_SIGMA_PX)},colorchannelmixer=rr=${num(HOST_BLUR_DARKEN)}:gg=${num(HOST_BLUR_DARKEN)}:bb=${num(HOST_BLUR_DARKEN)},crop=${panel.canvas.w}:${panel.canvas.h},setsar=1[hblurbg${clipIndex}_${panelIndex}]`,
+  );
+  parts.push(
+    `[hblur${clipIndex}_${panelIndex}1]scale=${foregroundWidth}:${panel.canvas.h}:flags=lanczos,setsar=1[hblurfg${clipIndex}_${panelIndex}]`,
+  );
+  return [
+    { label: `[hblurbg${clipIndex}_${panelIndex}]`, x: panel.canvas.x, y: panel.canvas.y },
+    { label: `[hblurfg${clipIndex}_${panelIndex}]`, x: panel.canvas.x + Math.round((panel.canvas.w - foregroundWidth) / 2), y: panel.canvas.y },
+  ];
 }
 
 async function probeVideoStreamDurationSeconds(path: string): Promise<number> {

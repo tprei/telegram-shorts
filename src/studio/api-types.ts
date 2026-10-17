@@ -5,6 +5,7 @@ import type {
   CandidateArc,
   CropAnalysisStatus,
   ExportStatus,
+  HostFraming,
   JobStatus,
   PublicationStatus,
   PublishCopy,
@@ -50,6 +51,7 @@ export interface ExportDto {
   id: string;
   shortId: string;
   editRevision: number;
+  current: boolean;
   status: ExportStatus;
   error: string | null;
   videoUrl: string | null;
@@ -143,6 +145,7 @@ export interface ShortDetailDto {
     thumbnailUrl: string | null;
     media: JobMediaDto;
     layout: LayoutProfile;
+    hostFraming: HostFraming | null;
     fontUrl: string;
   };
   exports: ExportDto[];
@@ -243,6 +246,7 @@ export interface StudioApi {
   correctWord(jobId: string, wordIndex: number, request: CorrectWordRequest): TranscriptDto;
   chooseSpeaker(jobId: string, request: ChooseSpeakerRequest): JobDetailDto;
   replan(jobId: string): JobDetailDto;
+  analyzeHostFraming(jobId: string): JobDetailDto;
   createManualShort(jobId: string, request: CreateManualShortRequest): ShortDetailDto;
   getShort(shortId: string): Promise<ShortDetailDto>;
   saveEdit(shortId: string, request: SaveEditRequest): Promise<ShortDetailDto>;

@@ -1,7 +1,7 @@
 import type { LayoutProfile, PxRect } from './layout.js';
 import type { CropKeyframe, ShortEdit } from './edit.js';
 import { keptWordIndices } from './edit.js';
-import type { TranscriptWord } from './model.js';
+import type { HostFraming, TranscriptWord } from './model.js';
 import { formatCaptionWord, wrapHook, wrapWords } from './text.js';
 import { contentSourceCrop, hostSourceCrop, normToPx, panelCanvasRect, toEvenPxRect } from './geometry.js';
 
@@ -10,6 +10,7 @@ export interface TimelinePanelPlacement {
   role: 'content' | 'host';
   source: PxRect;
   canvas: PxRect;
+  fill: 'cover' | 'blur';
 }
 
 export interface TimelineClip {
@@ -87,6 +88,8 @@ export interface Timeline {
 export const CLIP_PAD_IN_SECONDS = 0.08;
 export const CLIP_PAD_OUT_SECONDS = 0.12;
 export const CROP_SPLIT_MARGIN_SECONDS = 0.3;
+export const HOST_BLUR_SIGMA_PX = 30;
+export const HOST_BLUR_DARKEN = 0.6;
 export const END_CARD_SECONDS = 2.4;
 export const END_CARD_DARKEN_FACTOR = 0.55;
 export const END_CARD_THUMBNAIL_WIDTH_PX = 900;
@@ -171,6 +174,7 @@ export function buildTimeline(input: {
   layout: LayoutProfile;
   title: string;
   source: { width: number; height: number; durationSeconds: number };
+  hostFraming: HostFraming | null;
 }): Timeline {
   const { edit, words, layout, source } = input;
   const fps = layout.canvas.fps;
@@ -233,14 +237,22 @@ export function buildTimeline(input: {
     clip.panels = layout.panels.map((panel) => {
       const canvasRect = panelCanvasRect(panel, layout.canvas);
       const aspect = canvasRect.w / canvasRect.h;
+      if (panel.role === 'content') {
+        return {
+          panelId: panel.id,
+          role: panel.role,
+          source: contentSourceCrop(panel, focus ? focus.focus : null, source, aspect),
+          canvas: canvasRect,
+          fill: 'cover',
+        };
+      }
+      const crop = hostSourceCrop(panel, clip.zoom, source, aspect, input.hostFraming === null ? null : input.hostFraming.headBox);
       return {
         panelId: panel.id,
         role: panel.role,
-        source:
-          panel.role === 'content'
-            ? contentSourceCrop(panel, focus ? focus.focus : null, source, aspect)
-            : hostSourceCrop(panel, clip.zoom, source, aspect),
+        source: crop.source,
         canvas: canvasRect,
+        fill: crop.fill,
       };
     });
   }

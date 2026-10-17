@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type { ShortEdit } from './edit.js';
-import type { LayoutProfile } from './layout.js';
+import type { LayoutProfile, NormRect } from './layout.js';
 
 export type ShortVideoPlatform = 'instagram' | 'tiktok' | 'youtube_shorts';
 
@@ -72,17 +72,18 @@ export interface SourceMedia {
 
 export type JobStatus = 'queued' | 'downloading' | 'transcribing' | 'awaiting_speaker' | 'planning' | 'ready' | 'failed';
 
-export type QueueTaskKind = 'process_source' | 'plan_shorts' | 'analyze_crops' | 'export_short' | 'publish_short_video' | 'check_publication';
+export type QueueTaskKind = 'process_source' | 'analyze_host' | 'plan_shorts' | 'analyze_crops' | 'export_short' | 'publish_short_video' | 'check_publication';
 
 export type QueueLane = 'ingest' | 'output';
 
 export const QUEUE_LANES: Record<QueueLane, readonly QueueTaskKind[]> = {
-  ingest: ['process_source', 'plan_shorts', 'analyze_crops'],
+  ingest: ['process_source', 'analyze_host', 'plan_shorts', 'analyze_crops'],
   output: ['export_short', 'publish_short_video', 'check_publication'],
 };
 
 export interface QueueTaskPayloads {
   process_source: Record<string, never>;
+  analyze_host: Record<string, never>;
   plan_shorts: Record<string, never>;
   analyze_crops: { shortId: string };
   export_short: { exportId: string };
@@ -102,6 +103,10 @@ export interface QueueTask {
   error: string | null;
 }
 
+export interface HostFraming {
+  headBox: NormRect;
+}
+
 export interface JobRecord {
   id: string;
   sourceUrl: string;
@@ -119,6 +124,8 @@ export interface JobRecord {
   semanticBlocks: SemanticBlock[];
   strongSpeakers: SpeakerSample[];
   chosenSpeakerId: string | null;
+  hostFraming: HostFraming | null;
+  hostFramingAnalyzedAt: string | null;
   failedTaskKind: QueueTaskKind | null;
   error: string | null;
   createdAt: string;
@@ -169,6 +176,7 @@ export interface ExportRecord {
   transcriptRevision: number;
   edit: ShortEdit;
   title: string;
+  hostFraming: HostFraming | null;
   status: ExportStatus;
   artifactPath: string | null;
   coverPath: string | null;

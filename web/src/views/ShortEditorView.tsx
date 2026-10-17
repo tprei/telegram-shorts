@@ -101,7 +101,7 @@ export function ShortEditorView(props: ShortEditorViewProps) {
       viewport?.removeEventListener('scroll', resize);
     };
   }, []);
-  const currentExport = newestExport(detail.exports, detail.short.editRevision);
+  const currentExport = newestExport(detail.exports);
   function showExport() {
     setInspectorTab('publish');
     setWorkspace('inspector');

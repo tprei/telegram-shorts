@@ -20,6 +20,7 @@ import { CreatorProfileRepository } from '../src/infra/creator-profile-loader.js
 import type { OpenRouterClient } from '../src/infra/openrouter.js';
 import type { ShortVideoCheckPublicationInput, ShortVideoPublishInput, ShortVideoPublishProvider, ShortVideoPublishResult, RemotePublicationState } from '../src/infra/instagram-publisher.js';
 import { ShortVideoPublishError } from '../src/infra/instagram-publisher.js';
+import { boxToSourceFocus } from '../src/infra/vision.js';
 import { nowIso } from '../src/infra/util.js';
 
 const CREATOR_A: CreatorProfile = {
@@ -196,6 +197,8 @@ function seedReadyJob(store: ShortsStore, creator: CreatorProfile, rootDir: stri
     semanticBlocks: [],
     strongSpeakers: [],
     chosenSpeakerId: 'speaker_0',
+    hostFraming: null,
+    hostFramingAnalyzedAt: null,
     failedTaskKind: null,
     error: null,
     createdAt: nowIso(),
@@ -236,6 +239,7 @@ function seedReadyExport(store: ShortsStore, seeded: SeededJob, rootDir: string)
     transcriptRevision: 0,
     edit: seeded.edit,
     title: 'Short de teste',
+    hostFraming: null,
     status: 'ready',
     artifactPath: join(rootDir, 'export.mp4'),
     sizeBytes: 1024,
@@ -1280,7 +1284,7 @@ test('v3 migration marks unverified published publications submitted and queues 
     if (typeof row !== 'object' || row === null || !('user_version' in row) || typeof row.user_version !== 'number') {
       throw new Error('Database did not report a user_version');
     }
-    assert.equal(row.user_version, 4);
+    assert.equal(row.user_version, 5);
   } finally {
     db.close();
     await rm(dir, { recursive: true, force: true });
@@ -1515,5 +1519,316 @@ test('an export stays ready without a cover when the cover render throws', { tim
     assert.ok(exported.artifactPath);
   } finally {
     await cleanup(context);
+  }
+});
+
+function hostHeadChatResponse(content: string): Response {
+  return new Response(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content } }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+}
+
+const HOST_HEAD_BOXES: Array<[number, number, number, number]> = [
+  [140, 280, 860, 1000],
+  [150, 300, 850, 990],
+  [147, 287, 858, 1000],
+  [160, 310, 840, 980],
+  [155, 290, 845, 995],
+];
+
+async function seedSourceVideo(rootDir: string): Promise<void> {
+  await runProcess('ffmpeg', [
+    '-y',
+    '-f', 'lavfi', '-i', 'testsrc2=size=1920x1080:rate=30',
+    '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
+    '-t', '4',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-pix_fmt', 'yuv420p',
+    '-ac', '2', '-c:a', 'aac', '-b:a', '96k',
+    join(rootDir, 'source.mp4'),
+  ]);
+}
+
+test('analyzeHostFraming clears the analysis stamp and enqueues analyze_host', async () => {
+  const context = await makeContext();
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const job = context.store.getJob(seeded.jobId);
+    assert.ok(job);
+    job.hostFraming = { headBox: { x: 0.741181, y: 0.147, w: 0.258819, h: 0.711 } };
+    job.hostFramingAnalyzedAt = nowIso();
+    context.store.updateJob(job);
+
+    context.service.analyzeHostFraming(seeded.jobId);
+
+    const updated = context.store.getJob(seeded.jobId);
+    assert.ok(updated);
+    assert.equal(updated.hostFramingAnalyzedAt, null);
+    assert.deepEqual(updated.hostFraming, { headBox: { x: 0.741181, y: 0.147, w: 0.258819, h: 0.711 } });
+    const tasks = queuedTasks(context.dbPath, 'analyze_host');
+    assert.equal(tasks.length, 1);
+    assert.equal(tasks[0].status, 'queued');
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('analyzeHostFraming rejects a job that is not ready and a layout without a host panel', async () => {
+  const context = await makeContext();
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const planning = context.store.getJob(seeded.jobId);
+    assert.ok(planning);
+    planning.status = 'planning';
+    context.store.updateJob(planning);
+    assert.throws(() => context.service.analyzeHostFraming(seeded.jobId), isStudioErrorWithCode('conflict'));
+
+    planning.status = 'ready';
+    planning.layoutProfileSnapshot = {
+      ...planning.layoutProfileSnapshot,
+      panels: [{ id: 'screen', role: 'content', sourceRect: { x: 0, y: 0, w: 0.632, h: 1 }, canvasRect: { x: 0, y: 0.1146, w: 1, h: 0.4375 } }],
+    };
+    context.store.updateJob(planning);
+    assert.throws(() => context.service.analyzeHostFraming(seeded.jobId), isStudioErrorWithCode('invalid'));
+    assert.equal(queuedTasks(context.dbPath, 'analyze_host').length, 0);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('exportShort reuses an export only while the job hostFraming is unchanged', async () => {
+  const context = await makeContext();
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const job = context.store.getJob(seeded.jobId);
+    assert.ok(job);
+    const boxA = { headBox: { x: 0.741181, y: 0.147, w: 0.258819, h: 0.711 } };
+    const boxB = { headBox: { x: 0.75316, y: 0.171, w: 0.193116, h: 0.467 } };
+    job.hostFraming = boxA;
+    context.store.updateJob(job);
+
+    const first = await context.service.exportShort(seeded.shortId);
+    const second = await context.service.exportShort(seeded.shortId);
+    assert.equal(second.exports.length, 1);
+    assert.equal(second.exports[0].id, first.exports[0].id);
+    assert.equal(second.exports[0].current, true);
+
+    job.hostFraming = boxB;
+    job.updatedAt = nowIso();
+    context.store.updateJob(job);
+    const third = await context.service.exportShort(seeded.shortId);
+    assert.equal(third.exports.length, 2);
+    assert.equal(third.exports.find((record) => record.id === first.exports[0].id)?.current, false);
+    assert.equal(third.exports.find((record) => record.id !== first.exports[0].id)?.current, true);
+
+    const exports = context.store.listExportsForShort(seeded.shortId);
+    assert.deepEqual(exports.find((record) => record.id === first.exports[0].id)?.hostFraming, boxA);
+    assert.deepEqual(exports.find((record) => record.id !== first.exports[0].id)?.hostFraming, boxB);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('analyze_host stores the median head box and touches only the framing fields', async () => {
+  const context = await makeContext();
+  try {
+    const words = transcriptWords().slice(0, 5);
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir, words);
+    await seedSourceVideo(context.rootDir);
+    let call = 0;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      const box = HOST_HEAD_BOXES[call];
+      call += 1;
+      return hostHeadChatResponse(JSON.stringify({ box_2d: box, reason: 'cabeça do apresentador' }));
+    }) as typeof fetch;
+    try {
+      context.store.enqueueTask(seeded.jobId, 'analyze_host', {});
+      const pipeline = pipelineFor(context, fakePublisher());
+      assert.equal(await pipeline.runNext('ingest'), true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    assert.equal(call, 5);
+    const job = context.store.getJob(seeded.jobId);
+    assert.ok(job);
+    const hostSourceRect = { x: 0.342, y: 0, w: 0.316, h: 1 };
+    const expected = boxToSourceFocus([150, 290, 850, 995], { sourceRect: hostSourceRect });
+    assert.deepEqual(job.hostFraming, { headBox: expected });
+    assert.ok(job.hostFramingAnalyzedAt);
+    assert.equal(job.status, 'ready');
+    assert.equal(job.error, null);
+    assert.equal(job.failedTaskKind, null);
+    const tasks = queuedTasks(context.dbPath, 'analyze_host');
+    assert.equal(tasks[0].status, 'done');
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('analyze_host keeps the previous box and stamps analyzedAt when detection fails non-transiently', async () => {
+  const context = await makeContext();
+  try {
+    const words = transcriptWords().slice(0, 5);
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir, words);
+    const previous = { headBox: { x: 0.741181, y: 0.147, w: 0.258819, h: 0.711 } };
+    const seededJob = context.store.getJob(seeded.jobId);
+    assert.ok(seededJob);
+    seededJob.hostFraming = previous;
+    context.store.updateJob(seededJob);
+    await seedSourceVideo(context.rootDir);
+    let calls = 0;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      return new Response('vision provider unavailable', { status: 500 });
+    }) as typeof fetch;
+    try {
+      context.store.enqueueTask(seeded.jobId, 'analyze_host', {});
+      const pipeline = pipelineFor(context, fakePublisher());
+      assert.equal(await pipeline.runNext('ingest'), true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    assert.equal(calls, 5);
+    const job = context.store.getJob(seeded.jobId);
+    assert.ok(job);
+    assert.deepEqual(job.hostFraming, previous);
+    assert.ok(job.hostFramingAnalyzedAt);
+    assert.equal(job.status, 'ready');
+    assert.equal(job.error, null);
+    const tasks = queuedTasks(context.dbPath, 'analyze_host');
+    assert.equal(tasks[0].status, 'done');
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('analyze_host keeps the previous box and leaves analyzedAt null on a transient failure', async () => {
+  const context = await makeContext();
+  try {
+    const words = transcriptWords().slice(0, 5);
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir, words);
+    const previous = { headBox: { x: 0.741181, y: 0.147, w: 0.258819, h: 0.711 } };
+    const seededJob = context.store.getJob(seeded.jobId);
+    assert.ok(seededJob);
+    seededJob.hostFraming = previous;
+    context.store.updateJob(seededJob);
+    await seedSourceVideo(context.rootDir);
+    let calls = 0;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      if (calls <= 2) {
+        return hostHeadChatResponse(JSON.stringify({ box_2d: [147, 287, 858, 1000], reason: 'cabeça do apresentador' }));
+      }
+      const error = new Error('connect timed out');
+      (error as Error & { code: string }).code = 'ETIMEDOUT';
+      throw error;
+    }) as typeof fetch;
+    try {
+      context.store.enqueueTask(seeded.jobId, 'analyze_host', {});
+      const pipeline = pipelineFor(context, fakePublisher());
+      assert.equal(await pipeline.runNext('ingest'), true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    const job = context.store.getJob(seeded.jobId);
+    assert.ok(job);
+    assert.deepEqual(job.hostFraming, previous);
+    assert.equal(job.hostFramingAnalyzedAt, null);
+    assert.equal(job.status, 'ready');
+    assert.equal(job.error, null);
+    const tasks = queuedTasks(context.dbPath, 'analyze_host');
+    assert.equal(tasks[0].status, 'done');
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('ExportDto.current flips when the title, transcript revision, or host framing changes', async () => {
+  const context = await makeContext();
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    seedReadyExport(context.store, seeded, context.rootDir);
+    const fresh = await context.service.getShort(seeded.shortId);
+    assert.equal(fresh.exports[0].current, true);
+
+    const job = context.store.getJob(seeded.jobId);
+    assert.ok(job);
+    job.transcriptRevision += 1;
+    context.store.updateJob(job);
+    const afterTranscript = await context.service.getShort(seeded.shortId);
+    assert.equal(afterTranscript.exports[0].current, false);
+
+    job.transcriptRevision = 0;
+    job.hostFraming = { headBox: { x: 0.741181, y: 0.147, w: 0.258819, h: 0.711 } };
+    context.store.updateJob(job);
+    const afterFraming = await context.service.getShort(seeded.shortId);
+    assert.equal(afterFraming.exports[0].current, false);
+
+    job.hostFraming = null;
+    context.store.updateJob(job);
+    const short = context.store.getShort(seeded.shortId);
+    assert.ok(short);
+    short.title = 'Outro título';
+    context.store.updateShort(short);
+    const afterTitle = await context.service.getShort(seeded.shortId);
+    assert.equal(afterTitle.exports[0].current, false);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('enqueueMissingHostHeadAnalyses enqueues once per job that still needs analysis', async () => {
+  const context = await makeContext();
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const base = context.store.getJob(seeded.jobId);
+    assert.ok(base);
+    context.store.createJob({ ...base, id: 'job_analyzed', hostFramingAnalyzedAt: nowIso() });
+    context.store.createJob({ ...base, id: 'job_nomedia', media: null });
+    context.store.createJob({
+      ...base,
+      id: 'job_content',
+      layoutProfileSnapshot: {
+        ...base.layoutProfileSnapshot,
+        panels: [{ id: 'screen', role: 'content', sourceRect: { x: 0, y: 0, w: 0.632, h: 1 }, canvasRect: { x: 0, y: 0.1146, w: 1, h: 0.4375 } }],
+      },
+    });
+    context.store.createJob({ ...base, id: 'job_pending' });
+    context.store.enqueueTask('job_pending', 'analyze_host', {});
+
+    context.store.enqueueMissingHostHeadAnalyses();
+    const afterFirst = queuedTasks(context.dbPath, 'analyze_host').filter((task) => task.status === 'queued');
+    assert.equal(afterFirst.length, 2);
+
+    context.store.enqueueMissingHostHeadAnalyses();
+    const afterSecond = queuedTasks(context.dbPath, 'analyze_host').filter((task) => task.status === 'queued');
+    assert.equal(afterSecond.length, 2);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('the store migrates a v4 database by adding the host framing fields', async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'studio-migrate-'));
+  const dbPath = join(rootDir, 'shorts.sqlite');
+  const db = new DatabaseSync(dbPath);
+  db.exec('CREATE TABLE jobs (id TEXT PRIMARY KEY, status TEXT NOT NULL, updated_at TEXT NOT NULL, payload_json TEXT NOT NULL)');
+  db.exec('CREATE TABLE exports (id TEXT PRIMARY KEY, job_id TEXT NOT NULL, short_id TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, payload_json TEXT NOT NULL)');
+  db.exec(`INSERT INTO jobs(id, status, updated_at, payload_json) VALUES('job_old', 'ready', '${nowIso()}', '{"id":"job_old","transcriptRevision":2}')`);
+  db.exec(`INSERT INTO exports(id, job_id, short_id, status, created_at, payload_json) VALUES('export_old', 'job_old', 'short_old', 'ready', '${nowIso()}', '{"id":"export_old","editRevision":1,"transcriptRevision":0}')`);
+  db.exec('PRAGMA user_version = 4');
+  db.close();
+  const store = await ShortsStore.open(dbPath);
+  try {
+    const job = store.getJob('job_old');
+    assert.ok(job);
+    assert.equal(job.hostFraming, null);
+    assert.equal(job.hostFramingAnalyzedAt, null);
+    const record = store.getExport('export_old');
+    assert.ok(record);
+    assert.equal(record.hostFraming, null);
+  } finally {
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
   }
 });

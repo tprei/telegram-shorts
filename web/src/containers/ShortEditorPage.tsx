@@ -151,6 +151,7 @@ function ShortEditorSurface({ detail, transcript, refetchShort }: ShortEditorSur
 
   const layout = detail.job.layout;
   const media = detail.job.media;
+  const hostFraming = detail.job.hostFraming;
   const shortTitle = detail.short.title;
   const timeline = useMemo<Timeline>(
     () =>
@@ -164,8 +165,9 @@ function ShortEditorSurface({ detail, transcript, refetchShort }: ShortEditorSur
           height: media.height,
           durationSeconds: media.durationSeconds,
         },
+        hostFraming,
       }),
-    [edit, transcriptWords, layout, media, shortTitle],
+    [edit, transcriptWords, layout, media, shortTitle, hostFraming],
   );
 
   const canvasRef = useRef<HTMLCanvasElement>(null);

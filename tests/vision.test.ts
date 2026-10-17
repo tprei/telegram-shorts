@@ -1,9 +1,24 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { boxToSourceFocus, distributeSampleBudget, parseShowinfoSceneTimes, selectSpanSamples, wordsSpokenBetween } from '../src/infra/vision.js';
-import { ContentPanel } from '../src/domain/layout.js';
+import { boxToSourceFocus, distributeSampleBudget, hostHeadBoxFromFrames, hostHeadSampleTimes, medianHeadBox, medianValue, parseShowinfoSceneTimes, selectSpanSamples, wordsSpokenBetween } from '../src/infra/vision.js';
+import { isTransientNetworkError } from '../src/infra/instagram-publisher.js';
+import { ContentPanel, HostPanel, NormRect } from '../src/domain/layout.js';
 import { TranscriptWord } from '../src/domain/model.js';
+import type { AppConfig } from '../src/infra/env.js';
+
+const visionConfig = {
+  OPENROUTER_API_KEY: 'test-key',
+  OPENROUTER_VISION_MODEL: 'test-vision-model',
+} as AppConfig;
+
+function chatCompletion(content: string): Response {
+  return new Response(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content } }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+}
+
+function hostPanelFixture(): HostPanel {
+  return { id: 'host', role: 'host', sourceRect: { x: 0.637, y: 0, w: 0.363, h: 1 }, canvasRect: { x: 0, y: 0.5521, w: 1, h: 0.4479 }, anchor: { x: 0.5, y: 0.42 } };
+}
 
 function makeWord(id: string, text: string, startSeconds: number, endSeconds: number): TranscriptWord {
   return { id, text, startSeconds, endSeconds, speakerId: 'S0', confidence: null };
@@ -85,4 +100,123 @@ test('wordsSpokenBetween joins words overlapping the interval', () => {
   assert.equal(wordsSpokenBetween(words, 0.5, 2.5), 'olá pessoal');
   assert.equal(wordsSpokenBetween(words, 3.45, 4), 'tudo');
   assert.equal(wordsSpokenBetween(words, 10, 20), '');
+});
+
+test('hostHeadSampleTimes places five frames at 10/30/50/70/90% of the video', () => {
+  assert.deepEqual(hostHeadSampleTimes(40), [4, 12, 20, 28, 36]);
+  assert.deepEqual(hostHeadSampleTimes(0), [0, 0, 0, 0, 0]);
+});
+
+test('medianValue returns the middle value or the mean of the two middle values', () => {
+  assert.equal(medianValue([3, 1, 2]), 2);
+  assert.equal(medianValue([4, 1, 3, 2]), 2.5);
+  assert.equal(medianValue([7]), 7);
+  assert.throws(() => medianValue([]));
+});
+
+test('medianHeadBox medians the edges and rebuilds the box, not the sizes', () => {
+  const boxes: NormRect[] = [
+    { x: 0.1, y: 0.05, w: 0.6, h: 0.2 },
+    { x: 0.3, y: 0.4, w: 0.1, h: 0.3 },
+    { x: 0.7, y: 0.1, w: 0.2, h: 0.6 },
+  ];
+  const sizeMedian = {
+    x: medianValue([0.1, 0.3, 0.7]),
+    y: medianValue([0.05, 0.4, 0.1]),
+    w: medianValue([0.6, 0.1, 0.2]),
+    h: medianValue([0.2, 0.3, 0.6]),
+  };
+  const edgeMedian = medianHeadBox(boxes);
+  assertRectClose(edgeMedian, { x: 0.3, y: 0.1, w: 0.4, h: 0.6 });
+  assert.notDeepEqual(edgeMedian, sizeMedian);
+});
+
+test('boxToSourceFocus maps a Gemini host head box into source-normalized coordinates', () => {
+  assertRectClose(boxToSourceFocus([147, 287, 858, 1000], hostPanelFixture()), { x: 0.741181, y: 0.147, w: 0.258819, h: 0.711 });
+  assertRectClose(boxToSourceFocus([171, 320, 638, 852], hostPanelFixture()), { x: 0.75316, y: 0.171, w: 0.193116, h: 0.467 });
+});
+
+test('hostHeadBoxFromFrames maps each sample and medians each edge in source coordinates', async () => {
+  const panel = hostPanelFixture();
+  const boxes: Array<[number, number, number, number]> = [
+    [140, 280, 860, 1000],
+    [150, 300, 850, 990],
+    [147, 287, 858, 1000],
+    [160, 310, 840, 980],
+    [155, 290, 845, 995],
+  ];
+  let call = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    const box = boxes[call];
+    call += 1;
+    return chatCompletion(JSON.stringify({ box_2d: box, reason: 'cabeça do apresentador' }));
+  }) as typeof fetch;
+  try {
+    const frames = Array.from({ length: 5 }, () => ({ mimeType: 'image/jpeg' as const, base64: 'x' }));
+    const headBox = await hostHeadBoxFromFrames(visionConfig, frames, panel);
+    assert.equal(call, 5);
+    assertRectClose(headBox, boxToSourceFocus([150, 290, 850, 995], panel));
+    assertRectClose(headBox, { x: 0.74227, y: 0.15, w: 0.255915, h: 0.7 });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('hostHeadBoxFromFrames throws when fewer than three samples succeed, carrying the last sample error as cause', async () => {
+  const panel = hostPanelFixture();
+  let call = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    call += 1;
+    if (call <= 2) {
+      return chatCompletion(JSON.stringify({ box_2d: [147, 287, 858, 1000], reason: 'cabeça do apresentador' }));
+    }
+    return new Response('vision provider unavailable', { status: 500 });
+  }) as typeof fetch;
+  try {
+    const frames = Array.from({ length: 5 }, () => ({ mimeType: 'image/jpeg' as const, base64: 'x' }));
+    await assert.rejects(
+      () => hostHeadBoxFromFrames(visionConfig, frames, panel),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /succeeded on only 2 of 5 frames/);
+        assert.ok(error.cause instanceof Error);
+        assert.match(error.cause.message, /500 vision provider unavailable/);
+        return true;
+      },
+    );
+    assert.equal(call, 5);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('hostHeadBoxFromFrames carries a transient cause when the failing samples hit network errors', async () => {
+  const panel = hostPanelFixture();
+  let call = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    call += 1;
+    if (call <= 2) {
+      return chatCompletion(JSON.stringify({ box_2d: [147, 287, 858, 1000], reason: 'cabeça do apresentador' }));
+    }
+    const error = new Error('connect timed out');
+    (error as Error & { code: string }).code = 'ETIMEDOUT';
+    throw error;
+  }) as typeof fetch;
+  try {
+    const frames = Array.from({ length: 5 }, () => ({ mimeType: 'image/jpeg' as const, base64: 'x' }));
+    await assert.rejects(
+      () => hostHeadBoxFromFrames(visionConfig, frames, panel),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /succeeded on only 2 of 5 frames/);
+        assert.equal(isTransientNetworkError(error.cause), true);
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

@@ -3,10 +3,11 @@ import { join } from 'node:path';
 
 import { CropKeyframe } from '../domain/edit.js';
 import { normToPx, toEvenPxRect } from '../domain/geometry.js';
-import { ContentPanel, NormRect, PxRect } from '../domain/layout.js';
+import { ContentPanel, HostPanel, NormRect, PxRect } from '../domain/layout.js';
 import { CropFocusResponse, CropFocusResponseSchema, TranscriptWord } from '../domain/model.js';
 import type { AppConfig } from './env.js';
 import { requestStructuredJson } from './openrouter.js';
+import { logError } from './util.js';
 import { runProcess } from './process.js';
 
 const DEFAULT_SCENE_THRESHOLD = 0.18;
@@ -17,6 +18,9 @@ const SAMPLE_LEAD_SECONDS = 0.5;
 const VISION_CONCURRENCY = 3;
 const VISION_TEMPERATURE = 0.1;
 const FRAME_WIDTH = 1280;
+const HOST_HEAD_SAMPLE_FRACTIONS = [0.1, 0.3, 0.5, 0.7, 0.9];
+const MIN_HOST_HEAD_SAMPLES = 3;
+const HOST_HEAD_FRAME_HEIGHT = 720;
 
 const CROP_FOCUS_JSON_SCHEMA: Record<string, unknown> = {
   type: 'object',
@@ -42,6 +46,16 @@ const CROP_FOCUS_SYSTEM_PROMPT = [
   '- Exclua a moldura do navegador, abas, anúncios, barras laterais e margens vazias.',
   '- Prefira uma região de 40-70% da largura da imagem para o texto ficar legível no celular, a menos que o conteúdo precise de mais.',
 ].join('\n');
+
+const HOST_HEAD_SYSTEM_PROMPT = [
+  'Você localiza a cabeça do apresentador principal em um quadro de vídeo.',
+  'Responda com box_2d: [ymin, xmin, ymax, xmax] em escala 0-1000 relativa à imagem enviada.',
+  'A cabeça vai do topo do cabelo até a base do queixo e de orelha a orelha.',
+  '- Exclua pescoço, ombros, microfone e qualquer outro objeto.',
+  '- Se houver mais de uma pessoa, escolha o apresentador principal, aquele que está falando para a câmera.',
+].join('\n');
+
+const HOST_HEAD_USER_PROMPT = 'Localize a cabeça do apresentador principal neste quadro e responda com o box_2d.';
 
 export function parseShowinfoSceneTimes(stderr: string): number[] {
   return stderr
@@ -98,7 +112,7 @@ export function wordsSpokenBetween(words: TranscriptWord[], fromSeconds: number,
     .join(' ');
 }
 
-export function boxToSourceFocus(box: [number, number, number, number], panel: ContentPanel): NormRect {
+export function boxToSourceFocus(box: [number, number, number, number], panel: { sourceRect: NormRect }): NormRect {
   const [ymin, xmin, ymax, xmax] = box;
   if (ymin >= ymax || xmin >= xmax) {
     throw new Error(`Invalid crop box [${box.join(', ')}]: expected [ymin, xmin, ymax, xmax] with ymin < ymax and xmin < xmax`);
@@ -229,4 +243,100 @@ async function runWithConcurrency<T, R>(items: T[], limit: number, worker: (item
     }),
   );
   return results;
+}
+
+export function hostHeadSampleTimes(durationSeconds: number): number[] {
+  return HOST_HEAD_SAMPLE_FRACTIONS.map((fraction) => fraction * durationSeconds);
+}
+
+export function medianValue(values: number[]): number {
+  if (values.length === 0) {
+    throw new Error('Cannot take the median of an empty list.');
+  }
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+export function medianHeadBox(boxes: NormRect[]): NormRect {
+  const left = medianValue(boxes.map((box) => box.x));
+  const top = medianValue(boxes.map((box) => box.y));
+  const right = medianValue(boxes.map((box) => box.x + box.w));
+  const bottom = medianValue(boxes.map((box) => box.y + box.h));
+  return { x: left, y: top, w: right - left, h: bottom - top };
+}
+
+export async function detectHostHead(input: {
+  config: AppConfig;
+  videoPath: string;
+  source: { width: number; height: number };
+  panel: HostPanel;
+  durationSeconds: number;
+  workDir: string;
+}): Promise<NormRect> {
+  const region = toEvenPxRect(normToPx(input.panel.sourceRect, input.source.width, input.source.height));
+  const framesDir = join(input.workDir, 'host-head');
+  await mkdir(framesDir, { recursive: true });
+  const frames: Array<{ mimeType: 'image/jpeg'; base64: string }> = [];
+  for (const frameSeconds of hostHeadSampleTimes(input.durationSeconds)) {
+    const outputPath = join(framesDir, `host_head_${frameSeconds.toFixed(2).replace('.', '_')}.jpg`);
+    await extractHostHeadFrame({ videoPath: input.videoPath, region, frameSeconds, outputPath });
+    frames.push({ mimeType: 'image/jpeg', base64: await readFile(outputPath, 'base64') });
+  }
+  return hostHeadBoxFromFrames(input.config, frames, input.panel);
+}
+
+export async function hostHeadBoxFromFrames(
+  config: AppConfig,
+  frames: Array<{ mimeType: 'image/jpeg' | 'image/png'; base64: string }>,
+  panel: { sourceRect: NormRect },
+): Promise<NormRect> {
+  const outcomes = await runWithConcurrency(frames, VISION_CONCURRENCY, async (frame): Promise<{ box: NormRect } | { error: unknown }> => {
+    try {
+      const response = await requestStructuredJson<CropFocusResponse>(config, {
+        title: 'host_head',
+        system: HOST_HEAD_SYSTEM_PROMPT,
+        userText: HOST_HEAD_USER_PROMPT,
+        images: [frame],
+        model: config.OPENROUTER_VISION_MODEL,
+        temperature: VISION_TEMPERATURE,
+        responseFormat: { name: 'crop_focus', schema: CROP_FOCUS_JSON_SCHEMA },
+        parse: (value: unknown) => CropFocusResponseSchema.parse(value),
+      });
+      return { box: boxToSourceFocus(response.box_2d, panel) };
+    } catch (error) {
+      logError('Host head detection sample failed', error);
+      return { error };
+    }
+  });
+  const boxes: NormRect[] = [];
+  let lastError: unknown = null;
+  for (const outcome of outcomes) {
+    if ('box' in outcome) {
+      boxes.push(outcome.box);
+    } else {
+      lastError = outcome.error;
+    }
+  }
+  if (boxes.length < MIN_HOST_HEAD_SAMPLES) {
+    throw new Error(`Host head detection succeeded on only ${boxes.length} of ${frames.length} frames; need at least ${MIN_HOST_HEAD_SAMPLES}.`, { cause: lastError });
+  }
+  return medianHeadBox(boxes);
+}
+
+async function extractHostHeadFrame(input: {
+  videoPath: string;
+  region: PxRect;
+  frameSeconds: number;
+  outputPath: string;
+}): Promise<void> {
+  await runProcess('ffmpeg', [
+    '-y',
+    '-ss', String(input.frameSeconds),
+    '-i', input.videoPath,
+    '-frames:v', '1',
+    '-vf', `crop=${input.region.w}:${input.region.h}:${input.region.x}:${input.region.y},scale=-2:${HOST_HEAD_FRAME_HEIGHT}`,
+    '-q:v', '3',
+    input.outputPath,
+  ]);
 }

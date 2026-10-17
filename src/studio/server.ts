@@ -119,6 +119,7 @@ export function createStudioApp(input: StudioAppInput): Hono {
     c.json(api.chooseSpeaker(c.req.param('jobId'), ChooseSpeakerRequestSchema.parse(await parseBody(c)))),
   );
   app.post('/api/jobs/:jobId/replan', (c) => c.json(api.replan(c.req.param('jobId'))));
+  app.post('/api/jobs/:jobId/host-framing/analyze', (c) => c.json(api.analyzeHostFraming(c.req.param('jobId'))));
   app.post('/api/jobs/:jobId/shorts', async (c) =>
     c.json(api.createManualShort(c.req.param('jobId'), CreateManualShortRequestSchema.parse(await parseBody(c)))),
   );

@@ -1,10 +1,10 @@
 import type { ExportDto } from '@api';
 import { Icon } from './StudioPrimitives';
 
-export function newestExport(exports: readonly ExportDto[], editRevision: number): ExportDto | null {
+export function newestExport(exports: readonly ExportDto[]): ExportDto | null {
   let newest: ExportDto | null = null;
   for (const item of exports) {
-    if (item.editRevision !== editRevision) continue;
+    if (!item.current) continue;
     if (!newest || item.createdAt > newest.createdAt) newest = item;
   }
   return newest;

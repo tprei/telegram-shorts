@@ -147,6 +147,11 @@ class FakeStudioApi implements StudioApi {
     return jobDetailDto(jobId);
   }
 
+  analyzeHostFraming(jobId: string): JobDetailDto {
+    this.note('analyzeHostFraming', [jobId]);
+    return jobDetailDto(jobId);
+  }
+
   createManualShort(jobId: string, request: CreateManualShortRequest): ShortDetailDto {
     this.note('createManualShort', [jobId, request]);
     return shortDetailDto(jobId, 's1');
@@ -253,6 +258,7 @@ function exportDto(shortId: string): ExportDto {
     id: `exp_${shortId}`,
     shortId,
     editRevision: 3,
+    current: true,
     status: 'ready',
     error: null,
     videoUrl: `/media/exports/exp_${shortId}`,
@@ -301,6 +307,7 @@ function shortDetailDto(jobId: string, id: string): ShortDetailDto {
       thumbnailUrl: `/media/jobs/${jobId}/thumbnail`,
       media: { width: 1920, height: 1080, fps: 60, durationSeconds: 180, videoUrl: `/media/jobs/${jobId}/source` },
       layout: layoutProfile,
+      hostFraming: null,
       fontUrl: '/fonts/Montserrat-ExtraBold.ttf',
     },
     exports: [exportDto(id)],
@@ -614,6 +621,7 @@ test('every StudioApi route dispatches with parsed bodies', async () => {
     ['/api/shorts/s1/copy/generate', { method: 'POST' }, 'generatePublishCopy', ['s1']],
     ['/api/shorts/s1/copy', { method: 'PUT', body: JSON.stringify({ copy: { line1: 'First line', line2: 'Second line', hashtags: ['#shorts'] } }) }, 'updatePublishCopy', ['s1', { copy: { line1: 'First line', line2: 'Second line', hashtags: ['#shorts'] } }]],
     ['/api/exports/e1/publish', { method: 'POST', body: JSON.stringify({ platforms: ['instagram'], force: false }) }, 'publish', ['e1', { platforms: ['instagram'], force: false }]],
+    ['/api/jobs/j1/host-framing/analyze', { method: 'POST' }, 'analyzeHostFraming', ['j1']],
   ];
   for (const [route, init, method] of cases) {
     const res = await app.request(route, init);
@@ -701,7 +709,23 @@ test('duplicate publish platforms are rejected with 400 before dispatch', async 
     body: JSON.stringify({ platforms: ['instagram', 'instagram'], force: false }),
   });
   assert.equal(res.status, 400);
-  const body: { code: string } = await res.json();
+  const body = await res.json();
   assert.equal(body.code, 'invalid');
   assert.equal(api.calls.length, 0);
+});
+
+test('POST /api/jobs/:jobId/host-framing/analyze dispatches and maps conflict to 409', async () => {
+  const api = new FakeStudioApi();
+  const app = buildApp({ api });
+  const ok = await app.request('/api/jobs/j1/host-framing/analyze', { method: 'POST' });
+  assert.equal(ok.status, 200);
+  assert.deepEqual(await ok.json(), jobDetailDto('j1'));
+  assert.deepEqual(api.calls, [{ method: 'analyzeHostFraming', args: ['j1'] }]);
+
+  api.calls = [];
+  api.error = new StudioError('conflict', 'Job must be ready to analyze host framing.');
+  const conflict = await app.request('/api/jobs/j1/host-framing/analyze', { method: 'POST' });
+  assert.equal(conflict.status, 409);
+  assert.deepEqual(await conflict.json(), { error: 'Job must be ready to analyze host framing.', code: 'conflict' });
+  assert.deepEqual(api.calls, [{ method: 'analyzeHostFraming', args: ['j1'] }]);
 });
