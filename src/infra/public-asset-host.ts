@@ -1,18 +1,18 @@
 import { relative } from 'node:path';
 import { AppConfig } from './env.js';
-import { MallaryUploadClient } from './mallary.js';
+import type { MallaryUploadClient } from './mallary.js';
 
 export interface PublicAssetHost {
   readonly name: string;
   hostFile(path: string): Promise<string>;
 }
 
-export function createPublicAssetHost(config: AppConfig): PublicAssetHost | null {
+export function createPublicAssetHost(config: AppConfig, mallaryUploads: MallaryUploadClient | null): PublicAssetHost | null {
   if (config.BUFFER_PUBLIC_MEDIA_BASE_URL) {
     return new BaseUrlPublicAssetHost(config.artifactsDir, config.BUFFER_PUBLIC_MEDIA_BASE_URL);
   }
-  if (config.MALLARY_AI_API_TOKEN) {
-    return new MallaryPublicAssetHost(new MallaryUploadClient(config.MALLARY_AI_API_TOKEN));
+  if (mallaryUploads) {
+    return new MallaryPublicAssetHost(mallaryUploads);
   }
   return null;
 }

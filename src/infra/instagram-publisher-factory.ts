@@ -1,7 +1,7 @@
 import type { AppConfig } from './env.js';
 import { logError, describeError } from './util.js';
 import { BufferClient } from './buffer.js';
-import { MallaryClient } from './mallary.js';
+import { MallaryClient, MallaryUploadClient } from './mallary.js';
 import { createPublicAssetHost } from './public-asset-host.js';
 import type { ShortVideoPlatform } from '../domain/model.js';
 import type { ShortVideoPublishInput, ShortVideoPublishProvider, ShortVideoPublishResult } from './instagram-publisher.js';
@@ -10,11 +10,12 @@ import { ShortVideoPublishError } from './instagram-publisher.js';
 export function createShortVideoPublishProvider(config: AppConfig): ShortVideoPublishProvider | null {
   const providers: ShortVideoPublishProvider[] = [];
   const order = parseProviderOrder(config.SHORTS_PUBLISH_PROVIDERS);
-  const publicAssetHost = createPublicAssetHost(config);
+  const mallaryUploads = config.MALLARY_AI_API_TOKEN ? new MallaryUploadClient(config.MALLARY_AI_API_TOKEN) : null;
+  const publicAssetHost = createPublicAssetHost(config, mallaryUploads);
 
   for (const providerName of order) {
-    if (providerName === 'mallary' && config.MALLARY_AI_API_TOKEN) {
-      providers.push(new MallaryClient(config.MALLARY_AI_API_TOKEN, config.MALLARY_PROFILE_ID));
+    if (providerName === 'mallary' && config.MALLARY_AI_API_TOKEN && mallaryUploads) {
+      providers.push(new MallaryClient(config.MALLARY_AI_API_TOKEN, config.MALLARY_PROFILE_ID, mallaryUploads));
       continue;
     }
     if (providerName === 'buffer' && config.BUFFER_API_KEY && publicAssetHost) {
