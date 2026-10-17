@@ -354,7 +354,7 @@ test('renders through a work dir containing ffmpeg-hostile characters', { timeou
 test('renders frame-accurate audio and video across many crop-split clips', { timeout: 600_000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'render-sync-'));
   const sourcePath = join(dir, 'source.mp4');
-  await generateSource(sourcePath, 36);
+  await generateSource(sourcePath, 40);
   const words: TranscriptWord[] = Array.from({ length: 70 }, (_, index) => ({
     id: `w_${index}`,
     text: `palavra${index}`,
@@ -386,7 +386,7 @@ test('renders frame-accurate audio and video across many crop-split clips', { ti
     words,
     layout: smallLayout,
     title: 'Um titulo de teste para o cartao final do short',
-    source: { width: 640, height: 360, durationSeconds: 36 },
+    source: { width: 640, height: 360, durationSeconds: 40 },
   });
   assert.ok(timeline.clips.length >= 60, `clips ${timeline.clips.length}`);
   assert.ok(timeline.clips.some((clip) => clip.joinsPrevious));
@@ -412,11 +412,13 @@ test('renders frame-accurate audio and video across many crop-split clips', { ti
     '-f', 's16le',
     rawPath,
   ]);
-  const samples = new Int16Array(await readFile(rawPath));
+  const pcm = await readFile(rawPath);
+  const samples = new Int16Array(pcm.buffer.slice(pcm.byteOffset, pcm.byteOffset + pcm.byteLength));
   const mainSamples = Math.floor(timeline.durationSeconds * 48000);
   const maxZeroRun = 48;
   let runStart = -1;
-  for (let index = 4800; index < Math.min(mainSamples, samples.length); index += 1) {
+  const continuityEnd = Math.min(mainSamples + 24000, samples.length);
+  for (let index = 4800; index < continuityEnd; index += 1) {
     if (samples[index] === 0) {
       if (runStart < 0) {
         runStart = index;
@@ -426,4 +428,14 @@ test('renders frame-accurate audio and video across many crop-split clips', { ti
       runStart = -1;
     }
   }
+  const rms = (fromSeconds: number, toSeconds: number): number => {
+    const window = samples.subarray(Math.floor(fromSeconds * 48000), Math.floor(toSeconds * 48000));
+    return Math.sqrt(window.reduce((sum, sample) => sum + sample * sample, 0) / window.length);
+  };
+  const main = timeline.durationSeconds;
+  const body = rms(main - 0.4, main - 0.05);
+  const ducked = rms(main + 0.7, main + 1.2);
+  const tail = rms(main + timeline.endCard!.durationSeconds - 0.08, main + timeline.endCard!.durationSeconds - 0.01);
+  assert.ok(ducked > body * 0.15 && ducked < body * 0.7, `end card audio ${ducked} vs body ${body}`);
+  assert.ok(tail < body * 0.15, `end card tail ${tail} vs body ${body}`);
 });

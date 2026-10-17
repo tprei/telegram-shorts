@@ -1,6 +1,6 @@
 import type { LayoutProfile } from '@domain/layout.js';
-import type { Timeline, TimelineClip } from '@domain/timeline.js';
-import { activeCueAt, outputToSource } from '@domain/timeline.js';
+import type { Timeline, TimelineClip, TimelineEndCard } from '@domain/timeline.js';
+import { activeCueAt, endCardAudioGain, outputToSource } from '@domain/timeline.js';
 import { drawTimelineFrame } from './draw.js';
 
 export interface PreviewEngineOptions {
@@ -23,6 +23,7 @@ export interface PreviewState {
 const NOTIFY_INTERVAL_MS = 100;
 const CUT_MARGIN_SECONDS = 0.01;
 const END_CARD_SEEK_BACK_SECONDS = 0.05;
+const END_CARD_AUDIO_SEEK_TOLERANCE_SECONDS = 0.04;
 
 export class PreviewEngine {
   private readonly canvas: HTMLCanvasElement;
@@ -105,6 +106,7 @@ export class PreviewEngine {
     this.endCardVisible = false;
     this.endCardStartedAt = null;
     this.endCardElapsed = 0;
+    this.stopEndCardAudio();
     for (const video of this.videos) {
       video.playbackRate = timeline.speed;
     }
@@ -125,6 +127,7 @@ export class PreviewEngine {
     if (this.endCardVisible && timeline.endCard !== null && this.endCardElapsed < timeline.endCard.durationSeconds) {
       this.state.playing = true;
       this.endCardStartedAt = performance.now();
+      this.startEndCardAudio(this.endCardElapsed);
       this.notify(true);
       this.startLoop();
       return;
@@ -181,18 +184,19 @@ export class PreviewEngine {
     const target = Math.max(0, outputSeconds);
     if (target >= timeline.durationSeconds && timeline.endCard !== null) {
       this.endCardVisible = true;
+      this.endCardElapsed = 0;
       this.state.outputSeconds = timeline.durationSeconds;
       const last = timeline.clips.at(-1);
       if (last !== undefined) {
         this.clipIndex = last.index;
       }
+      this.activeVideo().pause();
       if (this.state.playing) {
         this.endCardStartedAt = performance.now();
-        for (const video of this.videos) {
-          video.pause();
-        }
+        this.startEndCardAudio(0);
       } else {
         this.endCardStartedAt = null;
+        this.stopEndCardAudio();
       }
       if (this.metadataReady && last !== undefined) {
         this.activeVideo().currentTime = Math.max(last.sourceStart, last.sourceEnd - END_CARD_SEEK_BACK_SECONDS);
@@ -204,6 +208,7 @@ export class PreviewEngine {
     this.endCardVisible = false;
     this.endCardStartedAt = null;
     this.endCardElapsed = 0;
+    this.stopEndCardAudio();
     this.syncTo(target);
     this.drawCurrentFrame();
   }
@@ -380,6 +385,10 @@ export class PreviewEngine {
       }
     }
     if (targetClip === undefined) {
+      const audio = timeline.endCard === null ? null : timeline.endCard.audio;
+      if (audio !== null) {
+        this.standbyVideo().currentTime = audio.sourceStart;
+      }
       return;
     }
     this.standbyVideo().currentTime = targetClip.sourceStart;
@@ -431,6 +440,9 @@ export class PreviewEngine {
       if (timeline.endCard !== null && elapsed >= timeline.endCard.durationSeconds) {
         this.stopAtEnd();
         return;
+      }
+      if (timeline.endCard !== null) {
+        this.updateEndCardAudio(timeline.endCard, elapsed);
       }
       this.notify(false);
       this.rafId = requestAnimationFrame(this.tick);
@@ -532,6 +544,7 @@ export class PreviewEngine {
     this.endCardVisible = true;
     this.endCardElapsed = 0;
     this.endCardStartedAt = performance.now();
+    this.startEndCardAudio(0);
     this.state.outputSeconds = timeline.durationSeconds;
     this.drawCurrentFrame();
     this.notify(true);
@@ -539,12 +552,55 @@ export class PreviewEngine {
 
   private stopAtEnd(): void {
     this.endCardStartedAt = null;
+    if (this.timeline !== null && this.timeline.endCard !== null) {
+      this.endCardElapsed = this.timeline.endCard.durationSeconds;
+    }
     this.state.playing = false;
     for (const video of this.videos) {
       video.pause();
     }
+    this.stopEndCardAudio();
     this.stopLoop();
     this.notify(true);
+  }
+
+  private startEndCardAudio(elapsedSeconds: number): void {
+    const timeline = this.timeline;
+    if (timeline === null || timeline.endCard === null || timeline.endCard.audio === null) {
+      return;
+    }
+    const audio = timeline.endCard.audio;
+    const target = audio.sourceStart + elapsedSeconds * timeline.speed;
+    if (target >= audio.sourceEnd) {
+      return;
+    }
+    const standby = this.standbyVideo();
+    if (Math.abs(standby.currentTime - target) > END_CARD_AUDIO_SEEK_TOLERANCE_SECONDS) {
+      standby.currentTime = target;
+    }
+    standby.playbackRate = timeline.speed;
+    standby.volume = endCardAudioGain(timeline.endCard, elapsedSeconds);
+    standby.muted = false;
+    void this.playElement(standby);
+  }
+
+  private updateEndCardAudio(endCard: TimelineEndCard, elapsedSeconds: number): void {
+    const standby = this.standbyVideo();
+    if (endCard.audio === null || standby.muted) {
+      return;
+    }
+    if (standby.currentTime >= endCard.audio.sourceEnd) {
+      standby.pause();
+      return;
+    }
+    standby.volume = endCardAudioGain(endCard, elapsedSeconds);
+  }
+
+  private stopEndCardAudio(): void {
+    const standby = this.standbyVideo();
+    standby.pause();
+    standby.muted = true;
+    standby.volume = 1;
   }
 
   private drawCurrentFrame(): void {

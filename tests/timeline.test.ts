@@ -8,6 +8,7 @@ import {
   activeCueAt,
   buildTimeline,
   computeSourceClips,
+  endCardAudioGain,
   outputDurationSeconds,
   outputToSource,
   sourceToOutput,
@@ -395,6 +396,7 @@ test('end card carries the full layout and is excluded from durationSeconds', ()
   const words = contiguousWords(['um', 'dois', 'três']);
   const withCard = buildTimeline({ edit: { ...singleRangeEdit(words), endCard: { enabled: true } }, words, layout, title: testTitle, source });
   const withoutCard = buildTimeline({ edit: singleRangeEdit(words), words, layout, title: testTitle, source });
+  const lastClip = withCard.clips.at(-1)!;
   assert.deepEqual(withCard.endCard, {
     durationSeconds: END_CARD_SECONDS,
     darkenFactor: 0.55,
@@ -403,9 +405,48 @@ test('end card carries the full layout and is excluded from durationSeconds', ()
     link: { text: 'Link na descrição', centerX: 540, centerY: 1700, sizePx: 44 },
     textOutlinePx: 2,
     textOutlineColor: '#000000',
+    audio: {
+      sourceStart: lastClip.sourceEnd,
+      sourceEnd: lastClip.sourceEnd + END_CARD_SECONDS * withCard.speed,
+      duckGain: 0.35,
+      duckSeconds: 0.5,
+      fadeOutSeconds: 1,
+    },
   });
   assert.equal(withoutCard.endCard, null);
   assert.equal(withCard.durationSeconds, withoutCard.durationSeconds);
+});
+
+test('end card audio continues the source after the last clip, clamped to the source end', () => {
+  const words = contiguousWords(['um', 'dois', 'três']);
+  const edit = { ...singleRangeEdit(words), endCard: { enabled: true }, speed: 1.2 };
+  const nearEnd = buildTimeline({ edit, words, layout, title: testTitle, source: { ...source, durationSeconds: 2 } });
+  const audio = nearEnd.endCard!.audio!;
+  approx(audio.sourceStart, nearEnd.clips.at(-1)!.sourceEnd);
+  assert.equal(audio.sourceEnd, 2);
+  const atSourceEnd = buildTimeline({ edit: singleRangeEdit(words), words, layout, title: testTitle, source: { ...source, durationSeconds: 1.5 } });
+  const endsAtSource = buildTimeline({ edit: { ...singleRangeEdit(words), endCard: { enabled: true } }, words, layout, title: testTitle, source: { ...source, durationSeconds: 1.5 } });
+  assert.equal(atSourceEnd.clips.at(-1)!.sourceEnd, 1.5);
+  assert.equal(endsAtSource.endCard!.audio, null);
+});
+
+test('end card audio ducks under the card and fades to silence by its end', () => {
+  const words = contiguousWords(['um', 'dois', 'três']);
+  const endCard = buildTimeline({ edit: { ...singleRangeEdit(words), endCard: { enabled: true } }, words, layout, title: testTitle, source }).endCard!;
+  approx(endCardAudioGain(endCard, 0), 1);
+  approx(endCardAudioGain(endCard, 0.25), 1 - 0.65 / 2);
+  approx(endCardAudioGain(endCard, 1), 0.35);
+  approx(endCardAudioGain(endCard, END_CARD_SECONDS - 0.5), 0.35 / 2);
+  approx(endCardAudioGain(endCard, END_CARD_SECONDS), 0);
+  assert.equal(endCardAudioGain({ ...endCard, audio: null }, 1), 0);
+});
+
+test('clip indices stay contiguous when a sub-frame clip is dropped mid-timeline', () => {
+  const words = [word('a', 0, 0.5, 0), word('x', 0.5, 0.6, 1), word('b', 0.6, 0.605, 2), word('y', 0.605, 1.0, 3), word('c', 1.0, 1.5, 4)];
+  const edit: ShortEdit = { ...baseEdit(), ranges: [{ startWord: 0, endWord: 4 }], removedWords: [1, 3] };
+  const timeline = buildTimeline({ edit, words, layout, title: testTitle, source });
+  assert.equal(timeline.clips.length, 2);
+  assert.deepEqual(timeline.clips.map((clip) => clip.index), [0, 1]);
 });
 
 test('clip output lengths snap to whole frames and sub-frame clips are dropped', () => {

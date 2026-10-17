@@ -55,6 +55,14 @@ export interface TimelineEndCardThumbnail {
   widthPx: number;
 }
 
+export interface TimelineEndCardAudio {
+  sourceStart: number;
+  sourceEnd: number;
+  duckGain: number;
+  duckSeconds: number;
+  fadeOutSeconds: number;
+}
+
 export interface TimelineEndCard {
   durationSeconds: number;
   darkenFactor: number;
@@ -63,6 +71,7 @@ export interface TimelineEndCard {
   link: TimelineEndCardLine;
   textOutlinePx: number;
   textOutlineColor: string;
+  audio: TimelineEndCardAudio | null;
 }
 
 export interface Timeline {
@@ -91,6 +100,9 @@ export const END_CARD_TITLE_MAX_LINES = 3;
 export const END_CARD_TEXT_OUTLINE_PX = 2;
 export const END_CARD_TEXT_OUTLINE_COLOR = '#000000';
 export const END_CARD_LINE_HEIGHT_RATIO = 1.12;
+export const END_CARD_AUDIO_DUCK_GAIN = 0.35;
+export const END_CARD_AUDIO_DUCK_SECONDS = 0.5;
+export const END_CARD_AUDIO_FADE_OUT_SECONDS = 1;
 export const CUE_GAP_BREAK_SECONDS = 0.6;
 export const CUE_TAIL_SECONDS = 0.25;
 
@@ -189,7 +201,7 @@ export function buildTimeline(input: {
     }
     const outputEnd = outputStart + frames / fps;
     clips.push({
-      index,
+      index: clips.length,
       sourceStart: clip.sourceStart,
       sourceEnd: clip.sourceStart + (frames / fps) * edit.speed,
       outputStart,
@@ -244,7 +256,7 @@ export function buildTimeline(input: {
     clips,
     cues,
     hook,
-    endCard: edit.endCard.enabled ? buildEndCard(input.title, layout) : null,
+    endCard: edit.endCard.enabled ? buildEndCard(input.title, layout, endCardAudio(clips, edit.speed, source.durationSeconds)) : null,
   };
 }
 
@@ -275,7 +287,33 @@ function fitHook(edit: ShortEdit, layout: LayoutProfile): TimelineHook | null {
   return { lines, canvas, sizePx: chosenSize };
 }
 
-function buildEndCard(title: string, layout: LayoutProfile): TimelineEndCard {
+function endCardAudio(clips: TimelineClip[], speed: number, sourceDurationSeconds: number): TimelineEndCardAudio | null {
+  const lastClip = clips.at(-1);
+  if (lastClip === undefined || lastClip.sourceEnd >= sourceDurationSeconds) {
+    return null;
+  }
+  return {
+    sourceStart: lastClip.sourceEnd,
+    sourceEnd: Math.min(sourceDurationSeconds, lastClip.sourceEnd + END_CARD_SECONDS * speed),
+    duckGain: END_CARD_AUDIO_DUCK_GAIN,
+    duckSeconds: END_CARD_AUDIO_DUCK_SECONDS,
+    fadeOutSeconds: END_CARD_AUDIO_FADE_OUT_SECONDS,
+  };
+}
+
+export function endCardAudioGain(endCard: TimelineEndCard, elapsedSeconds: number): number {
+  const audio = endCard.audio;
+  if (audio === null) {
+    return 0;
+  }
+  const t = Math.min(Math.max(0, elapsedSeconds), endCard.durationSeconds);
+  const duck = t < audio.duckSeconds ? 1 - ((1 - audio.duckGain) * t) / audio.duckSeconds : audio.duckGain;
+  const fadeStart = endCard.durationSeconds - audio.fadeOutSeconds;
+  const fade = t > fadeStart ? (endCard.durationSeconds - t) / audio.fadeOutSeconds : 1;
+  return duck * fade;
+}
+
+function buildEndCard(title: string, layout: LayoutProfile, audio: TimelineEndCardAudio | null): TimelineEndCard {
   const width = layout.canvas.width;
   const titleSizePx = layout.hookBand?.sizePx ?? layout.captions.sizePx;
   const titleWords = title.replace(/\s+/g, ' ').trim().split(' ').filter((word) => word.length > 0);
@@ -305,6 +343,7 @@ function buildEndCard(title: string, layout: LayoutProfile): TimelineEndCard {
     },
     textOutlinePx: END_CARD_TEXT_OUTLINE_PX,
     textOutlineColor: END_CARD_TEXT_OUTLINE_COLOR,
+    audio,
   };
 }
 

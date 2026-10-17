@@ -43,9 +43,11 @@ export async function renderShortExport(input: ExportRenderInput): Promise<Expor
   const chunkPaths: string[] = [];
   for (const [index, clips] of chunks.entries()) {
     const chunkPath = join(input.workDir, `chunk_${index}.mkv`);
+    const isLastChunk = index === chunks.length - 1;
     await renderChunk({
       clips,
       nextClip: timeline.clips[clips[clips.length - 1]!.index + 1] ?? null,
+      continuesIntoEndCard: isLastChunk && timeline.endCard?.audio != null,
       sourceVideoPath: input.sourceVideoPath,
       outputPath: chunkPath,
       fps,
@@ -61,6 +63,7 @@ export async function renderShortExport(input: ExportRenderInput): Promise<Expor
     endCardPath = await renderEndCardMkv({
       endCard: timeline.endCard,
       lastClipEnd: timeline.clips[timeline.clips.length - 1]!.sourceEnd,
+      speed,
       sourceVideoPath: input.sourceVideoPath,
       workDir: input.workDir,
       fontsDir: input.fontsDir,
@@ -82,6 +85,7 @@ export async function renderShortExport(input: ExportRenderInput): Promise<Expor
 async function renderChunk(input: {
   clips: TimelineClip[];
   nextClip: TimelineClip | null;
+  continuesIntoEndCard: boolean;
   sourceVideoPath: string;
   outputPath: string;
   fps: number;
@@ -115,6 +119,7 @@ async function renderChunk(input: {
 function buildChunkFilterGraph(input: {
   clips: TimelineClip[];
   nextClip: TimelineClip | null;
+  continuesIntoEndCard: boolean;
   fps: number;
   width: number;
   height: number;
@@ -156,7 +161,8 @@ function buildChunkFilterGraph(input: {
       audioChain.push(`afade=t=in:st=0:d=${num(fadeLength)}`);
     }
     const nextClip = index + 1 < clipCount ? input.clips[index + 1]! : input.nextClip;
-    if (nextClip === null || !nextClip.joinsPrevious) {
+    const continuesSeamlessly = nextClip === null ? input.continuesIntoEndCard : nextClip.joinsPrevious;
+    if (!continuesSeamlessly) {
       audioChain.push(`afade=t=out:st=${num(Math.max(0, outputDuration - fadeLength))}:d=${num(fadeLength)}`);
     }
     audioChain.push('apad', `atrim=end_sample=${audioSamples}`);
@@ -170,6 +176,7 @@ function buildChunkFilterGraph(input: {
 async function renderEndCardMkv(input: {
   endCard: TimelineEndCard;
   lastClipEnd: number;
+  speed: number;
   sourceVideoPath: string;
   workDir: string;
   fontsDir: string;
@@ -201,6 +208,12 @@ async function renderEndCardMkv(input: {
     ? `[0:v]${background}[bg];[1:v]scale=${thumbnailWidth}:-2[thumb];[bg][thumb]overlay=x=(W-w)/2:y=${thumbnailCenterY}-h/2[card];[card]${assArg}[vout]`
     : `[0:v]${background}[bg];[bg]${assArg}[vout]`;
   const duration = num(input.endCard.durationSeconds);
+  const audio = input.endCard.audio;
+  const audioInputIndex = hasThumbnail ? 2 : 1;
+  const audioSamples = Math.round(input.endCard.durationSeconds * AUDIO_SAMPLE_RATE);
+  const audioGraph = audio === null
+    ? ''
+    : `;[${audioInputIndex}:a:0]asetpts=PTS-STARTPTS,aresample=${AUDIO_SAMPLE_RATE}${input.speed !== 1 ? `,atempo=${num(input.speed)}` : ''},volume='${endCardVolumeExpression(input.endCard)}':eval=frame,apad,atrim=end_sample=${audioSamples}[aout]`;
   const args: string[] = [
     '-y',
     '-loop', '1', '-t', duration, '-framerate', String(input.fps), '-i', backgroundPath,
@@ -208,11 +221,15 @@ async function renderEndCardMkv(input: {
   if (hasThumbnail) {
     args.push('-loop', '1', '-t', duration, '-framerate', String(input.fps), '-i', input.thumbnailPath!);
   }
+  if (audio === null) {
+    args.push('-f', 'lavfi', '-t', duration, '-i', `anullsrc=r=${AUDIO_SAMPLE_RATE}:cl=stereo`);
+  } else {
+    args.push('-ss', num(audio.sourceStart), '-t', num(audio.sourceEnd - audio.sourceStart), '-i', input.sourceVideoPath);
+  }
   args.push(
-    '-f', 'lavfi', '-t', duration, '-i', `anullsrc=r=${AUDIO_SAMPLE_RATE}:cl=stereo`,
-    '-filter_complex', graph,
+    '-filter_complex', `${graph}${audioGraph}`,
     '-map', '[vout]',
-    '-map', `${hasThumbnail ? 2 : 1}:a`,
+    '-map', audio === null ? `${audioInputIndex}:a` : '[aout]',
     '-c:v', 'libx264',
     '-preset', 'veryfast',
     '-crf', '14',
@@ -338,6 +355,14 @@ async function probeDurationSeconds(path: string): Promise<number> {
     path,
   ]);
   return Number(stdout.trim());
+}
+
+function endCardVolumeExpression(endCard: TimelineEndCard): string {
+  const audio = endCard.audio!;
+  const duck = `if(lt(t,${num(audio.duckSeconds)}),1-${num(1 - audio.duckGain)}*t/${num(audio.duckSeconds)},${num(audio.duckGain)})`;
+  const fadeStart = num(endCard.durationSeconds - audio.fadeOutSeconds);
+  const fade = `if(gt(t,${fadeStart}),max(0,(${num(endCard.durationSeconds)}-t)/${num(audio.fadeOutSeconds)}),1)`;
+  return `${duck}*${fade}`;
 }
 
 function num(value: number): string {
