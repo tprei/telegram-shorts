@@ -430,8 +430,7 @@ export function EditorInspector(props: EditorInspectorProps) {
             </section>
           </>
         )}
-        {tab === 'publish' && (
-          <>
+        <div hidden={tab !== 'publish'}>
             <section className="inspector-section">
               <p className="eyebrow">READY WHEN YOU ARE</p>
               <div className="field-line">
@@ -562,8 +561,7 @@ export function EditorInspector(props: EditorInspectorProps) {
               onSelectedPlatformsChange={onSelectedPlatformsChange}
               onPublish={onPublish}
             />
-          </>
-        )}
+        </div>
         <ApiError message={error} />
       </div>
     </aside>

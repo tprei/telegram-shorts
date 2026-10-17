@@ -133,7 +133,7 @@ function ShortEditorSurface({ detail, transcript, refetchShort }: ShortEditorSur
   const exportShortMutation = useExportShortMutation(detail.short.id);
   const generateCopyMutation = useGeneratePublishCopyMutation(detail.short.id);
   const updatePublishCopyMutation = useUpdatePublishCopyMutation(detail.short.id);
-  const publishMutation = usePublishMutation();
+  const publishMutation = usePublishMutation(detail.short.id);
   const correctWordMutation = useCorrectWordMutation(detail.job.id, detail.short.id);
 
   const transcriptWords = useMemo<TranscriptWord[]>(

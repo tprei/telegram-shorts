@@ -1,4 +1,4 @@
-import { useRef, useState, type Ref } from 'react';
+import { useEffect, useRef, useState, type Ref } from 'react';
 import { Link } from 'react-router';
 import type { TranscriptDto } from '@api';
 import type { WordRange } from '@domain/edit';
@@ -77,15 +77,40 @@ export function ShortEditorView(props: ShortEditorViewProps) {
   } = props;
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>(props.initialTab ?? 'edit');
   const inspectorRegion = useRef<HTMLDivElement>(null);
+  const shell = useRef<HTMLDivElement>(null);
+  const [workspace, setWorkspace] = useState<'transcript' | 'inspector'>(
+    props.initialTab ? 'inspector' : 'transcript',
+  );
+  const [compact, setCompact] = useState(() => window.matchMedia('(max-width: 1120px)').matches);
+  useEffect(() => {
+    const media = window.matchMedia('(max-width: 1120px)');
+    const updateCompact = () => setCompact(media.matches);
+    const viewport = window.visualViewport;
+    const resize = () => {
+      if (!viewport || viewport.scale !== 1) return;
+      shell.current?.style.setProperty('--editor-viewport-height', `${viewport.height}px`);
+      shell.current?.style.setProperty('--editor-viewport-top', `${viewport.offsetTop}px`);
+    };
+    resize();
+    media.addEventListener('change', updateCompact);
+    viewport?.addEventListener('resize', resize);
+    viewport?.addEventListener('scroll', resize);
+    return () => {
+      media.removeEventListener('change', updateCompact);
+      viewport?.removeEventListener('resize', resize);
+      viewport?.removeEventListener('scroll', resize);
+    };
+  }, []);
   const currentExport = newestExport(detail.exports, detail.short.editRevision);
   function showExport() {
     setInspectorTab('publish');
+    setWorkspace('inspector');
     requestAnimationFrame(() => {
       const region = inspectorRegion.current;
       if (!region) return;
       region.querySelector('.inspector-scroll')?.scrollTo({ top: 0 });
-      if (window.matchMedia('(max-width: 1000px)').matches) {
-        region.scrollIntoView({ block: 'start', behavior: 'instant' });
+      if (window.matchMedia('(max-width: 1120px)').matches) {
+        document.getElementById('workspace-tab-inspector')?.focus({ preventScroll: true });
       }
     });
   }
@@ -97,7 +122,7 @@ export function ShortEditorView(props: ShortEditorViewProps) {
     (item) => item.status === 'queued' || item.status === 'rendering',
   );
   return (
-    <div className="editor-shell">
+    <div className="editor-shell" ref={shell}>
       <header className="editor-topbar">
         <Link
           className="editor-back"
@@ -149,7 +174,7 @@ export function ShortEditorView(props: ShortEditorViewProps) {
           </Button>
         </div>
       </header>
-      <main className="editor-grid">
+      <main className="editor-grid" data-workspace={workspace}>
         <PreviewPanel
           canvasRef={canvasRef}
           timeline={timeline}
@@ -162,7 +187,36 @@ export function ShortEditorView(props: ShortEditorViewProps) {
           onTogglePlayback={onTogglePlayback}
           onSeek={onSeek}
         />
-        <section className="transcript-column" aria-labelledby="transcript-title">
+        <div className="editor-workspace-tabs" role="tablist" aria-label="Editor workspace">
+          {(['transcript', 'inspector'] as const).map((name, index, names) => (
+            <button
+              key={name}
+              type="button"
+              role="tab"
+              id={`workspace-tab-${name}`}
+              aria-controls={`workspace-panel-${name}`}
+              aria-selected={workspace === name}
+              tabIndex={workspace === name ? 0 : -1}
+              onClick={() => setWorkspace(name)}
+              onKeyDown={(event) => {
+                if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+                event.preventDefault();
+                const next = event.key === 'Home' ? names[0]
+                  : event.key === 'End' ? names[1] : names[1 - index]!;
+                setWorkspace(next);
+                document.getElementById(`workspace-tab-${next}`)?.focus({ preventScroll: true });
+              }}
+            >
+              {name === 'transcript' ? 'Transcript' : 'Inspector'}
+            </button>
+          ))}
+        </div>
+        <section
+          className="transcript-column"
+          id="workspace-panel-transcript"
+          role={compact ? 'tabpanel' : 'region'}
+          aria-labelledby={compact ? 'workspace-tab-transcript' : 'transcript-title'}
+        >
           <div className="column-heading">
             <h2 id="transcript-title">Transcript</h2>
             <div className="transcript-legend">
@@ -189,7 +243,14 @@ export function ShortEditorView(props: ShortEditorViewProps) {
             correctingWordIndex={correctingWordIndex}
           />
         </section>
-        <div className="editor-inspector-region" ref={inspectorRegion}>
+        <div
+          className="editor-inspector-region"
+          ref={inspectorRegion}
+          id="workspace-panel-inspector"
+          role={compact ? 'tabpanel' : 'region'}
+          aria-labelledby={compact ? 'workspace-tab-inspector' : undefined}
+          aria-label={compact ? undefined : 'Inspector'}
+        >
           <EditorInspector
             {...props}
             tab={inspectorTab}

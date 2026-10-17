@@ -102,6 +102,14 @@ function selectionReason(attempts: readonly PublicationDto[], latestExportId: st
   return null;
 }
 
+interface PublishBatch {
+  platforms: ShortVideoPlatform[];
+  exportId: string;
+  previousIds: string[];
+  selectionKey: string;
+  request: 'starting' | 'pending' | 'finished';
+}
+
 interface PublicationOutcomeProps {
   publication: PublicationDto;
   exportItem: ExportDto | undefined;
@@ -118,7 +126,7 @@ function PublicationOutcome({ publication, exportItem, historical = false }: Pub
         <span className="publish-outcome-mark" aria-hidden="true">
           {publication.status === 'published' ? <Icon name="check" size={15} />
             : publication.status === 'failed' || publication.status === 'unconfirmed' ? <Icon name="alert" size={15} />
-              : <span />}
+              : <span className="spinner" />}
         </span>
         <p>{statusLabel(publication)}</p>
       </div>
@@ -155,6 +163,55 @@ export function PublishPanel({
 }: PublishPanelProps) {
   const id = useId();
   const confirmationTitle = useRef<HTMLHeadingElement>(null);
+  const feedbackRegion = useRef<HTMLDivElement>(null);
+  const actionLock = useRef(false);
+  const selectionKey = [...selectedPlatforms].sort().join(',');
+  const [batch, setBatch] = useState<PublishBatch | null>(() => {
+    const active = publications.filter((item, index) => IN_FLIGHT_STATUSES[item.status]
+      && publications.findIndex((other) => other.platform === item.platform) === index);
+    const exportId = active[0]?.exportId;
+    if (!exportId) return null;
+    const targets = active.filter((item) => item.exportId === exportId);
+    return {
+      platforms: targets.map((item) => item.platform),
+      exportId,
+      previousIds: publications.filter((item) => !targets.includes(item)).map((item) => item.id),
+      selectionKey,
+      request: publishPending ? 'pending' : 'finished',
+    };
+  });
+  const batchAttempts = batch?.platforms.map((platform) => ({
+    platform,
+    publication: publications.find((item) => item.platform === platform
+      && item.exportId === batch.exportId
+      && !batch.previousIds.includes(item.id)),
+  })) ?? [];
+  const batchInFlight = Boolean(batch && (batch.request !== 'finished'
+    || batchAttempts.some(({ publication }) => publication && IN_FLIGHT_STATUSES[publication.status])));
+  const showBatch = batch && (batchInFlight || batch.selectionKey === selectionKey);
+  const ongoingAttempts = publications.filter((item, index) => IN_FLIGHT_STATUSES[item.status]
+    && publications.findIndex((other) => other.platform === item.platform) === index);
+  const feedbackAttempts = showBatch ? batchAttempts
+    : ongoingAttempts.map((publication) => ({ platform: publication.platform, publication }));
+  const feedbackTargets = feedbackAttempts.length > 0
+    ? feedbackAttempts.map(({ platform }) => platform)
+    : publishPending ? [...selectedPlatforms] : [];
+  const feedbackPending = publishPending || batchInFlight || ongoingAttempts.length > 0;
+  const liveTargets = feedbackAttempts.filter(({ publication }) => publication?.status === 'published')
+    .map(({ platform }) => platform);
+  const failedTargets = feedbackAttempts.filter(({ publication }) => publication?.status === 'failed'
+    || (!publication && batch?.request === 'finished')).map(({ platform }) => platform);
+  const unconfirmedTargets = feedbackAttempts.filter(({ publication }) => publication?.status === 'unconfirmed')
+    .map(({ platform }) => platform);
+  const formatPlatforms = (targets: readonly ShortVideoPlatform[]) =>
+    destinationList.format(targets.map((platform) => platformNames[platform]));
+  const feedbackTitle = feedbackPending
+    ? `Publishing to ${formatPlatforms(feedbackTargets)}…`
+    : [
+      liveTargets.length > 0 ? `Live on ${formatPlatforms(liveTargets)}` : '',
+      failedTargets.length > 0 ? `Failed on ${formatPlatforms(failedTargets)}` : '',
+      unconfirmedTargets.length > 0 ? `Not confirmed on ${formatPlatforms(unconfirmedTargets)}` : '',
+    ].filter(Boolean).join(' · ');
   const [forceDraft, setForceDraft] = useState<{
     exportId: string;
     platforms: ShortVideoPlatform[];
@@ -166,11 +223,13 @@ export function PublishPanel({
   const groups = destinations.map((platform) => {
     const availability = platforms.find((item) => item.platform === platform);
     const attempts = publications.filter((item) => item.platform === platform);
-    const reason = !availability?.available
-      ? availability?.reason || 'No publishing provider connected.'
-      : !latestReadyExport
-        ? 'Export a video before selecting this platform.'
-        : selectionReason(attempts, latestReadyExport.id);
+    const reason = feedbackPending && feedbackTargets.includes(platform)
+      ? 'Publishing is in progress. This destination cannot be posted to again yet.'
+      : !availability?.available
+        ? availability?.reason || 'No publishing provider connected.'
+        : !latestReadyExport
+          ? 'Export a video before selecting this platform.'
+          : selectionReason(attempts, latestReadyExport.id);
     return { platform, attempts, reason, available: Boolean(availability?.available) };
   });
   const selected = groups
@@ -185,8 +244,8 @@ export function PublishPanel({
   const forceTargets = forceOpen
     ? repostable.filter((platform) => forceDraft.platforms.includes(platform))
     : [];
-  const canPublish = Boolean(latestReadyExport && copyReady && selected.length > 0 && !publishPending);
-  const canRepost = Boolean(latestReadyExport && copyReady && repostable.length > 0 && !publishPending);
+  const canPublish = Boolean(latestReadyExport && copyReady && selected.length > 0 && !feedbackPending);
+  const canRepost = Boolean(latestReadyExport && copyReady && repostable.length > 0 && !feedbackPending);
   const publishHelp = !latestReadyExport
     ? 'Export a video before publishing.'
     : !copyReady
@@ -201,6 +260,40 @@ export function PublishPanel({
     heading?.focus({ preventScroll: true });
     heading?.closest('.publish-force-confirmation')?.scrollIntoView({ block: 'nearest', behavior: 'instant' });
   }, [forceOpen]);
+
+  useEffect(() => {
+    setBatch((current) => {
+      if (!current || current.request === 'finished') return current;
+      if (publishPending && current.request === 'starting') return { ...current, request: 'pending' };
+      if (!publishPending && current.request === 'pending') return { ...current, request: 'finished' };
+      return current;
+    });
+  }, [publishPending]);
+
+  useEffect(() => {
+    if (!feedbackPending) actionLock.current = false;
+  }, [feedbackPending]);
+
+  useEffect(() => {
+    if (batch) feedbackRegion.current?.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+  }, [batch]);
+
+  useEffect(() => {
+    if (batch && !batchInFlight && batch.selectionKey !== selectionKey) setBatch(null);
+  }, [batch, batchInFlight, selectionKey]);
+
+  function startPublish(force: boolean, targets: ShortVideoPlatform[]) {
+    if (!latestReadyExport || targets.length === 0 || feedbackPending || actionLock.current) return;
+    actionLock.current = true;
+    setBatch({
+      platforms: [...targets],
+      exportId: latestReadyExport.id,
+      previousIds: publications.map((item) => item.id),
+      selectionKey,
+      request: 'starting',
+    });
+    onPublish(force, targets);
+  }
 
   function closeConfirmation() {
     setForceDraft(null);
@@ -221,13 +314,15 @@ export function PublishPanel({
           const earlier = attempts.slice(1);
           const failedCount = earlier.filter((item) => item.status === 'failed').length;
           const disabled = Boolean(reason || publishPending);
-          const describedBy = reason || publishPending ? `${id}-${platform}-reason` : undefined;
+          const isTargetPending = feedbackPending && feedbackTargets.includes(platform);
+          const describedBy = isTargetPending ? `${id}-publish-feedback`
+            : reason || publishPending ? `${id}-${platform}-reason` : undefined;
           return (
             <article className="publish-platform" key={platform} aria-labelledby={`${id}-${platform}-name`}>
               <label className={`publish-platform-choice${disabled ? ' is-disabled' : ''}`}>
                 <input
                   type="checkbox"
-                  checked={!reason && selected.includes(platform)}
+                  checked={selectedPlatforms.includes(platform)}
                   disabled={disabled}
                   aria-describedby={describedBy}
                   onChange={(event) => onSelectedPlatformsChange(
@@ -246,7 +341,7 @@ export function PublishPanel({
                     />
                   ) : <p className="publish-no-attempt">No publishing attempts yet.</p>}
                 </div>
-                {(reason || publishPending) && (
+                {!isTargetPending && (reason || publishPending) && (
                   <p className="publish-selection-reason" id={describedBy}>
                     {reason || 'A publishing request is in progress.'}
                   </p>
@@ -279,17 +374,51 @@ export function PublishPanel({
           Connect a publishing provider to see available platforms.
         </EmptyState>
       )}
-      <div className="publish-actions">
-        <p className="publish-action-help" id={`${id}-publish-help`}>{publishHelp}</p>
+      <div className="publish-actions" ref={feedbackRegion}>
+        <div className="publish-feedback" id={`${id}-publish-feedback`} aria-live="polite" aria-atomic="true">
+          {feedbackTargets.length > 0 && (
+            <div className={`publish-feedback-card${feedbackPending ? ' is-pending' : failedTargets.length > 0 || unconfirmedTargets.length > 0 ? ' has-warning' : ' is-live'}`}>
+              <div className="publish-feedback-heading">
+                {feedbackPending ? <span className="spinner" aria-hidden="true" />
+                  : <Icon name={failedTargets.length > 0 || unconfirmedTargets.length > 0 ? 'alert' : 'check'} size={17} />}
+                <strong>{feedbackTitle}</strong>
+              </div>
+              <ul className="publish-feedback-platforms">
+                {feedbackTargets.map((platform) => {
+                  const publication = feedbackAttempts.find((item) => item.platform === platform)?.publication;
+                  const pending = !publication && feedbackPending;
+                  return (
+                    <li key={platform}>
+                      <span className="publish-feedback-platform-name">{platformNames[platform]}</span>
+                      <span className={`publish-feedback-platform-state${publication ? ` publish-outcome--${publication.status}` : ''}`}>
+                        {(pending || (publication && IN_FLIGHT_STATUSES[publication.status])) && <span className="spinner" aria-hidden="true" />}
+                        {publication?.status === 'published' && publication.url ? (
+                          <a href={publication.url} target="_blank" rel="noopener noreferrer">
+                            Live · View post <Icon name="external" size={12} />
+                          </a>
+                        ) : publication ? statusLabel(publication) : pending
+                          ? 'Starting publish request…'
+                          : 'Request did not complete. Check the error below before trying again.'}
+                      </span>
+                    </li>
+                  );
+                })}
+              </ul>
+              {feedbackPending && <p>Uploads can take a few minutes. It’s safe to leave this page — publishing continues on the server.</p>}
+              {!feedbackPending && unconfirmedTargets.length > 0 && <p>Check the platform before reposting to avoid duplicates.</p>}
+            </div>
+          )}
+        </div>
+        {!feedbackPending && (feedbackTargets.length === 0 || selected.length > 0) && <p className="publish-action-help" id={`${id}-publish-help`}>{publishHelp}</p>}
         <Button
           variant="primary"
           className="full-width"
-          pending={publishPending}
+          pending={feedbackPending}
           disabled={!canPublish}
-          aria-describedby={`${id}-publish-help`}
-          onClick={() => onPublish(false, selected)}
+          aria-describedby={feedbackTargets.length > 0 ? `${id}-publish-feedback` : `${id}-publish-help`}
+          onClick={() => startPublish(false, selected)}
         >
-          {publishPending ? 'Sending publish request…' : selected.length > 0
+          {feedbackPending ? 'Publishing in progress…' : selected.length > 0
             ? `Publish to ${selected.length} ${selected.length === 1 ? 'platform' : 'platforms'}`
             : 'Publish selected platforms'}
         </Button>
@@ -334,7 +463,7 @@ export function PublishPanel({
           <p id={`${id}-force-description`}>
             This creates new posts. The existing posts stay up, so your audience may see duplicates.
           </p>
-          <fieldset className="publish-force-targets" disabled={publishPending}>
+          <fieldset className="publish-force-targets" disabled={feedbackPending}>
             <legend>Platforms with a live or unconfirmed post</legend>
             {repostable.map((platform) => (
               <label key={platform}>
@@ -359,7 +488,7 @@ export function PublishPanel({
               disabled={!canRepost || forceTargets.length === 0}
               pending={publishPending}
               onClick={() => {
-                onPublish(true, forceTargets);
+                startPublish(true, forceTargets);
                 setForceDraft(null);
               }}
             >

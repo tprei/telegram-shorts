@@ -191,12 +191,23 @@ export function useSuggestHooksMutation(shortId: string) {
   });
 }
 
-export function usePublishMutation() {
+export function usePublishMutation(shortId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (input: { exportId: string; request: PublishRequest }) =>
       api.publish(input.exportId, input.request),
-    onSuccess: () => {
+    onSuccess: (publications) => {
+      queryClient.setQueryData<ShortDetailDto>(queryKeys.short(shortId), (detail) => {
+        if (detail === undefined) {
+          return detail;
+        }
+        const returnedIds = new Set(publications.map((publication) => publication.id));
+        return {
+          ...detail,
+          publications: [...publications, ...detail.publications.filter((publication) => !returnedIds.has(publication.id))],
+        };
+      });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.short(shortId) });
       void queryClient.invalidateQueries({ queryKey: queryKeys.jobs });
     },
   });

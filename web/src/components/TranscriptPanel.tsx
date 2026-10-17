@@ -291,11 +291,11 @@ export function TranscriptPanel({
     onCorrectWord?.(index, text);
     cancelCorrection(index);
   }, [onCorrectWord, cancelCorrection]);
-  function clearHold() {
-    if (holdTimer.current !== null) clearTimeout(holdTimer.current);
+  const clearHold = useCallback(() => {
+    clearTimeout(holdTimer.current ?? undefined);
     holdTimer.current = null;
-  }
-  useEffect(() => clearHold, []);
+  }, []);
+  useEffect(() => clearHold, [clearHold]);
   function beginCorrection(index: number) {
     if (picker || !onCorrectWord || correctingWordIndex !== null) return;
     if (editingWordIndex !== null) {
@@ -343,6 +343,7 @@ export function TranscriptPanel({
   const initialWord = ranges[0]?.startWord;
   useEffect(() => {
     const container = root.current;
+    if (!container || transcript.words.length === 0) return;
     const word =
       initialWord !== undefined
         ? container?.querySelector<HTMLElement>(`[data-word="${initialWord}"]`)
@@ -559,6 +560,8 @@ export function TranscriptPanel({
       <div
         ref={root}
         className="transcript-scroll"
+        role="region"
+        aria-label={picker ? 'Transcript range selection' : 'Transcript words'}
         onPointerDown={pointerDown}
         onPointerMove={pointerMove}
         onContextMenu={(event) => {
