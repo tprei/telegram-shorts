@@ -1,13 +1,15 @@
-import { AppConfig } from './env.js';
+import type { AppConfig } from './env.js';
 import { logError, describeError } from './util.js';
 import { BufferClient } from './buffer.js';
 import { MallaryClient } from './mallary.js';
 import { createPublicAssetHost } from './public-asset-host.js';
-import { ShortVideoPublishError, ShortVideoPlatform, ShortVideoPublishInput, ShortVideoPublishProvider, ShortVideoPublishResult } from './instagram-publisher.js';
+import type { ShortVideoPlatform } from '../domain/model.js';
+import type { ShortVideoPublishInput, ShortVideoPublishProvider, ShortVideoPublishResult } from './instagram-publisher.js';
+import { ShortVideoPublishError } from './instagram-publisher.js';
 
-export function createInstagramPublishProvider(config: AppConfig): ShortVideoPublishProvider | null {
+export function createShortVideoPublishProvider(config: AppConfig): ShortVideoPublishProvider | null {
   const providers: ShortVideoPublishProvider[] = [];
-  const order = parseProviderOrder(config.TELEGRAM_SHORTS_INSTAGRAM_PUBLISH_PROVIDERS);
+  const order = parseProviderOrder(config.SHORTS_PUBLISH_PROVIDERS);
   const publicAssetHost = createPublicAssetHost(config);
 
   for (const providerName of order) {

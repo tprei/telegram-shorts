@@ -1,4 +1,4 @@
-export type ShortVideoPlatform = 'instagram' | 'tiktok' | 'youtube_shorts';
+import type { ShortVideoPlatform } from '../domain/model.js';
 
 export interface ShortVideoPublishInput {
   platform: ShortVideoPlatform;

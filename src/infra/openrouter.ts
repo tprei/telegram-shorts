@@ -1,6 +1,22 @@
-import { AppConfig } from './env.js';
-import { Candidate, InstagramReelCopy, InstagramReelCopySchema, OpportunityPlanResponse, OpportunityPlanResponseSchema, PlannedCandidateResponse, PlannedCandidateResponseSchema, RevisionIntent, RevisionIntentSchema, SemanticBlockKind, SemanticBlockResponseSet, SemanticBlockResponseSetSchema, TranscriptSentence, TranscriptSpanLocate, TranscriptSpanLocateSchema } from '../domain/model.js';
+import type { AppConfig, ReasoningEffort } from './env.js';
+import { HookSuggestionsResponse, HookSuggestionsResponseSchema, OpportunityPlanResponse, OpportunityPlanResponseSchema, PlannedCandidateResponse, PlannedCandidateResponseSchema, PublishCopyResponse, PublishCopyResponseSchema, RevisionIntent, RevisionIntentSchema, SemanticBlockKind, SemanticBlockResponseSet, SemanticBlockResponseSetSchema, TranscriptSentence, TranscriptSpanLocate, TranscriptSpanLocateSchema } from '../domain/model.js';
 import { logError } from './util.js';
+
+type ImageInput = { mimeType: 'image/jpeg' | 'image/png'; base64: string };
+type ResponseFormat = { name: string; schema: Record<string, unknown> };
+type ChatPart = { type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } };
+type ReasoningOptions = { effort: ReasoningEffort; maxTokens: number };
+type PlannerBlock = { id: string; kind: SemanticBlockKind; summary: string; start_seconds: number; end_seconds: number; text: string };
+
+const EDITORIAL_TEMPERATURE = 0.2;
+const HOOK_TEXT_RULE = 'hook_text: manchete curta para a faixa no topo do short (ideal até 45 caracteres, máx. 90), provocativa, específica, sem clickbait vazio, em PT-BR.';
+const FIRST_BLOCK_RULE = 'O primeiro bloco precisa prender nos primeiros 3 segundos sem depender de contexto anterior.';
+const DURATION_RULE = 'Duração ideal de 40 a 75 segundos somando os blocos escolhidos (use start_seconds e end_seconds); passe de 90 segundos só quando o argumento realmente exigir; nunca menos de 30 nem mais de 180.';
+const JSON_REPAIR_SYSTEM = [
+  'Você corrige JSON malformado produzido por outro modelo.',
+  'Preserve a estrutura e os valores pretendidos o máximo possível.',
+  'Não explique nada. Retorne apenas um único objeto JSON válido.',
+].join(' ');
 
 const BLOCK_KINDS: SemanticBlockKind[] = ['hook', 'setup', 'turn', 'explain', 'evidence', 'payoff'];
 const JSON_SCHEMA_BLOCK_KIND = { type: 'string', enum: BLOCK_KINDS, description: 'Semantic block kind.' };
@@ -23,6 +39,7 @@ const JSON_SCHEMA_CANDIDATE = {
     title: { type: 'string', minLength: 1 },
     summary: { type: 'string', minLength: 1 },
     hook: { type: 'string', minLength: 1 },
+    hook_text: { type: 'string', minLength: 1, maxLength: 90 },
     payoff: { type: 'string', minLength: 1 },
     rationale: { type: 'string', minLength: 1 },
     thesis: { type: 'string', minLength: 1 },
@@ -30,7 +47,7 @@ const JSON_SCHEMA_CANDIDATE = {
     block_ids: { type: 'array', minItems: 2, items: { type: 'string', minLength: 1 } },
     steps: { type: 'array', minItems: 2, items: JSON_SCHEMA_STEP },
   },
-  required: ['title', 'summary', 'hook', 'payoff', 'rationale', 'thesis', 'risk', 'block_ids', 'steps'],
+  required: ['title', 'summary', 'hook', 'hook_text', 'payoff', 'rationale', 'thesis', 'risk', 'block_ids', 'steps'],
 };
 const JSON_SCHEMA_OPPORTUNITY = {
   ...JSON_SCHEMA_CANDIDATE,
@@ -105,16 +122,16 @@ const STRUCTURED_OUTPUT_SCHEMAS = {
           items: {
             anyOf: [
               { type: 'object', additionalProperties: false, properties: { kind: { const: 'retitle' }, title: { type: 'string', minLength: 1 } }, required: ['kind', 'title'] },
-              { type: 'object', additionalProperties: false, properties: { kind: { const: 'caption_cleanup' } }, required: ['kind'] },
+              { type: 'object', additionalProperties: false, properties: { kind: { const: 'set_hook' }, text: { type: 'string', minLength: 1, maxLength: 90 } }, required: ['kind', 'text'] },
               { type: 'object', additionalProperties: false, properties: { kind: { const: 'trim_start' }, seconds: { type: 'number', exclusiveMinimum: 0 } }, required: ['kind', 'seconds'] },
               { type: 'object', additionalProperties: false, properties: { kind: { const: 'trim_end' }, seconds: { type: 'number', exclusiveMinimum: 0 } }, required: ['kind', 'seconds'] },
               { type: 'object', additionalProperties: false, properties: { kind: { const: 'extend_start' }, seconds: { type: 'number', exclusiveMinimum: 0 } }, required: ['kind', 'seconds'] },
               { type: 'object', additionalProperties: false, properties: { kind: { const: 'extend_end' }, seconds: { type: 'number', exclusiveMinimum: 0 } }, required: ['kind', 'seconds'] },
               { type: 'object', additionalProperties: false, properties: { kind: { const: 'insert_span' }, query: { type: 'string', minLength: 1 } }, required: ['kind', 'query'] },
-              { type: 'object', additionalProperties: false, properties: { kind: { const: 'reorder_candidate' }, rank: { type: 'integer', minimum: 1, maximum: 5 } }, required: ['kind', 'rank'] },
-              { type: 'object', additionalProperties: false, properties: { kind: { const: 'set_speed' }, speed: { type: 'number', exclusiveMinimum: 0, maximum: 1.5 } }, required: ['kind', 'speed'] },
-              { type: 'object', additionalProperties: false, properties: { kind: { const: 'enable_preview_end_card' } }, required: ['kind'] },
-              { type: 'object', additionalProperties: false, properties: { kind: { const: 'disable_preview_end_card' } }, required: ['kind'] },
+              { type: 'object', additionalProperties: false, properties: { kind: { const: 'remove_span' }, query: { type: 'string', minLength: 1 } }, required: ['kind', 'query'] },
+              { type: 'object', additionalProperties: false, properties: { kind: { const: 'set_speed' }, speed: { type: 'number', minimum: 1, maximum: 1.5 } }, required: ['kind', 'speed'] },
+              { type: 'object', additionalProperties: false, properties: { kind: { const: 'enable_end_card' } }, required: ['kind'] },
+              { type: 'object', additionalProperties: false, properties: { kind: { const: 'disable_end_card' } }, required: ['kind'] },
             ],
           },
         },
@@ -122,8 +139,8 @@ const STRUCTURED_OUTPUT_SCHEMAS = {
       required: ['summary', 'actions'],
     },
   },
-  instagramCopy: {
-    name: 'instagram_reel_copy',
+  publishCopy: {
+    name: 'publish_copy',
     schema: {
       type: 'object',
       additionalProperties: false,
@@ -133,6 +150,17 @@ const STRUCTURED_OUTPUT_SCHEMAS = {
         hashtags: { type: 'array', minItems: 3, maxItems: 6, items: { type: 'string', minLength: 2, maxLength: 40 } },
       },
       required: ['line_1', 'line_2', 'hashtags'],
+    },
+  },
+  hookSuggestions: {
+    name: 'hook_suggestions',
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        options: { type: 'array', minItems: 3, maxItems: 3, items: { type: 'string', minLength: 1, maxLength: 90 } },
+      },
+      required: ['options'],
     },
   },
   locateSpan: {
@@ -153,8 +181,12 @@ const STRUCTURED_OUTPUT_SCHEMAS = {
 export class OpenRouterClient {
   constructor(private readonly config: AppConfig) {}
 
+  private get reasoning(): ReasoningOptions {
+    return { effort: this.config.OPENROUTER_REASONING_EFFORT, maxTokens: this.config.OPENROUTER_MAX_TOKENS };
+  }
+
   async buildSemanticBlocks(input: { title: string | null; sentences: TranscriptSentence[] }): Promise<SemanticBlockResponseSet> {
-    const raw = await callJson<unknown>(this.config, {
+    return requestStructuredJson<SemanticBlockResponseSet>(this.config, {
       title: 'semantic-block-builder',
       system: [
         'Você segmenta um vídeo de um único apresentador em blocos semânticos curtos para planejamento de shorts.',
@@ -164,7 +196,7 @@ export class OpenRouterClient {
         'Ignore CTA, pedido de like, propaganda do canal e housekeeping, a menos que sejam realmente parte do argumento.',
         'Retorne apenas JSON válido com a chave blocks.',
       ].join(' '),
-      payload: {
+      userText: JSON.stringify({
         source_title: input.title,
         sentences: input.sentences.map((sentence) => ({
           id: sentence.id,
@@ -172,15 +204,16 @@ export class OpenRouterClient {
           end_seconds: sentence.endSeconds,
           text: sentence.text,
         })),
-      },
+      }),
+      reasoning: this.reasoning,
+      temperature: EDITORIAL_TEMPERATURE,
       responseFormat: STRUCTURED_OUTPUT_SCHEMAS.semanticBlocks,
-      schema: { parse: (value: unknown) => value },
+      parse: (value) => SemanticBlockResponseSetSchema.parse(normalizeSemanticBlockPayload(value, input.sentences)),
     });
-    return SemanticBlockResponseSetSchema.parse(normalizeSemanticBlockPayload(raw, input.sentences));
   }
 
-  async findOpportunities(input: { title: string | null; blocks: Array<{ id: string; kind: SemanticBlockKind; summary: string; start_seconds: number; end_seconds: number; text: string }> }): Promise<OpportunityPlanResponse> {
-    const raw = await callJson<unknown>(this.config, {
+  async findOpportunities(input: { title: string | null; blocks: PlannerBlock[] }): Promise<OpportunityPlanResponse> {
+    return requestStructuredJson<OpportunityPlanResponse>(this.config, {
       title: 'editorial-opportunity-planner',
       system: [
         'Você é diretor editorial de shorts em PT-BR.',
@@ -188,102 +221,140 @@ export class OpenRouterClient {
         'Uma oportunidade é uma ideia publicável com promessa ao espectador, tensão, desenvolvimento e um ponto de chegada; não é um capítulo solto nem um resumo do assunto.',
         'Priorize tese, contraste, mecanismo, consequência, caso absurdo que revela a tese maior, ou payoff explicativo forte.',
         'Ordem cronológica estrita; use apenas os blocos fornecidos; poucos saltos; CTA, propaganda, housekeeping e glossário não entram.',
-        'Cada oportunidade já deve vir como proposta de short: título, resumo, hook, payoff, rationale, thesis, viewer_promise, tension, why_this_short, risk, block_ids e steps.',
+        'Cada oportunidade já deve vir como proposta de short: título, resumo, hook, hook_text, payoff, rationale, thesis, viewer_promise, tension, why_this_short, risk, block_ids e steps.',
+        HOOK_TEXT_RULE,
+        DURATION_RULE,
         'Retorne apenas JSON válido com a chave opportunities.',
       ].join(' '),
-      payload: {
+      userText: JSON.stringify({
         source_title: input.title,
         blocks: input.blocks,
-      },
+      }),
+      reasoning: this.reasoning,
+      temperature: EDITORIAL_TEMPERATURE,
       responseFormat: STRUCTURED_OUTPUT_SCHEMAS.opportunities,
-      schema: { parse: (value: unknown) => value },
+      parse: (value) => OpportunityPlanResponseSchema.parse(normalizeOpportunityPlanPayload(value)),
     });
-    return OpportunityPlanResponseSchema.parse(normalizeOpportunityPlanPayload(raw));
   }
 
   async repairOpportunityPlan(input: {
     title: string | null;
-    blocks: Array<{ id: string; kind: SemanticBlockKind; summary: string; start_seconds: number; end_seconds: number; text: string }>;
+    blocks: PlannerBlock[];
     opportunities: OpportunityPlanResponse['opportunities'];
     diagnostics: Array<{ title: string; reasons: string[]; durationSeconds: number | null }>;
   }): Promise<OpportunityPlanResponse> {
-    const raw = await callJson<unknown>(this.config, {
+    return requestStructuredJson<OpportunityPlanResponse>(this.config, {
       title: 'editorial-opportunity-repair',
       system: [
         'Você está reparando um plano de shorts que falhou no crítico local.',
         'Gere uma nova lista de oportunidades publicáveis a partir dos blocos, preservando ordem cronológica estrita e usando apenas os blocos fornecidos.',
         'Cada oportunidade deve aterrissar num ponto que resolve, sintetiza, revela a consequência ou responde por-que-isso-importa. Não dependa só de blocos explicitamente rotulados como payoff.',
         'Evite duplicar blocos, evite capítulos locais sem tese, evite terminar em abertura de lista, CTA, merchandising ou continuação.',
-        'Cada oportunidade já deve vir como proposta de short: título, resumo, hook, payoff, rationale, thesis, viewer_promise, tension, why_this_short, risk, block_ids e steps.',
+        'Cada oportunidade já deve vir como proposta de short: título, resumo, hook, hook_text, payoff, rationale, thesis, viewer_promise, tension, why_this_short, risk, block_ids e steps.',
+        HOOK_TEXT_RULE,
+        DURATION_RULE,
         'Retorne apenas JSON válido com a chave opportunities.',
       ].join(' '),
-      payload: {
+      userText: JSON.stringify({
         source_title: input.title,
         blocks: input.blocks,
         rejected_opportunities: input.opportunities,
         critic_findings: input.diagnostics,
-      },
+      }),
+      reasoning: this.reasoning,
+      temperature: EDITORIAL_TEMPERATURE,
       responseFormat: STRUCTURED_OUTPUT_SCHEMAS.opportunities,
-      schema: { parse: (value: unknown) => value },
+      parse: (value) => OpportunityPlanResponseSchema.parse(normalizeOpportunityPlanPayload(value)),
     });
-    return OpportunityPlanResponseSchema.parse(normalizeOpportunityPlanPayload(raw));
   }
 
-  async planCandidates(input: { title: string | null; blocks: Array<{ id: string; kind: SemanticBlockKind; summary: string; start_seconds: number; end_seconds: number; text: string }>; opportunities: OpportunityPlanResponse['opportunities'] }): Promise<PlannedCandidateResponse> {
-    const raw = await callJson<unknown>(this.config, {
+  async planCandidates(input: { title: string | null; blocks: PlannerBlock[]; opportunities: OpportunityPlanResponse['opportunities'] }): Promise<PlannedCandidateResponse> {
+    return requestStructuredJson<PlannedCandidateResponse>(this.config, {
       title: 'argument-arc-planner',
       system: [
         'Você é diretor editorial de shorts em PT-BR.',
         'Objetivo: transformar oportunidades editoriais em no máximo 5 candidatos de short bem compostos.',
         'Regras obrigatórias: ordem cronológica estrita; usar apenas os blocos fornecidos; poucos saltos; priorizar transformação argumentativa completa por segundo; cada candidato deve cumprir claramente a promessa ao espectador da oportunidade escolhida.',
+        FIRST_BLOCK_RULE,
         'Não devolva capítulo local sem tese. Prefira ideias grandes do vídeo, bons casos reveladores, ou conclusões explicativas fortes.',
         'O título deve descrever o argumento do short, não apenas o assunto ou capítulo local.',
+        HOOK_TEXT_RULE,
+        DURATION_RULE,
         'Retorne apenas JSON válido com a chave candidates.',
       ].join(' '),
-      payload: {
+      userText: JSON.stringify({
         source_title: input.title,
         blocks: input.blocks,
         opportunities: input.opportunities,
-      },
+      }),
+      reasoning: this.reasoning,
+      temperature: EDITORIAL_TEMPERATURE,
       responseFormat: STRUCTURED_OUTPUT_SCHEMAS.candidates,
-      schema: { parse: (value: unknown) => value },
+      parse: (value) => PlannedCandidateResponseSchema.parse(normalizeArcPlanPayload(value, input.opportunities)),
     });
-    return PlannedCandidateResponseSchema.parse(normalizeArcPlanPayload(raw, input.opportunities));
   }
 
-  async parseRevision(input: { candidate: Candidate; message: string }): Promise<RevisionIntent> {
-    const raw = await callJson<unknown>(this.config, {
+  async parseRevision(input: {
+    title: string;
+    hookText: string;
+    durationSeconds: number;
+    segments: Array<{ start_seconds: number; end_seconds: number; text: string }>;
+    message: string;
+  }): Promise<RevisionIntent> {
+    return requestStructuredJson<RevisionIntent>(this.config, {
       title: 'revision-intent',
       system: [
         'Você converte pedidos do diretor em ações seguras para revisão de shorts.',
-        'Ações permitidas: retitle, caption_cleanup, trim_start, trim_end, extend_start, extend_end, insert_span, reorder_candidate, set_speed, enable_preview_end_card, disable_preview_end_card.',
+        'Ações permitidas: retitle (title), set_hook (text, até 90 caracteres), trim_start (seconds), trim_end (seconds), extend_start (seconds), extend_end (seconds), insert_span (query), remove_span (query), set_speed (speed entre 1 e 1.5), enable_end_card, disable_end_card.',
         'Para pedidos como incluir conclusão, fechar melhor, terminar menos abrupto, use extend_end com segundos ou insert_span com uma query de conclusão/payoff já falado no vídeo.',
+        'Para remover uma fala ou trecho já falado, use remove_span com uma query que identifique esse trecho.',
+        'Para trocar a manchete do topo, use set_hook com o novo texto.',
         'Não invente ações fora dessa lista.',
         'Se o texto for ambíguo, escolha a interpretação mais conservadora.',
         'Retorne apenas JSON válido com actions e summary.',
       ].join(' '),
-      payload: {
-        candidate: {
-          id: input.candidate.id,
-          title: input.candidate.title,
-          duration_seconds: input.candidate.durationSeconds,
-          segments: input.candidate.segments.map((segment) => ({
-            start_seconds: segment.startSeconds,
-            end_seconds: segment.endSeconds,
-            text: segment.text,
-          })),
-        },
+      userText: JSON.stringify({
+        title: input.title,
+        hook_text: input.hookText,
+        duration_seconds: input.durationSeconds,
+        segments: input.segments,
         message: input.message,
-      },
+      }),
+      reasoning: this.reasoning,
+      temperature: EDITORIAL_TEMPERATURE,
       responseFormat: STRUCTURED_OUTPUT_SCHEMAS.revision,
-      schema: { parse: (value: unknown) => value },
+      parse: (value) => RevisionIntentSchema.parse(normalizeRevisionPayload(value)),
     });
-    return RevisionIntentSchema.parse(normalizeRevisionPayload(raw));
   }
 
-  async writeInstagramReelDescription(input: { candidate: Candidate }): Promise<InstagramReelCopy> {
-    const raw = await callJson<unknown>(this.config, {
-      title: 'instagram-reel-copy',
+  async suggestHooks(input: { title: string; summary: string; transcriptText: string; current: string }): Promise<string[]> {
+    const response = await requestStructuredJson<HookSuggestionsResponse>(this.config, {
+      title: 'hook-suggestions',
+      system: [
+        'Você escreve manchetes curtas para a faixa no topo de shorts em PT-BR.',
+        'Devolva exatamente 3 opções distintas entre si.',
+        'Cada opção deve ter idealmente até 45 caracteres (máximo 90), ser provocativa e específica do argumento, sem clickbait vazio.',
+        'Não use as palavras vídeo, short, reel, corte, assista ou veja, nem frases que descrevam a edição.',
+        'A manchete atual vem apenas como referência; não repita ela.',
+        'Retorne apenas JSON válido com a chave options.',
+      ].join(' '),
+      userText: JSON.stringify({
+        title: input.title,
+        summary: input.summary,
+        transcript_text: input.transcriptText,
+        current_hook: input.current,
+      }),
+      reasoning: this.reasoning,
+      temperature: EDITORIAL_TEMPERATURE,
+      responseFormat: STRUCTURED_OUTPUT_SCHEMAS.hookSuggestions,
+      parse: (value) => HookSuggestionsResponseSchema.parse(value),
+    });
+    return response.options;
+  }
+
+  async writePublishCopy(input: { title: string; summary: string; hook: string; payoff: string; rationale: string; quotes: string[] }): Promise<PublishCopyResponse> {
+    return requestStructuredJson<PublishCopyResponse>(this.config, {
+      title: 'publish-copy',
       system: [
         'Você escreve legenda curta para Reel em PT-BR com cara de fala nativa do próprio criador do vídeo.',
         'Objetivo: devolver exatamente 2 linhas fortes e 3 a 6 hashtags altamente compartilháveis.',
@@ -298,24 +369,23 @@ export class OpenRouterClient {
         'Evite palavras quebradas, duplicadas, vagas, burocráticas ou genéricas em inglês como #mindset, #business, #success e similares.',
         'Retorne apenas JSON válido com line_1, line_2 e hashtags.',
       ].join(' '),
-      payload: {
-        candidate: {
-          title: input.candidate.title,
-          summary: input.candidate.summary,
-          hook: input.candidate.hook,
-          payoff: input.candidate.payoff,
-          rationale: input.candidate.rationale,
-          source_quotes: input.candidate.segments.slice(0, 4).map((segment) => segment.text),
-        },
-      },
-      responseFormat: STRUCTURED_OUTPUT_SCHEMAS.instagramCopy,
-      schema: { parse: (value: unknown) => value },
+      userText: JSON.stringify({
+        title: input.title,
+        summary: input.summary,
+        hook: input.hook,
+        payoff: input.payoff,
+        rationale: input.rationale,
+        source_quotes: input.quotes.slice(0, 4),
+      }),
+      reasoning: this.reasoning,
+      temperature: EDITORIAL_TEMPERATURE,
+      responseFormat: STRUCTURED_OUTPUT_SCHEMAS.publishCopy,
+      parse: (value) => PublishCopyResponseSchema.parse(normalizePublishCopyPayload(value, input)),
     });
-    return InstagramReelCopySchema.parse(normalizeInstagramReelCopyPayload(raw));
   }
 
   async locateTranscriptSpan(input: { query: string; sentences: TranscriptSentence[] }): Promise<TranscriptSpanLocate> {
-    const raw = await callJson<unknown>(this.config, {
+    return requestStructuredJson<TranscriptSpanLocate>(this.config, {
       title: 'transcript-span-locator',
       system: [
         'Você recebe uma solicitação do diretor para incluir um trecho já falado no vídeo.',
@@ -324,7 +394,7 @@ export class OpenRouterClient {
         'É obrigatório preencher start_sentence_id e end_sentence_id com IDs válidos da lista recebida.',
         'Retorne apenas JSON válido.',
       ].join(' '),
-      payload: {
+      userText: JSON.stringify({
         query: input.query,
         sentences: input.sentences.map((sentence) => ({
           id: sentence.id,
@@ -332,40 +402,70 @@ export class OpenRouterClient {
           end_seconds: sentence.endSeconds,
           text: sentence.text,
         })),
-      },
+      }),
+      reasoning: this.reasoning,
+      temperature: EDITORIAL_TEMPERATURE,
       responseFormat: STRUCTURED_OUTPUT_SCHEMAS.locateSpan,
-      schema: { parse: (value: unknown) => value },
+      parse: (value) => parseLocatedSpan(value, input.query, input.sentences),
     });
-    const normalized = normalizeLocatePayload(raw);
-    const parsed = TranscriptSpanLocateSchema.safeParse(normalized);
-    if (parsed.success) {
-      return parsed.data;
-    }
-    const fallback = fallbackLocateTranscriptSpan(input.query, input.sentences);
-    if (fallback) {
-      return fallback;
-    }
-    throw parsed.error;
   }
 }
 
-async function callJson<T>(config: AppConfig, input: { title: string; system: string; payload: unknown; responseFormat?: { name: string; schema: Record<string, unknown> }; schema: { parse(value: unknown): T } }): Promise<T> {
+export async function requestStructuredJson<T>(config: AppConfig, input: {
+  title: string;
+  system: string;
+  userText: string;
+  images?: ImageInput[];
+  model?: string;
+  reasoning?: ReasoningOptions;
+  temperature: number;
+  responseFormat: ResponseFormat;
+  parse: (value: unknown) => T;
+}): Promise<T> {
+  const model = input.model ?? config.OPENROUTER_MODEL;
   const content = await requestCompletionContent(config, {
     title: input.title,
+    model,
+    reasoning: input.reasoning,
     system: input.system,
-    user: JSON.stringify(input.payload),
-    temperature: 0.2,
+    user: buildUserContent(input.userText, input.images),
+    temperature: input.temperature,
     responseFormat: input.responseFormat,
   });
   try {
-    return input.schema.parse(JSON.parse(extractJson(content)));
+    return input.parse(JSON.parse(extractJson(content)));
   } catch (error) {
-    const repairedContent = await repairMalformedJson(config, input.title, content, error instanceof Error ? error.message : String(error));
-    return input.schema.parse(JSON.parse(extractJson(repairedContent)));
+    const repairedContent = await requestCompletionContent(config, {
+      title: `${input.title}-json-repair`,
+      model,
+      system: JSON_REPAIR_SYSTEM,
+      user: JSON.stringify({ parse_error: error instanceof Error ? error.message : String(error), malformed_json: content }),
+      temperature: 0,
+      responseFormat: input.responseFormat,
+    });
+    return input.parse(JSON.parse(extractJson(repairedContent)));
   }
 }
 
-async function requestCompletionContent(config: AppConfig, input: { title: string; system: string; user: string; temperature: number; responseFormat?: { name: string; schema: Record<string, unknown> } }): Promise<string> {
+function buildUserContent(userText: string, images: ImageInput[] | undefined): string | ChatPart[] {
+  if (!images || images.length === 0) {
+    return userText;
+  }
+  return [
+    { type: 'text', text: userText },
+    ...images.map((image): ChatPart => ({ type: 'image_url', image_url: { url: `data:${image.mimeType};base64,${image.base64}` } })),
+  ];
+}
+
+async function requestCompletionContent(config: AppConfig, input: {
+  title: string;
+  model: string;
+  reasoning?: ReasoningOptions;
+  system: string;
+  user: string | ChatPart[];
+  temperature: number;
+  responseFormat: ResponseFormat;
+}): Promise<string> {
   let response: Response;
   try {
     response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -373,22 +473,21 @@ async function requestCompletionContent(config: AppConfig, input: { title: strin
       headers: {
         Authorization: `Bearer ${config.OPENROUTER_API_KEY}`,
         'Content-Type': 'application/json',
-        'HTTP-Referer': 'https://github.com/retirers/telegram-shorts',
+        'HTTP-Referer': 'http://127.0.0.1',
         'X-Title': input.title,
       },
       body: JSON.stringify({
-        model: config.OPENROUTER_MODEL,
+        model: input.model,
         temperature: input.temperature,
-        response_format: input.responseFormat
-          ? {
-              type: 'json_schema',
-              json_schema: {
-                name: input.responseFormat.name,
-                strict: true,
-                schema: input.responseFormat.schema,
-              },
-            }
-          : { type: 'json_object' },
+        ...(input.reasoning ? { reasoning: { effort: input.reasoning.effort }, max_tokens: input.reasoning.maxTokens } : {}),
+        response_format: {
+          type: 'json_schema',
+          json_schema: {
+            name: input.responseFormat.name,
+            strict: true,
+            schema: input.responseFormat.schema,
+          },
+        },
         plugins: [{ id: 'response-healing' }],
         messages: [
           { role: 'system', content: input.system },
@@ -397,36 +496,34 @@ async function requestCompletionContent(config: AppConfig, input: { title: strin
       }),
     });
   } catch (error) {
-    logError('OpenRouter request failed', error, { title: input.title, model: config.OPENROUTER_MODEL });
+    logError('OpenRouter request failed', error, { title: input.title, model: input.model });
     throw error;
   }
   if (!response.ok) {
     throw new Error(`OpenRouter request failed: ${response.status} ${await response.text()}`);
   }
-  const payload = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-  const content = payload.choices?.[0]?.message?.content;
+  const payload = await response.json() as { choices?: Array<{ finish_reason?: string; message?: { content?: string } }>; usage?: { completion_tokens?: number; completion_tokens_details?: { reasoning_tokens?: number } } };
+  const choice = payload.choices?.[0];
+  const content = choice?.message?.content;
   if (!content) {
-    throw new Error('OpenRouter response was empty.');
+    throw new Error(`OpenRouter response was empty (${input.title}, finish_reason ${choice?.finish_reason ?? 'missing'}, completion tokens ${payload.usage?.completion_tokens ?? 'n/a'}, reasoning tokens ${payload.usage?.completion_tokens_details?.reasoning_tokens ?? 'n/a'}).`);
   }
   return content;
 }
 
-async function repairMalformedJson(config: AppConfig, title: string, malformedContent: string, parseError: string): Promise<string> {
-  return requestCompletionContent(config, {
-    title: `${title}-json-repair`,
-    system: [
-      'Você corrige JSON malformado produzido por outro modelo.',
-      'Preserve a estrutura e os valores pretendidos o máximo possível.',
-      'Não explique nada. Retorne apenas um único objeto JSON válido.',
-    ].join(' '),
-    user: JSON.stringify({ parse_error: parseError, malformed_json: malformedContent }),
-    temperature: 0,
-    responseFormat: { name: `${title.replace(/[^a-z0-9_-]+/gi, '_')}_repair`, schema: { type: 'object' } },
-  });
+function parseLocatedSpan(raw: unknown, query: string, sentences: TranscriptSentence[]): TranscriptSpanLocate {
+  const parsed = TranscriptSpanLocateSchema.safeParse(normalizeLocatePayload(raw));
+  if (parsed.success) {
+    return parsed.data;
+  }
+  const fallback = fallbackLocateTranscriptSpan(query, sentences);
+  if (fallback) {
+    return fallback;
+  }
+  throw parsed.error;
 }
 
 function normalizeSemanticBlockPayload(raw: unknown, sentences: TranscriptSentence[]): unknown {
-  const bySentenceId = new Map(sentences.map((sentence) => [sentence.id, sentence]));
   const record = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
   const blocks = Array.isArray(record.blocks) ? record.blocks : [];
   return {
@@ -434,8 +531,8 @@ function normalizeSemanticBlockPayload(raw: unknown, sentences: TranscriptSenten
       const item = block && typeof block === 'object' ? block as Record<string, unknown> : {};
       const startSentenceId = stringValue(item.start_sentence_id) ?? stringValue(item.start_id) ?? stringValue(item.from_sentence_id) ?? '';
       const endSentenceId = stringValue(item.end_sentence_id) ?? stringValue(item.end_id) ?? stringValue(item.to_sentence_id) ?? startSentenceId;
-      const start = bySentenceId.get(startSentenceId);
-      const end = bySentenceId.get(endSentenceId);
+      const start = sentences.find((sentence) => sentence.id === startSentenceId);
+      const end = sentences.find((sentence) => sentence.id === endSentenceId);
       const fallbackSummary = start && end ? sentences.slice(start.index, end.index + 1).map((sentence) => sentence.text).join(' ') : '';
       return {
         id: stringValue(item.id) ?? `b_${String(index + 1).padStart(3, '0')}`,
@@ -511,11 +608,13 @@ function normalizeArcCandidate(raw: unknown, opportunities: OpportunityPlanRespo
     : [];
   const fallbackBlockIds = normalizedBlockIds.length > 0 ? normalizedBlockIds : (sourceOpportunity?.block_ids ?? []);
   const fallbackSteps = steps.length > 0 ? steps : (sourceOpportunity?.steps ?? deriveFallbackSteps(fallbackBlockIds));
+  const title = stringValue(record.title) ?? stringValue(record.candidate_title) ?? sourceOpportunity?.title ?? 'Sem título';
   return {
     opportunity_id: opportunityId ?? sourceOpportunity?.id,
-    title: stringValue(record.title) ?? stringValue(record.candidate_title) ?? sourceOpportunity?.title ?? 'Sem título',
+    title,
     summary: stringValue(record.summary) ?? stringValue(record.candidate_summary) ?? sourceOpportunity?.summary ?? 'Resumo',
     hook: stringValue(record.hook) ?? stringValue(record.first_words) ?? sourceOpportunity?.hook ?? stringValue(record.summary) ?? 'Hook',
+    hook_text: summarize(stringValue(record.hook_text) ?? stringValue(record.hookText) ?? sourceOpportunity?.hook_text ?? stringValue(record.hook) ?? sourceOpportunity?.hook ?? stringValue(record.title) ?? 'Hook', 90),
     payoff: stringValue(record.payoff) ?? stringValue(record.last_words) ?? sourceOpportunity?.payoff ?? stringValue(record.summary) ?? 'Payoff',
     rationale: stringValue(record.rationale) ?? stringValue(record.reason) ?? sourceOpportunity?.rationale ?? stringValue(record.summary) ?? 'Racional',
     thesis: stringValue(record.thesis) ?? sourceOpportunity?.thesis ?? stringValue(record.summary) ?? 'Tese',
@@ -573,10 +672,12 @@ function normalizeRevisionAction(raw: unknown): Record<string, unknown> | null {
   const kind = rawKind.toLowerCase().replace(/[-\s]+/g, '_');
   const seconds = positiveNumber(record.seconds) ?? positiveNumber(record.duration_seconds) ?? positiveNumber(record.amount_seconds);
   if (kind === 'retitle' || kind === 'change_title' || kind === 'rename') {
-    return { kind: 'retitle', title: stringValue(record.title) ?? stringValue(record.value) ?? 'Novo título' };
+    const title = stringValue(record.title) ?? stringValue(record.value);
+    return title ? { kind: 'retitle', title } : null;
   }
-  if (kind === 'caption_cleanup' || kind === 'cleanup_caption' || kind === 'clean_caption') {
-    return { kind: 'caption_cleanup' };
+  if (kind === 'set_hook' || kind === 'hook' || kind === 'headline' || kind === 'change_hook' || kind === 'update_hook' || kind === 'hook_text') {
+    const text = stringValue(record.text) ?? stringValue(record.hook_text) ?? stringValue(record.value) ?? stringValue(record.title);
+    return text ? { kind: 'set_hook', text: summarize(text, 90) } : null;
   }
   if (kind === 'trim_start' || kind === 'shorten_start') {
     return { kind: 'trim_start', seconds: seconds ?? 5 };
@@ -593,17 +694,18 @@ function normalizeRevisionAction(raw: unknown): Record<string, unknown> | null {
   if (kind === 'insert_span' || kind === 'insert' || kind === 'include_span' || kind === 'add_span') {
     return { kind: 'insert_span', query: stringValue(record.query) ?? stringValue(record.text) ?? stringValue(record.description) ?? 'conclusão ou payoff do argumento' };
   }
-  if (kind === 'reorder_candidate' || kind === 'reorder') {
-    return { kind: 'reorder_candidate', rank: Math.max(1, Math.min(5, Math.round(positiveNumber(record.rank) ?? 1))) };
+  if (kind === 'remove_span' || kind === 'cut_span' || kind === 'remove' || kind === 'delete_span' || kind === 'exclude_span') {
+    const query = stringValue(record.query) ?? stringValue(record.text) ?? stringValue(record.description);
+    return query ? { kind: 'remove_span', query } : null;
   }
   if (kind === 'set_speed' || kind === 'speed' || kind === 'playback_speed') {
-    return { kind: 'set_speed', speed: Math.max(0.1, Math.min(1.5, positiveNumber(record.speed) ?? positiveNumber(record.value) ?? 1.15)) };
+    return { kind: 'set_speed', speed: Math.max(1, Math.min(1.5, positiveNumber(record.speed) ?? positiveNumber(record.value) ?? 1.15)) };
   }
-  if (kind === 'enable_preview_end_card' || kind === 'add_end_card' || kind === 'enable_end_card') {
-    return { kind: 'enable_preview_end_card' };
+  if (kind === 'enable_end_card' || kind === 'enable_preview_end_card' || kind === 'add_end_card') {
+    return { kind: 'enable_end_card' };
   }
-  if (kind === 'disable_preview_end_card' || kind === 'remove_end_card' || kind === 'disable_end_card') {
-    return { kind: 'disable_preview_end_card' };
+  if (kind === 'disable_end_card' || kind === 'disable_preview_end_card' || kind === 'remove_end_card') {
+    return { kind: 'disable_end_card' };
   }
   const freeText = [rawKind, stringValue(record.query), stringValue(record.text), stringValue(record.description), stringValue(record.reason)].filter(Boolean).join(' ').toLowerCase();
   if (/conclus|fech|payoff|final/.test(freeText)) {
@@ -617,7 +719,7 @@ function positiveNumber(value: unknown): number | null {
   return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
 }
 
-function normalizeInstagramReelCopyPayload(raw: unknown): unknown {
+function normalizePublishCopyPayload(raw: unknown, fallback: { hook: string; payoff: string }): unknown {
   if (!raw || typeof raw !== 'object') {
     return raw;
   }
@@ -628,8 +730,8 @@ function normalizeInstagramReelCopyPayload(raw: unknown): unknown {
       ? record.hashtags.split(/\s+/)
       : [];
   return {
-    line_1: stringValue(record.line_1) ?? stringValue(record.line1) ?? stringValue(record.caption) ?? 'O ponto central é bem mais incômodo do que parece.',
-    line_2: stringValue(record.line_2) ?? stringValue(record.line2) ?? stringValue(record.summary) ?? 'Quando você segue a lógica até o fim, a contradição fica óbvia.',
+    line_1: stringValue(record.line_1) ?? stringValue(record.line1) ?? stringValue(record.caption) ?? summarize(fallback.hook, 180),
+    line_2: stringValue(record.line_2) ?? stringValue(record.line2) ?? stringValue(record.summary) ?? summarize(fallback.payoff, 180),
     hashtags: hashtags
       .map((value) => typeof value === 'string' ? value.trim() : '')
       .filter(Boolean)
@@ -639,7 +741,12 @@ function normalizeInstagramReelCopyPayload(raw: unknown): unknown {
 }
 
 function fallbackLocateTranscriptSpan(query: string, sentences: TranscriptSentence[]): TranscriptSpanLocate | null {
-  const queryTerms = tokenizeForLocate(query);
+  const queryTerms = query
+    .normalize('NFD')
+    .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((term) => term.length >= 4);
   if (queryTerms.length === 0 || sentences.length === 0) {
     return null;
   }
@@ -674,15 +781,6 @@ function fallbackLocateTranscriptSpan(query: string, sentences: TranscriptSenten
     end_sentence_id: sentences[endIndex]!.id,
     why: 'Fallback localizou o trecho por similaridade lexical com a solicitação.',
   };
-}
-
-function tokenizeForLocate(value: string): string[] {
-  return value
-    .normalize('NFD')
-    .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
-    .toLowerCase()
-    .split(/\s+/)
-    .filter((term) => term.length >= 4);
 }
 
 function scoreSentenceForLocate(text: string, queryTerms: string[]): number {

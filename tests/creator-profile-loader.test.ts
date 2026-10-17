@@ -1,207 +1,182 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import type { TestContext } from 'node:test';
+import { StudioError } from '../src/application/errors.js';
 import { CreatorProfileRepository, publishConfigForPlatform } from '../src/infra/creator-profile-loader.js';
+import type { CreatorProfile } from '../src/domain/model.js';
+import { loadLayoutProfile } from '../src/infra/layout.js';
 
 const rootDir = process.cwd();
+const filipeLayoutPath = join(rootDir, 'profiles', 'filipe_boni_layout.json');
+const jonesLayoutPath = join(rootDir, 'profiles', 'jones_manoel_layout.json');
 
-test('creator profile manifest loads Filipe and Jones profiles with validated layouts', async () => {
-  const repo = new CreatorProfileRepository({
-    rootDir,
-    manifestPath: 'profiles/creator-profiles.json',
-    defaultCreatorId: 'filipe_boni',
-    legacyLayoutPath: 'profiles/filipe_boni_layout.json',
+async function createTempDir(t: TestContext): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), 'creator-profiles-'));
+  t.after(async () => {
+    await rm(dir, { recursive: true, force: true });
   });
+  return dir;
+}
 
-  const manifest = await repo.loadManifest();
+async function writeManifest(dir: string, manifest: unknown): Promise<string> {
+  const manifestPath = join(dir, 'creator-profiles.json');
+  await writeFile(manifestPath, JSON.stringify(manifest, null, 2), 'utf-8');
+  return manifestPath;
+}
+
+function isInvalidStudioError(error: unknown): boolean {
+  return error instanceof StudioError && error.code === 'invalid';
+}
+
+test('real profiles manifest loads both creators with valid v2 layouts', async () => {
+  const repo = new CreatorProfileRepository({ rootDir, manifestPath: 'profiles/creator-profiles.json' });
+  const manifest = await repo.getManifest();
+
+  assert.equal(manifest.version, 2);
   assert.equal(manifest.defaultCreatorId, 'filipe_boni');
-  assert.deepEqual(manifest.creators.map((profile) => profile.id), ['filipe_boni', 'jones_manoel']);
+  assert.deepEqual(manifest.creators.map((creator) => creator.id), ['filipe_boni', 'jones_manoel']);
 
-  const jones = manifest.creators.find((profile) => profile.id === 'jones_manoel');
-  assert.ok(jones);
-  assert.equal(jones.render.layoutPath, 'profiles/jones_manoel_layout.json');
-  assert.equal(publishConfigForPlatform(jones, 'instagram')?.mode, 'disabled');
+  const [filipe, jones] = manifest.creators;
+  assert.ok(filipe && jones);
+  assert.equal(filipe.render.layoutPath, 'profiles/filipe_boni_layout.json');
+  assert.equal(filipe.render.layoutId, 'screen-top-host-bottom-v2');
+  assert.equal(jones.render.layoutId, 'center-speaker-vertical-v2');
+  assert.deepEqual(publishConfigForPlatform(filipe, 'youtube_shorts'), { mode: 'global' });
+  assert.deepEqual(publishConfigForPlatform(jones, 'instagram'), { mode: 'disabled' });
 
-  const resolved = await repo.resolveCreatorProfile({ chatDefaultCreatorId: 'jones_manoel' });
-  assert.equal(resolved.source, 'chat_default');
-  assert.equal(resolved.profile.displayName, 'Jones Manoel');
-  assert.equal(resolved.layoutProfile?.creatorId, 'jones_manoel');
-  assert.equal(resolved.layoutProfile?.layoutId, 'center-speaker-vertical-crop-v1');
+  const filipeLayout = await loadLayoutProfile(filipe.render.layoutPath, rootDir);
+  const jonesLayout = await loadLayoutProfile(jones.render.layoutPath, rootDir);
+  assert.equal(filipeLayout.creatorId, 'filipe_boni');
+  assert.deepEqual(filipeLayout.panels.map((panel) => panel.role), ['content', 'host']);
+  assert.equal(jonesLayout.creatorId, 'jones_manoel');
+  assert.deepEqual(jonesLayout.panels.map((panel) => panel.role), ['host']);
 });
 
-test('explicit missing creator manifest is rejected instead of failing open to legacy publish defaults', async () => {
-  const repo = new CreatorProfileRepository({
-    rootDir,
-    manifestPath: 'profiles/does-not-exist.json',
-    legacyLayoutPath: 'profiles/filipe_boni_layout.json',
-  });
+test('resolution follows requested > studio default > manifest default', async () => {
+  const repo = new CreatorProfileRepository({ rootDir, manifestPath: 'profiles/creator-profiles.json' });
 
-  await assert.rejects(() => repo.resolveCreatorProfile(), /manifest not found/i);
+  const requested = await repo.resolveCreatorProfile({ requestedId: 'jones_manoel', studioDefaultId: 'filipe_boni' });
+  assert.equal(requested.profile.id, 'jones_manoel');
+  assert.equal(requested.layout.layoutId, 'center-speaker-vertical-v2');
+  assert.equal(requested.layout.creatorId, 'jones_manoel');
+
+  const studioDefault = await repo.resolveCreatorProfile({ studioDefaultId: 'jones_manoel' });
+  assert.equal(studioDefault.profile.id, 'jones_manoel');
+  assert.equal(studioDefault.layout.layoutId, 'center-speaker-vertical-v2');
+
+  const manifestDefault = await repo.resolveCreatorProfile({ studioDefaultId: null });
+  assert.equal(manifestDefault.profile.id, 'filipe_boni');
+  assert.equal(manifestDefault.layout.layoutId, 'screen-top-host-bottom-v2');
+
+  const byId = await repo.getCreatorProfileById('jones_manoel');
+  assert.ok(byId);
+  assert.equal(byId.id, 'jones_manoel');
+  assert.equal(await repo.getCreatorProfileById('nobody'), null);
 });
 
-test('omitting creator manifest path preserves legacy static layout selection', async () => {
-  const repo = new CreatorProfileRepository({
-    rootDir,
-    legacyLayoutPath: 'profiles/jones_manoel_layout.json',
-  });
+test('requested id that is missing or disabled is rejected as invalid', async (t) => {
+  const repo = new CreatorProfileRepository({ rootDir, manifestPath: 'profiles/creator-profiles.json' });
+  await assert.rejects(
+    () => repo.resolveCreatorProfile({ requestedId: 'unknown_creator' }),
+    isInvalidStudioError,
+  );
 
-  const resolved = await repo.resolveCreatorProfile();
-  assert.equal(resolved.source, 'legacy_static_layout');
-  assert.equal(resolved.profile.id, 'legacy_default');
-  assert.equal(resolved.layoutProfile?.creatorId, 'jones_manoel');
-  assert.equal(resolved.layoutProfile?.layoutId, 'center-speaker-vertical-crop-v1');
-});
-
-test('disabled profiles with broken layouts do not block enabled creator selection', async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), 'telegram-shorts-profile-manifest-'));
-  t.after(async () => {
-    await rm(dir, { recursive: true, force: true });
-  });
-  const manifestPath = join(dir, 'creator-profiles.json');
-  await writeFile(manifestPath, JSON.stringify({
-    version: 1,
-    defaultCreatorId: 'filipe_boni',
+  const dir = await createTempDir(t);
+  const manifestPath = await writeManifest(dir, {
+    version: 2,
     creators: [
-      {
-        id: 'filipe_boni',
-        displayName: 'Filipe Boni',
-        enabled: true,
-        render: {
-          layoutPath: 'profiles/filipe_boni_layout.json',
-          layoutId: 'source-left-host-right-stack-v1',
-          snapshotLayoutInJobs: true,
-        },
-        publish: {
-          instagram: { mode: 'global', provider: 'global', fallbackToGlobal: true, configRef: null },
-        },
-      },
-      {
-        id: 'jones_manoel',
-        displayName: 'Jones Manoel',
-        enabled: false,
-        render: {
-          layoutPath: 'profiles/does-not-exist.json',
-          layoutId: 'broken-layout',
-          snapshotLayoutInJobs: true,
-        },
-        publish: {
-          instagram: { mode: 'disabled' },
-        },
-      },
+      { id: 'filipe_boni', displayName: 'Filipe Boni', enabled: true, render: { layoutPath: filipeLayoutPath, layoutId: 'screen-top-host-bottom-v2' } },
+      { id: 'jones_manoel', displayName: 'Jones Manoel', enabled: false, render: { layoutPath: jonesLayoutPath, layoutId: 'center-speaker-vertical-v2' } },
     ],
-  }, null, 2), 'utf-8');
-
-  const repo = new CreatorProfileRepository({
-    rootDir,
-    manifestPath,
-    legacyLayoutPath: 'profiles/filipe_boni_layout.json',
   });
-
-  const resolved = await repo.resolveCreatorProfile();
-  assert.equal(resolved.profile.id, 'filipe_boni');
-  assert.equal(resolved.source, 'manifest_default');
+  const withDisabled = new CreatorProfileRepository({ rootDir: dir, manifestPath });
+  await assert.rejects(
+    () => withDisabled.resolveCreatorProfile({ requestedId: 'jones_manoel' }),
+    isInvalidStudioError,
+  );
 });
 
-test('manifest with no enabled creators is rejected instead of falling back to legacy publishing defaults', async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), 'telegram-shorts-profile-manifest-'));
-  t.after(async () => {
-    await rm(dir, { recursive: true, force: true });
+test('disabled studio default falls through to manifest default and first enabled', async (t) => {
+  const dir = await createTempDir(t);
+  const manifestPath = await writeManifest(dir, {
+    version: 2,
+    defaultCreatorId: 'jones_manoel',
+    creators: [
+      { id: 'jones_manoel', displayName: 'Jones Manoel', enabled: false, render: { layoutPath: jonesLayoutPath, layoutId: 'center-speaker-vertical-v2' } },
+      { id: 'filipe_boni', displayName: 'Filipe Boni', enabled: true, render: { layoutPath: filipeLayoutPath, layoutId: 'screen-top-host-bottom-v2' } },
+    ],
   });
-  const manifestPath = join(dir, 'creator-profiles.json');
-  await writeFile(manifestPath, JSON.stringify({
-    version: 1,
-    creators: [{
-      id: 'filipe_boni',
-      displayName: 'Filipe Boni',
-      enabled: false,
-      render: {
-        layoutPath: 'profiles/filipe_boni_layout.json',
-        layoutId: 'source-left-host-right-stack-v1',
-        snapshotLayoutInJobs: true,
-      },
-      publish: {
-        instagram: { mode: 'disabled' },
-      },
-    }],
-  }, null, 2), 'utf-8');
+  const repo = new CreatorProfileRepository({ rootDir: dir, manifestPath });
 
-  const repo = new CreatorProfileRepository({
-    rootDir,
-    manifestPath,
-    legacyLayoutPath: 'profiles/filipe_boni_layout.json',
-  });
+  const fromDisabledStudioDefault = await repo.resolveCreatorProfile({ studioDefaultId: 'jones_manoel' });
+  assert.equal(fromDisabledStudioDefault.profile.id, 'filipe_boni');
 
-  await assert.rejects(() => repo.resolveCreatorProfile(), /no enabled creator profiles/i);
+  const fromUnknownStudioDefault = await repo.resolveCreatorProfile({ studioDefaultId: 'ghost' });
+  assert.equal(fromUnknownStudioDefault.profile.id, 'filipe_boni');
+
+  const fromDisabledManifestDefault = await repo.resolveCreatorProfile();
+  assert.equal(fromDisabledManifestDefault.profile.id, 'filipe_boni');
 });
 
-test('phase-1 manifest rejects reserved legacy_default creator ids', async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), 'telegram-shorts-profile-manifest-'));
-  t.after(async () => {
-    await rm(dir, { recursive: true, force: true });
+test('layout creatorId and layoutId must match the creator manifest entry', async (t) => {
+  const dir = await createTempDir(t);
+  const mismatchedLayoutIdPath = await writeManifest(dir, {
+    version: 2,
+    creators: [
+      { id: 'filipe_boni', displayName: 'Filipe Boni', enabled: true, render: { layoutPath: filipeLayoutPath, layoutId: 'some-other-layout' } },
+    ],
   });
-  const manifestPath = join(dir, 'creator-profiles.json');
-  await writeFile(manifestPath, JSON.stringify({
-    version: 1,
-    creators: [{
-      id: 'legacy_default',
-      displayName: 'Legacy default',
-      enabled: true,
-      render: {
-        layoutPath: 'profiles/filipe_boni_layout.json',
-        layoutId: 'source-left-host-right-stack-v1',
-        snapshotLayoutInJobs: true,
-      },
-      publish: {
-        instagram: { mode: 'disabled' },
-      },
-    }],
-  }, null, 2), 'utf-8');
+  const mismatchedLayoutId = new CreatorProfileRepository({ rootDir: dir, manifestPath: mismatchedLayoutIdPath });
+  await assert.rejects(() => mismatchedLayoutId.getManifest(), isInvalidStudioError);
 
-  const repo = new CreatorProfileRepository({
-    rootDir,
-    manifestPath,
-    legacyLayoutPath: 'profiles/filipe_boni_layout.json',
+  const mismatchedCreatorIdPath = await writeManifest(dir, {
+    version: 2,
+    creators: [
+      { id: 'someone_else', displayName: 'Someone Else', enabled: true, render: { layoutPath: filipeLayoutPath, layoutId: 'screen-top-host-bottom-v2' } },
+    ],
   });
-
-  await assert.rejects(() => repo.loadManifest(), /reserved/i);
+  const mismatchedCreatorId = new CreatorProfileRepository({ rootDir: dir, manifestPath: mismatchedCreatorIdPath });
+  await assert.rejects(() => mismatchedCreatorId.getManifest(), isInvalidStudioError);
 });
 
-test('phase-1 manifest rejects unsupported profile-scoped publish mode', async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), 'telegram-shorts-profile-manifest-'));
-  t.after(async () => {
-    await rm(dir, { recursive: true, force: true });
-  });
-  const manifestPath = join(dir, 'creator-profiles.json');
-  await writeFile(manifestPath, JSON.stringify({
-    version: 1,
-    defaultCreatorId: 'filipe_boni',
-    creators: [{
-      id: 'filipe_boni',
-      displayName: 'Filipe Boni',
-      enabled: true,
-      render: {
-        layoutPath: 'profiles/filipe_boni_layout.json',
-        layoutId: 'source-left-host-right-stack-v1',
-        snapshotLayoutInJobs: true,
-      },
-      publish: {
-        instagram: {
-          mode: 'profile',
-          provider: 'buffer',
-          configRef: 'FILIPE_BUFFER',
-          fallbackToGlobal: false,
-        },
-      },
-    }],
-  }, null, 2), 'utf-8');
+test('layout with an invalid color is rejected', async (t) => {
+  const dir = await createTempDir(t);
+  const rawLayout = JSON.parse(await readFile(filipeLayoutPath, 'utf-8')) as Record<string, unknown>;
+  rawLayout.background = '#12345';
+  const layoutPath = join(dir, 'broken_layout.json');
+  await writeFile(layoutPath, JSON.stringify(rawLayout, null, 2), 'utf-8');
 
-  const repo = new CreatorProfileRepository({
-    rootDir,
-    manifestPath,
-    legacyLayoutPath: 'profiles/filipe_boni_layout.json',
+  const manifestPath = await writeManifest(dir, {
+    version: 2,
+    creators: [
+      { id: 'filipe_boni', displayName: 'Filipe Boni', enabled: true, render: { layoutPath, layoutId: 'screen-top-host-bottom-v2' } },
+    ],
   });
+  const repo = new CreatorProfileRepository({ rootDir: dir, manifestPath });
+  await assert.rejects(() => repo.getManifest());
+});
 
-  await assert.rejects(() => repo.loadManifest(), /unsupported publish mode/i);
+test('duplicate creator ids are rejected', async (t) => {
+  const dir = await createTempDir(t);
+  const entry = { id: 'filipe_boni', displayName: 'Filipe Boni', enabled: true, render: { layoutPath: filipeLayoutPath, layoutId: 'screen-top-host-bottom-v2' } };
+  const manifestPath = await writeManifest(dir, {
+    version: 2,
+    creators: [entry, { ...entry }],
+  });
+  const repo = new CreatorProfileRepository({ rootDir: dir, manifestPath });
+  await assert.rejects(() => repo.getManifest(), isInvalidStudioError);
+});
+
+test('publish config defaults to disabled when the platform is absent', () => {
+  const profile: CreatorProfile = {
+    id: 'filipe_boni',
+    displayName: 'Filipe Boni',
+    enabled: true,
+    render: { layoutPath: 'profiles/filipe_boni_layout.json', layoutId: 'screen-top-host-bottom-v2' },
+  };
+  assert.deepEqual(publishConfigForPlatform(profile, 'instagram'), { mode: 'disabled' });
+  assert.deepEqual(publishConfigForPlatform({ ...profile, publish: { tiktok: { mode: 'global' } } }, 'tiktok'), { mode: 'global' });
 });

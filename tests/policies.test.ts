@@ -1,124 +1,91 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildCandidateVersion, buildSentences, applyRevision, applyResolvedInsert } from '../src/domain/policies.js';
+import { buildSentences, detectStrongSpeakers } from '../src/domain/policies.js';
 import type { TranscriptWord } from '../src/domain/model.js';
 
-function words(): TranscriptWord[] {
+function word(text: string, startSeconds: number, endSeconds: number, index: number, speakerId = 'A'): TranscriptWord {
+  return { id: `w_${index}`, text, startSeconds, endSeconds, speakerId, confidence: 0.9 };
+}
+
+function interleavedWords(): TranscriptWord[] {
   return [
-    word('A primeira ideia fecha aqui.', 0, 14),
-    word('A segunda ideia continua bem.', 15, 30),
-    word('A terceira ideia fecha agora.', 31, 46),
-    word('A quarta ideia traz o payoff final.', 47, 65),
+    word('oi', 0.0, 0.5, 0),
+    word('gente', 0.5, 1.0, 1),
+    word('blá', 1.0, 1.5, 2, 'B'),
+    word('blé', 1.5, 2.0, 3, 'B'),
+    word('voltando', 2.0, 2.5, 4),
+    word('ao', 2.5, 3.0, 5),
+    word('assunto.', 3.0, 3.5, 6),
   ];
 }
 
-function word(text: string, startSeconds: number, endSeconds: number): TranscriptWord {
-  return {
-    id: `w_${startSeconds}`,
-    text,
-    startSeconds,
-    endSeconds,
-    speakerId: 'speaker_0',
-    confidence: 0.9,
-  };
-}
-
-test('candidate builder rejects out-of-order ranges and keeps valid chronological candidates', () => {
-  const sentences = buildSentences(words());
-  const version = buildCandidateVersion('job_1', 1, null, 'initial', sentences, {
-    candidates: [
-      {
-        title: 'Inválido',
-        summary: 'Inválido',
-        hook: 'Inválido',
-        payoff: 'Inválido',
-        rationale: 'Inválido',
-        risk: 'medium',
-        segments: [
-          { start_sentence_id: sentences[2]!.id, end_sentence_id: sentences[3]!.id, why: 'x' },
-          { start_sentence_id: sentences[0]!.id, end_sentence_id: sentences[1]!.id, why: 'y' },
-        ],
-      },
-      {
-        title: 'Válido',
-        summary: 'Resumo',
-        hook: 'Hook',
-        payoff: 'Payoff',
-        rationale: 'Racional',
-        risk: 'low',
-        segments: [
-          { start_sentence_id: sentences[0]!.id, end_sentence_id: sentences[1]!.id, why: 'x' },
-          { start_sentence_id: sentences[2]!.id, end_sentence_id: sentences[3]!.id, why: 'y' },
-        ],
-      },
+test('buildSentences maps startWord/endWord back to the original array when another speaker is interleaved', () => {
+  const sentences = buildSentences(interleavedWords(), 'A');
+  assert.equal(sentences.length, 2);
+  assert.deepEqual(
+    sentences.map((sentence) => [sentence.startWord, sentence.endWord]),
+    [
+      [0, 1],
+      [4, 6],
     ],
-  });
-  assert.equal(version.candidates.length, 1);
-  assert.equal(version.candidates[0]?.title, 'Válido');
-  assert.equal(version.candidates[0]?.seamCount, 1);
+  );
+  assert.deepEqual(
+    sentences.map((sentence) => [sentence.index, sentence.speakerId]),
+    [
+      [0, 'A'],
+      [1, 'A'],
+    ],
+  );
+  assert.equal(sentences[0]!.text, 'oi gente');
+  assert.equal(sentences[1]!.text, 'voltando ao assunto.');
+  assert.equal(sentences[1]!.startSeconds, 2.0);
+  assert.equal(sentences[1]!.endSeconds, 3.5);
 });
 
-test('revision creates a new version and invalidates previous draft readiness', () => {
-  const sentences = buildSentences(words());
-  const version = buildCandidateVersion('job_1', 1, null, 'initial', sentences, {
-    candidates: [{
-      title: 'Válido',
-      summary: 'Resumo',
-      hook: 'Hook',
-      payoff: 'Payoff',
-      rationale: 'Racional',
-      risk: 'low',
-      segments: [{ start_sentence_id: sentences[0]!.id, end_sentence_id: sentences[3]!.id, why: 'x' }],
-    }],
-  });
-  version.candidates[0]!.draftReady = true;
-  const revised = applyRevision(version, version.candidates[0]!.id, [{ kind: 'retitle', title: 'Novo título' }, { kind: 'trim_end', seconds: 4 }], sentences);
-  assert.notEqual(revised.id, version.id);
-  assert.equal(revised.number, 2);
-  assert.equal(revised.candidates[0]?.title, 'Novo título');
-  assert.equal(revised.candidates[0]?.draftReady, false);
-  assert.ok((revised.candidates[0]?.durationSeconds ?? 0) < (version.candidates[0]?.durationSeconds ?? 0));
+test('buildSentences breaks on speaker changes, terminal punctuation and long gaps', () => {
+  const sentences = buildSentences(interleavedWords());
+  assert.deepEqual(
+    sentences.map((sentence) => [sentence.speakerId, sentence.startWord, sentence.endWord]),
+    [
+      ['A', 0, 1],
+      ['B', 2, 3],
+      ['A', 4, 6],
+    ],
+  );
+
+  const punctuated = buildSentences([word('fecha aqui.', 0, 0.5, 0), word('começa outro', 0.6, 1.1, 1)]);
+  assert.deepEqual(
+    punctuated.map((sentence) => [sentence.startWord, sentence.endWord]),
+    [
+      [0, 0],
+      [1, 1],
+    ],
+  );
+
+  const gapped = buildSentences([word('um', 0, 0.5, 0), word('dois', 5.0, 5.5, 1)]);
+  assert.equal(gapped.length, 2);
 });
 
-test('resolved insert keeps chronological order and produces a new seam', () => {
-  const sentences = buildSentences(words());
-  const version = buildCandidateVersion('job_1', 1, null, 'initial', sentences, {
-    candidates: [{
-      title: 'Válido',
-      summary: 'Resumo',
-      hook: 'Hook',
-      payoff: 'Payoff',
-      rationale: 'Racional',
-      risk: 'low',
-      segments: [
-        { start_sentence_id: sentences[0]!.id, end_sentence_id: sentences[1]!.id, why: 'x' },
-        { start_sentence_id: sentences[3]!.id, end_sentence_id: sentences[3]!.id, why: 'y' },
-      ],
-    }],
-  });
-  const revised = applyResolvedInsert(version, version.candidates[0]!.id, sentences[2]!.id, sentences[2]!.id, sentences);
-  assert.equal(revised.candidates[0]?.segments.length, 3);
-  assert.equal(revised.candidates[0]?.segments[1]?.startSentenceId, sentences[2]!.id);
-});
-
-test('speed and preview end card can be requested through revision actions', () => {
-  const sentences = buildSentences(words());
-  const version = buildCandidateVersion('job_1', 1, null, 'initial', sentences, {
-    candidates: [{
-      title: 'Válido',
-      summary: 'Resumo',
-      hook: 'Hook',
-      payoff: 'Payoff',
-      rationale: 'Racional',
-      risk: 'low',
-      segments: [{ start_sentence_id: sentences[0]!.id, end_sentence_id: sentences[3]!.id, why: 'x' }],
-    }],
-  });
-  const revised = applyRevision(version, version.candidates[0]!.id, [
-    { kind: 'set_speed', speed: 1.5 },
-    { kind: 'enable_preview_end_card' },
-  ], sentences);
-  assert.equal(revised.candidates[0]?.playbackSpeed, 1.5);
-  assert.equal(revised.candidates[0]?.previewEndCard, true);
-  assert.ok((revised.candidates[0]?.durationSeconds ?? 0) < (version.candidates[0]?.durationSeconds ?? 0));
+test('detectStrongSpeakers keeps only speakers above the threshold, loudest first', () => {
+  const words: TranscriptWord[] = [];
+  let index = 0;
+  for (let second = 0; second < 20; second += 1) {
+    words.push(word('palavra', second, second + 0.95, index++, 'main'));
+  }
+  for (let second = 20; second < 23; second += 1) {
+    words.push(word('palavra', second, second + 0.95, index++, 'side'));
+  }
+  for (let second = 23; second < 36; second += 1) {
+    words.push(word('palavra', second, second + 0.95, index++, 'other'));
+  }
+  const speakers = detectStrongSpeakers(words);
+  assert.deepEqual(
+    speakers.map((speaker) => speaker.speakerId),
+    ['main', 'other'],
+  );
+  assert.equal(speakers[0]!.totalSeconds, 19);
+  assert.equal(speakers[1]!.totalSeconds, 12.35);
+  assert.ok(speakers[0]!.sampleSentences.length > 0);
+  assert.ok(speakers[0]!.sampleSentences.length <= 3);
+  assert.ok(speakers[0]!.sampleSentences.every((sentence) => sentence.speakerId === 'main'));
 });

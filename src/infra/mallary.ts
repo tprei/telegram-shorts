@@ -1,9 +1,8 @@
 import { basename, extname } from 'node:path';
-import { readFile, unlink } from 'node:fs/promises';
-import { Candidate, InstagramReelCopy } from '../domain/model.js';
-import type { ShortVideoPlatform, ShortVideoPublishInput, ShortVideoPublishProvider, ShortVideoPublishResult } from './instagram-publisher.js';
+import { readFile } from 'node:fs/promises';
+import type { PublishCopy, ShortVideoPlatform } from '../domain/model.js';
+import type { ShortVideoPublishInput, ShortVideoPublishProvider, ShortVideoPublishResult } from './instagram-publisher.js';
 import { ShortVideoPublishError } from './instagram-publisher.js';
-import { runProcess } from './process.js';
 import { logError } from './util.js';
 
 const BASE_URL = 'https://mallary.ai';
@@ -239,48 +238,9 @@ function buildMallaryShortVideoPayload(input: {
   };
 }
 
-export async function createInstagramCoverImage(input: {
-  sourceVideoPath: string;
-  sourceThumbnailPath?: string | null;
-  candidate: Candidate;
-  outputPath: string;
-}): Promise<string> {
-  const fallbackFramePath = `${input.outputPath}.frame.jpg`;
-  const baseImagePath = input.sourceThumbnailPath ?? fallbackFramePath;
-  if (!input.sourceThumbnailPath) {
-    const probeSeconds = input.candidate.segments[0]
-      ? input.candidate.segments[0].startSeconds + Math.max(0.3, Math.min(2, (input.candidate.segments[0].endSeconds - input.candidate.segments[0].startSeconds) / 3))
-      : 1;
-    await runProcess('ffmpeg', [
-      '-y',
-      '-ss', probeSeconds.toFixed(3),
-      '-i', input.sourceVideoPath,
-      '-frames:v', '1',
-      fallbackFramePath,
-    ], { capture: false });
-  }
-  try {
-    await runProcess('ffmpeg', [
-      '-y',
-      '-loop', '1',
-      '-i', baseImagePath,
-      '-filter_complex', '[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=18:2[bg];[0:v]scale=920:920:force_original_aspect_ratio=decrease[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2[vout]',
-      '-map', '[vout]',
-      '-frames:v', '1',
-      '-update', '1',
-      input.outputPath,
-    ], { capture: false });
-  } finally {
-    if (!input.sourceThumbnailPath) {
-      await unlink(fallbackFramePath).catch(() => undefined);
-    }
-  }
-  return input.outputPath;
-}
-
-export function buildInstagramReelDescription(copy: InstagramReelCopy): string {
+export function buildPublishMessage(copy: PublishCopy): string {
   const hashtags = uniqueHashtags(copy.hashtags).slice(0, 6);
-  return `${ensureSentence(copy.line_1)}\n${ensureSentence(copy.line_2)}\n\n${hashtags.join(' ')}`;
+  return `${ensureSentence(copy.line1)}\n${ensureSentence(copy.line2)}\n\n${hashtags.join(' ')}`;
 }
 
 function normalizeCommentsUnderPost(values: string[] | undefined): string[] {

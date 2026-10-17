@@ -3,23 +3,34 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "main": "dist/index.js",
   "engines": {
     "node": ">=24"
   },
   "scripts": {
-    "dev": "tsx src/index.ts",
-    "build": "tsc",
+    "dev:server": "tsx watch src/index.ts",
+    "dev:web": "vite --config web/vite.config.ts",
+    "build:web": "vite build --config web/vite.config.ts",
+    "studio": "vite build --config web/vite.config.ts && tsx src/index.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p web/tsconfig.json --noEmit",
     "test": "tsx --test tests/*.test.ts",
-    "clean": "rm -rf dist",
-    "process-once": "tsx src/index.ts process-once"
+    "clean": "rm -rf dist web/dist"
   },
   "dependencies": {
+    "@hono/node-server": "^2.1.5",
+    "@tanstack/react-query": "^5.104.3",
+    "hono": "^4.13.13",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-router": "^8.4.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.20.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
     "tsx": "^4.22.4",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vite": "^8.3.4"
   }
 }

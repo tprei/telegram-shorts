@@ -1,14 +1,14 @@
 {
-  "version": 1,
+  "version": 2,
   "creatorId": "jones_manoel",
-  "layoutId": "center-speaker-vertical-crop-v1",
-  "regions": [
-    {
-      "id": "center-speaker",
-      "sourceRect": { "x": 0.342, "y": 0.0, "w": 0.316, "h": 1.0 },
-      "canvasRect": { "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0 },
-      "fit": "cover"
-    }
+  "layoutId": "center-speaker-vertical-v2",
+  "canvas": { "width": 1080, "height": 1920, "fps": 30 },
+  "background": "#101010",
+  "defaultSpeed": 1.0,
+  "font": { "family": "Montserrat ExtraBold", "file": "assets/fonts/Montserrat-ExtraBold.ttf", "assSizeScale": 1.562 },
+  "panels": [
+    { "id": "speaker", "role": "host", "sourceRect": { "x": 0.342, "y": 0, "w": 0.316, "h": 1 }, "canvasRect": { "x": 0, "y": 0, "w": 1, "h": 1 }, "anchor": { "x": 0.5, "y": 0.4 } }
   ],
-  "subtitleSafeArea": { "x": 0.08, "y": 0.72, "w": 0.84, "h": 0.18 }
+  "hookBand": { "rect": { "x": 0.05, "y": 0.07, "w": 0.9, "h": 0.11 }, "background": "#000000B3", "textColor": "#FFFFFF", "sizePx": 56, "maxCharsPerLine": 24, "maxLines": 2, "uppercase": true },
+  "captions": { "sizePx": 64, "textColor": "#FFFFFF", "highlightColor": "#FFD400", "outlineColor": "#000000", "outlinePx": 6, "shadowPx": 2, "uppercase": true, "maxWordsPerCue": 4, "maxCharsPerLine": 16, "maxLines": 2, "centerY": 0.72 }
 }

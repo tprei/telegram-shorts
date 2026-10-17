@@ -1,13 +1,17 @@
 #!/usr/bin/env node
 
-import { closeSync, openSync, unlinkSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { ShortsPipeline } from './application/pipeline.js';
+import { StudioService } from './application/studio-service.js';
+import type { QueueLane } from './domain/model.js';
 import { ShortsStore } from './infra/db.js';
 import { loadConfig } from './infra/env.js';
+import { CreatorProfileRepository } from './infra/creator-profile-loader.js';
+import { createShortVideoPublishProvider } from './infra/instagram-publisher-factory.js';
+import { acquireStudioLock } from './infra/studio-lock.js';
 import { OpenRouterClient } from './infra/openrouter.js';
-import { TelegramApi } from './infra/telegram.js';
-import { describeError } from './infra/util.js';
-import { ShortsWorkflow } from './application/workflow.js';
+import { describeError, logError } from './infra/util.js';
+import { createStudioApp, startStudioServer } from './studio/server.js';
 
 process.on('unhandledRejection', (reason) => {
   process.stderr.write(`[${new Date().toISOString()}] unhandledRejection: ${describeError(reason)}\n`);
@@ -19,111 +23,74 @@ process.on('uncaughtExceptionMonitor', (error) => {
 
 async function main(): Promise<void> {
   const config = loadConfig();
-  const store = await ShortsStore.open(config.dbPath);
-  store.requeueRunningTasks();
-  const openRouter = new OpenRouterClient(config);
-  const args = process.argv.slice(2).filter((value, index) => !(index === 0 && value === '--'));
-  if (args[0] === 'process-once') {
-    const url = args[1];
-    const speaker = readFlag(args, '--speaker') ?? 'host';
-    if (!url) {
-      throw new Error('Usage: process-once <youtube-url> --speaker "Name"');
-    }
-    const workflow = new ShortsWorkflow(config, store, null, openRouter);
-    const finalPath = await workflow.processOnce(url, speaker);
-    process.stdout.write(`${finalPath}\n`);
-    store.close();
-    return;
-  }
-  if (!config.TELEGRAM_BOT_TOKEN) {
-    throw new Error('TELEGRAM_BOT_TOKEN is required in bot mode.');
-  }
-  const lockFd = acquireLock(`${config.dbPath}.lock`);
-  let released = false;
+  const lock = acquireStudioLock(config.dbPath);
+  let lockReleased = false;
   const release = () => {
-    if (released) {
+    if (lockReleased) {
       return;
     }
-    released = true;
-    if (lockFd !== null) {
-      try {
-        closeSync(lockFd);
-      } catch {}
-      try {
-        unlinkSync(`${config.dbPath}.lock`);
-      } catch {}
+    lockReleased = true;
+    lock.release();
+  };
+  const store = await ShortsStore.open(config.dbPath);
+  let server: { close(): Promise<void> } | null = null;
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) {
+      return;
     }
+    shuttingDown = true;
+    try {
+      await server?.close();
+    } catch (error) {
+      logError('Studio server close failed', error);
+    }
+    release();
     try {
       store.close();
-    } catch {}
+    } catch (error) {
+      logError('Store close failed', error);
+    }
   };
   process.on('exit', release);
-  const telegram = new TelegramApi(config.TELEGRAM_BOT_TOKEN);
-  const workflow = new ShortsWorkflow(config, store, telegram, openRouter);
-  await telegram.deleteWebhook(false);
   process.on('SIGINT', () => {
-    release();
-    process.exit(0);
+    void shutdown().then(() => process.exit(0));
   });
   process.on('SIGTERM', () => {
-    release();
-    process.exit(0);
+    void shutdown().then(() => process.exit(0));
   });
-  await Promise.all([
-    pollTelegram(store, telegram, workflow, config.TELEGRAM_SHORTS_POLL_INTERVAL_MS),
-    runWorker(workflow),
-  ]);
+  store.requeueRunningTasks();
+  const openRouter = new OpenRouterClient(config);
+  const profiles = new CreatorProfileRepository({
+    rootDir: config.rootDir,
+    manifestPath: config.SHORTS_CREATOR_PROFILES_PATH,
+  });
+  const publisher = createShortVideoPublishProvider(config);
+  const studio = new StudioService({ config, store, openRouter, profiles, publisher });
+  const pipeline = new ShortsPipeline({ config, store, openRouter, profiles, publisher });
+  const app = createStudioApp({
+    api: studio,
+    media: studio,
+    webDistDir: config.webDistDir,
+    fontsDir: config.fontsDir,
+  });
+  const startedServer = await startStudioServer(app, config.SHORTS_STUDIO_PORT);
+  server = startedServer;
+  process.stdout.write(`Studio running at ${startedServer.url}\n`);
+  await Promise.all([runLane(pipeline, 'ingest'), runLane(pipeline, 'output')]);
 }
 
-async function pollTelegram(store: ShortsStore, telegram: TelegramApi, workflow: ShortsWorkflow, pollIntervalMs: number): Promise<never> {
-  let offset = Number(store.getSetting('last_update_id') ?? '0') + 1;
+async function runLane(pipeline: ShortsPipeline, lane: QueueLane): Promise<never> {
   while (true) {
     try {
-      const updates = await telegram.getUpdates(offset, 30);
-      for (const update of updates) {
-        const updateId = Number((update as { update_id?: number }).update_id ?? 0);
-        await workflow.handleUpdate(update);
-        if (updateId >= offset) {
-          offset = updateId + 1;
-          store.setSetting('last_update_id', String(updateId));
-        }
+      const didWork = await pipeline.runNext(lane);
+      if (!didWork) {
+        await sleep(500);
       }
     } catch (error) {
-      if (!isBenignTelegramPollError(error)) {
-        process.stderr.write(`[${new Date().toISOString()}] telegram poll failed: ${describeError(error)}\n`);
-      }
-      await sleep(pollIntervalMs);
-    }
-  }
-}
-
-function isBenignTelegramPollError(error: unknown): boolean {
-  const message = describeError(error);
-  return message.includes('UND_ERR_INFO') || message.includes('stream timeout') || message.includes('ECONNRESET');
-}
-
-async function runWorker(workflow: ShortsWorkflow): Promise<never> {
-  while (true) {
-    const didWork = await workflow.runNextTask();
-    if (!didWork) {
+      logError(`Pipeline lane ${lane} crashed`, error);
       await sleep(500);
     }
-  }
-}
-
-function readFlag(args: string[], flag: string): string | null {
-  const index = args.indexOf(flag);
-  if (index === -1) {
-    return null;
-  }
-  return args[index + 1] ?? null;
-}
-
-function acquireLock(path: string): number | null {
-  try {
-    return openSync(path, 'wx');
-  } catch {
-    throw new Error('telegram-shorts is already running.');
   }
 }
 

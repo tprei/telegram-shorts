@@ -1,303 +1,345 @@
-import { readFile, stat, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
-import { Candidate, LayoutProfile, RenderArtifact, TranscriptSentence, TranscriptWord } from '../domain/model.js';
-import { ensureParent, sha256 } from './util.js';
+import { stat, writeFile } from 'node:fs/promises';
+import { join, relative } from 'node:path';
+import type { LayoutProfile } from '../domain/layout.js';
+import type { Timeline, TimelineClip, TimelineEndCard } from '../domain/timeline.js';
+import { buildEndCardAss, buildExportAss } from './ass.js';
 import { runProcess } from './process.js';
-import { buildLayoutFilter } from './layout.js';
-import { buildAssSubtitles } from './subtitles.js';
+import { ensureParent } from './util.js';
 
-interface RenderProfileSettings {
-  width: number;
-  height: number;
-  fps: number;
-  videoBitrate: string;
-  audioBitrate: string;
-  crf: string;
-  preset: string;
-}
-
-export async function renderCandidate(input: {
-  jobId: string;
-  candidate: Candidate;
-  candidateVersionId: string;
-  kind: 'draft' | 'final';
+export interface ExportRenderInput {
+  timeline: Timeline;
+  layout: LayoutProfile;
   sourceVideoPath: string;
-  sourceTitle: string;
-  sourceThumbnailPath?: string | null;
-  transcriptWords: TranscriptWord[];
-  chosenSpeakerId?: string | null;
-  layoutProfile?: LayoutProfile | null;
-  artifactsDir: string;
-  renderTier?: 'dev' | 'prod';
-}): Promise<Omit<RenderArtifact, 'telegramMessageId' | 'status' | 'createdAt' | 'id'>> {
-  const profile = renderProfile(input.kind, input.renderTier);
-  const baseDir = resolve(input.artifactsDir, input.jobId, input.candidateVersionId, input.candidate.id, input.kind);
-  const clipsDir = join(baseDir, 'clips');
-  const listPath = join(baseDir, 'clips.txt');
-  const stitchedPath = join(baseDir, 'stitched.mp4');
-  const subtitlePath = join(baseDir, 'captions.ass');
-  const bodyPath = join(baseDir, 'body.mp4');
-  const endCardPath = join(baseDir, 'preview-end-card.mp4');
-  const concatPath = join(baseDir, 'final-parts.txt');
-  const artifactPath = join(baseDir, `${input.candidate.id}-${input.kind}.mp4`);
-  await ensureParent(join(clipsDir, 'noop'));
-  const clipPaths: string[] = [];
-  for (const [index, segment] of input.candidate.segments.entries()) {
-    const clipPath = join(clipsDir, `${String(index + 1).padStart(2, '0')}.mp4`);
-    await createClip({
-      sourceVideoPath: input.sourceVideoPath,
-      outputPath: clipPath,
-      startSeconds: segment.startSeconds,
-      endSeconds: segment.endSeconds,
-      profile,
-      layoutProfile: input.layoutProfile,
-      playbackSpeed: input.candidate.playbackSpeed ?? 1,
-    });
-    clipPaths.push(clipPath);
-  }
-  await writeFile(listPath, clipPaths.map((path) => `file '${path.replace(/'/g, "'\\''")}'`).join('\n'), 'utf-8');
-  await runProcess('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', stitchedPath], { capture: false });
-  await writeFile(subtitlePath, buildAssSubtitles({
-    candidate: input.candidate,
-    transcriptWords: input.transcriptWords,
-    chosenSpeakerId: input.chosenSpeakerId,
-    profile: input.kind,
-    layoutProfile: input.layoutProfile,
-    outputWidth: profile.width,
-    outputHeight: profile.height,
-  }), 'utf-8');
-  await burnSubtitles({
-    sourcePath: stitchedPath,
-    subtitlePath,
-    outputPath: bodyPath,
-    profile,
-  });
-  if (input.candidate.previewEndCard) {
-    await createPreviewEndCard({
-      sourcePath: input.sourceVideoPath,
-      sourceStartSeconds: input.candidate.segments[input.candidate.segments.length - 1]!.endSeconds,
-      sourceTitle: input.sourceTitle,
-      thumbnailPath: input.sourceThumbnailPath ?? undefined,
-      outputPath: endCardPath,
-      profile,
-    });
-    await writeFile(concatPath, [`file '${bodyPath.replace(/'/g, "'\\''")}'`, `file '${endCardPath.replace(/'/g, "'\\''")}'`].join('\n'), 'utf-8');
-    await runProcess('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', concatPath, '-c:v', 'libx264', '-preset', profile.preset, '-crf', profile.crf, '-b:v', profile.videoBitrate, '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', profile.audioBitrate, '-movflags', '+faststart', artifactPath], { capture: false });
-  } else {
-    await runProcess('ffmpeg', ['-y', '-i', bodyPath, '-c', 'copy', artifactPath], { capture: false });
-  }
-  const buffer = await readFile(artifactPath);
-  const fileStat = await stat(artifactPath);
-  return {
-    jobId: input.jobId,
-    candidateId: input.candidate.id,
-    candidateVersionId: input.candidateVersionId,
-    kind: input.kind,
-    profile: input.kind,
-    artifactPath,
-    subtitlePath,
-    sizeBytes: fileStat.size,
-    sha256: sha256(buffer),
-  };
+  workDir: string;
+  fontsDir: string;
+  endCardThumbnailPath: string | null;
 }
 
-async function createClip(input: {
+export interface ExportRenderResult {
+  artifactPath: string;
+  sizeBytes: number;
+  durationSeconds: number;
+}
+
+const CHUNK_MAX_SOURCE_GAP_SECONDS = 20;
+const CHUNK_MAX_CLIPS = 40;
+const FADE_SECONDS = 0.015;
+const AUDIO_SAMPLE_RATE = 48000;
+const LOUDNORM_FILTER = 'loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000';
+
+export async function renderShortExport(input: ExportRenderInput): Promise<ExportRenderResult> {
+  const { timeline, layout } = input;
+  if (timeline.clips.length === 0) {
+    throw new Error('Nothing to export: every word is cut');
+  }
+  const fps = timeline.canvas.fps;
+  const width = timeline.canvas.width;
+  const height = timeline.canvas.height;
+  const speed = timeline.speed;
+  const assPath = join(input.workDir, 'captions.ass');
+  await ensureParent(assPath);
+  await writeFile(assPath, buildExportAss({ timeline, layout }), 'utf-8');
+  const chunks = chunkClips(timeline.clips);
+  const chunkPaths: string[] = [];
+  for (const [index, clips] of chunks.entries()) {
+    const chunkPath = join(input.workDir, `chunk_${index}.mkv`);
+    await renderChunk({
+      clips,
+      nextClip: timeline.clips[clips[clips.length - 1]!.index + 1] ?? null,
+      sourceVideoPath: input.sourceVideoPath,
+      outputPath: chunkPath,
+      fps,
+      width,
+      height,
+      background: layout.background,
+      speed,
+    });
+    chunkPaths.push(chunkPath);
+  }
+  let endCardPath: string | null = null;
+  if (timeline.endCard) {
+    endCardPath = await renderEndCardMkv({
+      endCard: timeline.endCard,
+      lastClipEnd: timeline.clips[timeline.clips.length - 1]!.sourceEnd,
+      sourceVideoPath: input.sourceVideoPath,
+      workDir: input.workDir,
+      fontsDir: input.fontsDir,
+      fps,
+      thumbnailPath: input.endCardThumbnailPath,
+      layout,
+    });
+  }
+  const concatPath = join(input.workDir, 'chunks.txt');
+  const concatBody = `${chunkPaths.map((path) => `file '${path.replace(/'/g, "'\\''")}'`).join('\n')}\n`;
+  await writeFile(concatPath, concatBody, 'utf-8');
+  const artifactPath = join(input.workDir, 'short.mp4');
+  await encodeFinal({ concatPath, endCardPath, workDir: input.workDir, fontsDir: input.fontsDir, fps, outputPath: artifactPath });
+  const durationSeconds = await probeDurationSeconds(artifactPath);
+  const sizeBytes = (await stat(artifactPath)).size;
+  return { artifactPath, sizeBytes, durationSeconds };
+}
+
+async function renderChunk(input: {
+  clips: TimelineClip[];
+  nextClip: TimelineClip | null;
   sourceVideoPath: string;
   outputPath: string;
-  startSeconds: number;
-  endSeconds: number;
-  profile: RenderProfileSettings;
-  layoutProfile?: LayoutProfile | null;
-  playbackSpeed: number;
+  fps: number;
+  width: number;
+  height: number;
+  background: string;
+  speed: number;
 }): Promise<void> {
-  const duration = Math.max(0.1, input.endSeconds - input.startSeconds);
-  const speed = Math.max(1, input.playbackSpeed);
-  if (!input.layoutProfile) {
-    const vf = `${fallbackVisualFilter(input.profile.width, input.profile.height)},setpts=PTS/${speed}`;
-    await runProcess('ffmpeg', [
-      '-y',
-      '-ss', input.startSeconds.toFixed(3),
-      '-to', input.endSeconds.toFixed(3),
-      '-i', input.sourceVideoPath,
-      '-vf', vf,
-      '-r', String(input.profile.fps),
-      '-c:v', 'libx264',
-      '-preset', input.profile.preset,
-      '-crf', input.profile.crf,
-      '-b:v', input.profile.videoBitrate,
-      '-pix_fmt', 'yuv420p',
-      '-af', `atempo=${speed}`,
-      '-c:a', 'aac',
-      '-b:a', input.profile.audioBitrate,
-      '-movflags', '+faststart',
-      input.outputPath,
-    ], { capture: false });
-    return;
-  }
-  const filterComplex = `${buildLayoutFilter(input.layoutProfile, input.profile.width, input.profile.height, duration)};[vout]setpts=PTS/${speed}[vfinal]`;
+  await ensureParent(input.outputPath);
+  const chunkStart = input.clips[0]!.sourceStart;
+  const chunkEnd = input.clips[input.clips.length - 1]!.sourceEnd;
   await runProcess('ffmpeg', [
     '-y',
-    '-ss', input.startSeconds.toFixed(3),
-    '-to', input.endSeconds.toFixed(3),
+    '-ss', num(chunkStart),
+    '-to', num(chunkEnd),
     '-i', input.sourceVideoPath,
-    '-filter_complex', filterComplex,
-    '-map', '[vfinal]',
-    '-map', '0:a:0',
-    '-r', String(input.profile.fps),
+    '-filter_complex', buildChunkFilterGraph(input),
+    '-map', '[vc]',
+    '-map', '[ac]',
     '-c:v', 'libx264',
-    '-preset', input.profile.preset,
-    '-crf', input.profile.crf,
-    '-b:v', input.profile.videoBitrate,
+    '-preset', 'veryfast',
+    '-crf', '14',
     '-pix_fmt', 'yuv420p',
-    '-af', `atempo=${speed}`,
-    '-c:a', 'aac',
-    '-b:a', input.profile.audioBitrate,
-    '-movflags', '+faststart',
+    '-r', String(input.fps),
+    '-c:a', 'pcm_s16le',
+    '-ar', String(AUDIO_SAMPLE_RATE),
     input.outputPath,
-  ], { capture: false });
+  ]);
 }
 
-async function burnSubtitles(input: { sourcePath: string; subtitlePath: string; outputPath: string; profile: RenderProfileSettings }): Promise<void> {
-  await runProcess('ffmpeg', [
-    '-y',
-    '-i', input.sourcePath,
-    '-vf', buildSubtitlesFilterArg(input.subtitlePath),
-    '-c:v', 'libx264',
-    '-preset', input.profile.preset,
-    '-crf', input.profile.crf,
-    '-b:v', input.profile.videoBitrate,
-    '-pix_fmt', 'yuv420p',
-    '-c:a', 'copy',
-    '-movflags', '+faststart',
-    input.outputPath,
-  ], { capture: false });
-}
-
-async function createPreviewEndCard(input: { sourcePath: string; sourceStartSeconds: number; sourceTitle: string; thumbnailPath?: string; outputPath: string; profile: RenderProfileSettings }): Promise<void> {
-  const resolvedThumbPath = input.thumbnailPath ?? `${input.outputPath}.thumb.png`;
-  if (!input.thumbnailPath) {
-    await runProcess('ffmpeg', [
-      '-y',
-      '-ss', '1.000',
-      '-i', input.sourcePath,
-      '-frames:v', '1',
-      resolvedThumbPath,
-    ], { capture: false });
-  }
-  const titleLines = wrapTitle(input.sourceTitle, 22).slice(0, 3);
-  const titleDraw = titleLines
-    .map((line, index) => `drawtext=text='${escapeDrawtext(line)}':fontfile=/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf:fontcolor=white:fontsize=38:x=(w-text_w)/2:y=${74 + index * 48}`)
-    .join(',');
-  const titleBoxHeight = 90 + titleLines.length * 52;
-  const titleBox = `drawbox=x=36:y=40:w=iw-72:h=${titleBoxHeight}:color=black@0.45:t=fill`;
-  const linkBox = `drawbox=x=48:y=ih-240:w=iw-96:h=128:color=black@0.60:t=fill`;
-  const linkText = `drawtext=text='Link na descrição':fontfile=/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf:fontcolor=white:fontsize=42:x=(w-text_w)/2:y=h-168`;
-  await runProcess('ffmpeg', [
-    '-y',
-    '-ss', input.sourceStartSeconds.toFixed(3),
-    '-t', '2.4',
-    '-i', input.sourcePath,
-    '-loop', '1',
-    '-i', resolvedThumbPath,
-    '-filter_complex', `[0:v]scale=${input.profile.width}:${input.profile.height}:force_original_aspect_ratio=decrease,pad=${input.profile.width}:${input.profile.height}:(ow-iw)/2:(oh-ih)/2:color=black,boxblur=18:2[bg];[1:v]scale=360:-1[thumb];[bg][thumb]overlay=(W-w)/2:240[tmp];[tmp]${titleBox},${titleDraw},${linkBox},${linkText}[vout]`,
-    '-map', '[vout]',
-    '-map', '0:a:0',
-    '-r', String(input.profile.fps),
-    '-c:v', 'libx264',
-    '-preset', input.profile.preset,
-    '-crf', input.profile.crf,
-    '-b:v', input.profile.videoBitrate,
-    '-pix_fmt', 'yuv420p',
-    '-c:a', 'aac',
-    '-b:a', '96k',
-    '-shortest',
-    '-movflags', '+faststart',
-    input.outputPath,
-  ], { capture: false });
-}
-
-function wrapTitle(value: string, maxChars: number): string[] {
-  const words = value.split(/\s+/).filter(Boolean);
-  const lines: string[] = [];
-  let current = '';
-  for (const word of words) {
-    const next = current.length === 0 ? word : `${current} ${word}`;
-    if (next.length > maxChars && current.length > 0) {
-      lines.push(current);
-      current = word;
-      continue;
+function buildChunkFilterGraph(input: {
+  clips: TimelineClip[];
+  nextClip: TimelineClip | null;
+  fps: number;
+  width: number;
+  height: number;
+  background: string;
+  speed: number;
+}): string {
+  const parts: string[] = [];
+  const chunkStart = input.clips[0]!.sourceStart;
+  const clipCount = input.clips.length;
+  parts.push(`[0:v]split=${clipCount}${splitLabels('vsrc', clipCount, '')}`);
+  parts.push(`[0:a]asplit=${clipCount}${splitLabels('asrc', clipCount, '')}`);
+  input.clips.forEach((clip, index) => {
+    const trimStart = clip.sourceStart - chunkStart;
+    const trimEnd = clip.sourceEnd - chunkStart;
+    const outputDuration = (clip.sourceEnd - clip.sourceStart) / input.speed;
+    const audioSamples = Math.round(outputDuration * AUDIO_SAMPLE_RATE);
+    const fadeLength = Math.min(FADE_SECONDS, outputDuration / 2);
+    parts.push(
+      `[vsrc${index}]trim=start=${num(trimStart)}:end=${num(trimEnd)},setpts=(PTS-STARTPTS)/${num(input.speed)},fps=${input.fps},split=${clip.panels.length}${splitLabels(`vcrop${index}`, clip.panels.length, '_')}`,
+    );
+    clip.panels.forEach((panel, panelIndex) => {
+      parts.push(
+        `[vcrop${index}_${panelIndex}]crop=${panel.source.w}:${panel.source.h}:${panel.source.x}:${panel.source.y},scale=${panel.canvas.w}:${panel.canvas.h}:flags=lanczos,setsar=1[vscaled${index}_${panelIndex}]`,
+      );
+    });
+    parts.push(`color=c=${input.background}:s=${input.width}x${input.height}:r=${input.fps}:d=${num(outputDuration)}[vbase${index}]`);
+    let previousLabel = `[vbase${index}]`;
+    clip.panels.forEach((panel, panelIndex) => {
+      const last = panelIndex === clip.panels.length - 1;
+      const label = last ? `[vclip${index}]` : `[vover${index}_${panelIndex}]`;
+      parts.push(`${previousLabel}[vscaled${index}_${panelIndex}]overlay=x=${panel.canvas.x}:y=${panel.canvas.y}${last ? ',format=yuv420p' : ''}${label}`);
+      previousLabel = label;
+    });
+    const audioChain = [`[asrc${index}]atrim=start=${num(trimStart)}:end=${num(trimEnd)},asetpts=PTS-STARTPTS,aresample=${AUDIO_SAMPLE_RATE}`];
+    if (input.speed !== 1) {
+      audioChain.push(`atempo=${num(input.speed)}`);
     }
-    current = next;
+    if (!clip.joinsPrevious) {
+      audioChain.push(`afade=t=in:st=0:d=${num(fadeLength)}`);
+    }
+    const nextClip = index + 1 < clipCount ? input.clips[index + 1]! : input.nextClip;
+    if (nextClip === null || !nextClip.joinsPrevious) {
+      audioChain.push(`afade=t=out:st=${num(Math.max(0, outputDuration - fadeLength))}:d=${num(fadeLength)}`);
+    }
+    audioChain.push('apad', `atrim=end_sample=${audioSamples}`);
+    parts.push(`${audioChain.join(',')}[aclip${index}]`);
+  });
+  const pairs = input.clips.map((_, index) => `[vclip${index}][aclip${index}]`).join('');
+  parts.push(`${pairs}concat=n=${clipCount}:v=1:a=1[vc][ac]`);
+  return parts.join(';');
+}
+
+async function renderEndCardMkv(input: {
+  endCard: TimelineEndCard;
+  lastClipEnd: number;
+  sourceVideoPath: string;
+  workDir: string;
+  fontsDir: string;
+  fps: number;
+  thumbnailPath: string | null;
+  layout: LayoutProfile;
+}): Promise<string> {
+  const outputPath = join(input.workDir, 'end-card.mkv');
+  const backgroundPath = join(input.workDir, 'end-card-bg.jpg');
+  const videoStreamDuration = await probeVideoStreamDurationSeconds(input.sourceVideoPath);
+  const seekSeconds = Math.max(0, Math.min(input.lastClipEnd, videoStreamDuration) - 1 / input.fps);
+  await extractFrame({
+    videoPath: input.sourceVideoPath,
+    seconds: seekSeconds,
+    width: input.layout.canvas.width,
+    outputPath: backgroundPath,
+  });
+  const assPath = join(input.workDir, 'end-card.ass');
+  await writeFile(assPath, buildEndCardAss({ endCard: input.endCard, layout: input.layout }), 'utf-8');
+  const assArg = buildSubtitlesFilterArg('end-card.ass', relative(input.workDir, input.fontsDir));
+  const hasThumbnail = input.thumbnailPath !== null;
+  const width = input.layout.canvas.width;
+  const height = input.layout.canvas.height;
+  const darken = num(input.endCard.darkenFactor);
+  const background = `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},colorchannelmixer=rr=${darken}:gg=${darken}:bb=${darken},gblur=sigma=24,setsar=1`;
+  const thumbnailWidth = input.endCard.thumbnail.widthPx;
+  const thumbnailCenterY = input.endCard.thumbnail.centerY;
+  const graph = hasThumbnail
+    ? `[0:v]${background}[bg];[1:v]scale=${thumbnailWidth}:-2[thumb];[bg][thumb]overlay=x=(W-w)/2:y=${thumbnailCenterY}-h/2[card];[card]${assArg}[vout]`
+    : `[0:v]${background}[bg];[bg]${assArg}[vout]`;
+  const duration = num(input.endCard.durationSeconds);
+  const args: string[] = [
+    '-y',
+    '-loop', '1', '-t', duration, '-framerate', String(input.fps), '-i', backgroundPath,
+  ];
+  if (hasThumbnail) {
+    args.push('-loop', '1', '-t', duration, '-framerate', String(input.fps), '-i', input.thumbnailPath!);
+  }
+  args.push(
+    '-f', 'lavfi', '-t', duration, '-i', `anullsrc=r=${AUDIO_SAMPLE_RATE}:cl=stereo`,
+    '-filter_complex', graph,
+    '-map', '[vout]',
+    '-map', `${hasThumbnail ? 2 : 1}:a`,
+    '-c:v', 'libx264',
+    '-preset', 'veryfast',
+    '-crf', '14',
+    '-pix_fmt', 'yuv420p',
+    '-r', String(input.fps),
+    '-c:a', 'pcm_s16le',
+    '-ar', String(AUDIO_SAMPLE_RATE),
+    '-t', duration,
+    outputPath,
+  );
+  await runProcess('ffmpeg', args, { cwd: input.workDir });
+  return outputPath;
+}
+
+async function encodeFinal(input: {
+  concatPath: string;
+  endCardPath: string | null;
+  workDir: string;
+  fontsDir: string;
+  fps: number;
+  outputPath: string;
+}): Promise<void> {
+  await ensureParent(input.outputPath);
+  const assArg = buildSubtitlesFilterArg('captions.ass', relative(input.workDir, input.fontsDir));
+  const filterComplex = input.endCardPath
+    ? `[0:v]${assArg}[vmain];[vmain][0:a][1:v][1:a]concat=n=2:v=1:a=1[vcat][acat];[acat]${LOUDNORM_FILTER}[aout]`
+    : `[0:v]${assArg}[vcat];[0:a]${LOUDNORM_FILTER}[aout]`;
+  const args = ['-y', '-f', 'concat', '-safe', '0', '-i', input.concatPath];
+  if (input.endCardPath) {
+    args.push('-i', input.endCardPath);
+  }
+  args.push(
+    '-filter_complex', filterComplex,
+    '-map', '[vcat]',
+    '-map', '[aout]',
+    '-c:v', 'libx264',
+    '-preset', 'medium',
+    '-crf', '20',
+    '-profile:v', 'high',
+    '-pix_fmt', 'yuv420p',
+    '-r', String(input.fps),
+    '-c:a', 'aac',
+    '-b:a', '160k',
+    '-ar', String(AUDIO_SAMPLE_RATE),
+    '-movflags', '+faststart',
+    input.outputPath,
+  );
+  await runProcess('ffmpeg', args, { cwd: input.workDir });
+}
+
+export async function extractFrame(input: { videoPath: string; seconds: number; width: number; outputPath: string }): Promise<void> {
+  await ensureParent(input.outputPath);
+  await runProcess('ffmpeg', [
+    '-y',
+    '-ss', num(input.seconds),
+    '-i', input.videoPath,
+    '-frames:v', '1',
+    '-vf', `scale=${input.width}:-2`,
+    '-q:v', '3',
+    input.outputPath,
+  ]);
+  try {
+    await stat(input.outputPath);
+  } catch {
+    throw new Error(`ffmpeg wrote no frame to ${input.outputPath}`);
+  }
+}
+
+export function buildSubtitlesFilterArg(assPath: string, fontsDir: string): string {
+  return `ass=filename=${escapeFiltergraphValue(assPath)}:fontsdir=${escapeFiltergraphValue(fontsDir)}`;
+}
+
+function escapeFiltergraphValue(value: string): string {
+  const optionLevel = value.replace(/['\\:]/g, '\\$&');
+  return optionLevel.replace(/['\\]/g, '\\$&');
+}
+
+function chunkClips(clips: TimelineClip[]): TimelineClip[][] {
+  const chunks: TimelineClip[][] = [];
+  let current: TimelineClip[] = [];
+  for (const clip of clips) {
+    const previous = current[current.length - 1];
+    if (
+      previous !== undefined &&
+      !clip.joinsPrevious &&
+      (clip.sourceStart - previous.sourceEnd > CHUNK_MAX_SOURCE_GAP_SECONDS || current.length >= CHUNK_MAX_CLIPS)
+    ) {
+      chunks.push(current);
+      current = [];
+    }
+    current.push(clip);
   }
   if (current.length > 0) {
-    lines.push(current);
+    chunks.push(current);
   }
-  return lines.slice(0, 3);
+  return chunks;
 }
 
-function escapeDrawtext(value: string): string {
-  return value.replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, "\\'").replace(/\n/g, '\\\\n');
+function splitLabels(prefix: string, count: number, separator: string): string {
+  return Array.from({ length: count }, (_, index) => `[${prefix}${separator}${index}]`).join('');
 }
 
-export function buildSubtitlesFilterArg(path: string): string {
-  return `subtitles=filename='${escapeFilterValue(path)}'`;
-}
-
-function escapeFilterValue(value: string): string {
-  return value
-    .replaceAll('\\', '\\\\')
-    .replaceAll("'", "\\'")
-    .replaceAll(':', '\\:')
-    .replaceAll(',', '\\,')
-    .replaceAll(';', '\\;')
-    .replaceAll('[', '\\[')
-    .replaceAll(']', '\\]');
-}
-
-function fallbackVisualFilter(width: number, height: number): string {
-  return `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black`;
-}
-
-function renderProfile(kind: 'draft' | 'final', tierOverride?: 'dev' | 'prod'): RenderProfileSettings {
-  const tier = tierOverride ?? (process.env.TELEGRAM_SHORTS_RENDER_TIER === 'prod' ? 'prod' : 'dev');
-  if (tier === 'dev') {
-    return kind === 'draft'
-      ? {
-          width: 480,
-          height: 854,
-          fps: 24,
-          videoBitrate: '550k',
-          audioBitrate: '96k',
-          crf: '30',
-          preset: 'veryfast',
-        }
-      : {
-          width: 480,
-          height: 854,
-          fps: 24,
-          videoBitrate: '700k',
-          audioBitrate: '96k',
-          crf: '28',
-          preset: 'veryfast',
-        };
+async function probeVideoStreamDurationSeconds(path: string): Promise<number> {
+  const { stdout } = await runProcess('ffprobe', [
+    '-v', 'error',
+    '-select_streams', 'v:0',
+    '-show_entries', 'stream=duration',
+    '-of', 'default=noprint_wrappers=1:nokey=1',
+    path,
+  ]);
+  const duration = Number(stdout.trim());
+  if (!Number.isFinite(duration) || duration <= 0) {
+    throw new Error(`No video stream duration found in ${path}`);
   }
-  return kind === 'draft'
-    ? {
-        width: 480,
-        height: 854,
-        fps: 24,
-        videoBitrate: '550k',
-        audioBitrate: '96k',
-        crf: '30',
-        preset: 'veryfast',
-      }
-    : {
-        width: 720,
-        height: 1280,
-        fps: 24,
-        videoBitrate: '1500k',
-        audioBitrate: '128k',
-        crf: '24',
-        preset: 'medium',
-      };
+  return duration;
+}
+
+async function probeDurationSeconds(path: string): Promise<number> {
+  const { stdout } = await runProcess('ffprobe', [
+    '-v', 'error',
+    '-show_entries', 'format=duration',
+    '-of', 'default=noprint_wrappers=1:nokey=1',
+    path,
+  ]);
+  return Number(stdout.trim());
+}
+
+function num(value: number): string {
+  return String(Number(value.toFixed(6)));
 }

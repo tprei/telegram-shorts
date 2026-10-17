@@ -1,27 +1,10 @@
 import { z } from 'zod';
+import type { ShortEdit } from './edit.js';
+import type { LayoutProfile } from './layout.js';
 
-export type JobStatus =
-  | 'queued'
-  | 'acquiring_source'
-  | 'transcribing'
-  | 'awaiting_speaker_confirmation'
-  | 'planning_candidates'
-  | 'rendering_drafts'
-  | 'awaiting_review'
-  | 'applying_revision'
-  | 'rendering_final'
-  | 'final_uploading'
-  | 'completed'
-  | 'failed';
+export type ShortVideoPlatform = 'instagram' | 'tiktok' | 'youtube_shorts';
 
-export type QueueTaskKind =
-  | 'process_source'
-  | 'plan_candidates'
-  | 'render_draft'
-  | 'apply_revision'
-  | 'render_final'
-  | 'publish_instagram'
-  | 'publish_short_video';
+export const SHORT_VIDEO_PLATFORMS: readonly ShortVideoPlatform[] = ['instagram', 'tiktok', 'youtube_shorts'];
 
 export type TranscriptProvider = 'deepgram' | 'scribe';
 
@@ -38,6 +21,8 @@ export interface TranscriptSentence {
   id: string;
   index: number;
   speakerId: string;
+  startWord: number;
+  endWord: number;
   startSeconds: number;
   endSeconds: number;
   text: string;
@@ -62,15 +47,6 @@ export interface SemanticBlock {
   text: string;
 }
 
-export interface CandidateSegment {
-  id: string;
-  startSentenceId: string;
-  endSentenceId: string;
-  startSeconds: number;
-  endSeconds: number;
-  text: string;
-}
-
 export interface CandidateArcStep {
   kind: SemanticBlockKind;
   label: string;
@@ -84,97 +60,33 @@ export interface CandidateArc {
   steps: CandidateArcStep[];
 }
 
-export interface Candidate {
-  id: string;
-  rank: number;
-  title: string;
-  summary: string;
-  hook: string;
-  payoff: string;
-  rationale: string;
+export interface SourceMedia {
+  videoPath: string;
+  audioPath: string;
+  thumbnailPath: string | null;
+  width: number;
+  height: number;
+  fps: number;
   durationSeconds: number;
-  seamCount: number;
-  risk: 'low' | 'medium' | 'high';
-  segments: CandidateSegment[];
-  arc: CandidateArc | null;
-  arcPreviewPath: string | null;
-  playbackSpeed: number;
-  previewEndCard: boolean;
-  draftReady: boolean;
-  rejected: boolean;
 }
 
-export interface CandidateVersion {
-  id: string;
-  jobId: string;
-  number: number;
-  parentId: string | null;
-  source: 'initial' | 'revision';
-  createdAt: string;
-  candidates: Candidate[];
-}
+export type JobStatus = 'queued' | 'downloading' | 'transcribing' | 'awaiting_speaker' | 'planning' | 'ready' | 'failed';
 
-export interface RenderArtifact {
-  id: string;
-  jobId: string;
-  candidateId: string;
-  candidateVersionId: string;
-  kind: 'draft' | 'final';
-  profile: 'draft' | 'final';
-  status: 'queued' | 'rendering' | 'ready' | 'sent' | 'failed';
-  artifactPath: string;
-  subtitlePath: string;
-  sizeBytes: number;
-  sha256: string;
-  telegramMessageId: number | null;
-  createdAt: string;
-}
+export type QueueTaskKind = 'process_source' | 'plan_shorts' | 'analyze_crops' | 'export_short' | 'publish_short_video';
 
-export interface MessageBindings {
-  overviewMessageId: number | null;
-  speakerPromptMessageId: number | null;
-}
+export type QueueLane = 'ingest' | 'output';
 
-export interface JobRecord {
-  id: string;
-  sourceUrl: string;
-  sourceTitle: string | null;
-  status: JobStatus;
-  operatorChatId: string;
-  operatorUserId: string;
-  transcriptProvider: TranscriptProvider;
-  creatorProfileId?: string | null;
-  creatorProfileSnapshot?: CreatorProfile | null;
-  layoutProfileId?: string | null;
-  layoutProfileSnapshot?: LayoutProfile | null;
-  profileSelectionSource?: ProfileSelectionSource;
-  sourceVideoPath: string | null;
-  sourceAudioPath: string | null;
-  sourceThumbnailPath: string | null;
-  transcriptPath: string | null;
-  sentencesPath: string | null;
-  semanticBlocksPath: string | null;
-  transcriptWords: TranscriptWord[];
-  transcriptSentences: TranscriptSentence[];
-  semanticBlocks: SemanticBlock[];
-  chosenSpeakerId: string | null;
-  strongSpeakers: SpeakerSample[];
-  currentCandidateVersionId: string | null;
-  approvedRenderId: string | null;
-  finalRenderId: string | null;
-  messages: MessageBindings;
-  error: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
+export const QUEUE_LANES: Record<QueueLane, readonly QueueTaskKind[]> = {
+  ingest: ['process_source', 'plan_shorts', 'analyze_crops'],
+  output: ['export_short', 'publish_short_video'],
+};
 
-export interface PendingReplyContext {
-  chatId: string;
-  jobId: string;
-  candidateId: string;
-  candidateVersionId: string;
-  anchorMessageId: number;
-  kind: 'revision';
+export interface QueueTaskPayloads {
+  process_source: Record<string, never>;
+  plan_shorts: Record<string, never>;
+  analyze_crops: { shortId: string };
+  export_short: { exportId: string };
+  publish_short_video: { publicationId: string };
 }
 
 export interface QueueTask {
@@ -187,6 +99,131 @@ export interface QueueTask {
   availableAt: string | null;
   startedAt: string | null;
   error: string | null;
+}
+
+export interface JobRecord {
+  id: string;
+  sourceUrl: string;
+  sourceTitle: string | null;
+  status: JobStatus;
+  progress: string | null;
+  creatorProfileId: string;
+  creatorProfileSnapshot: CreatorProfile;
+  layoutProfileSnapshot: LayoutProfile;
+  transcriptProvider: TranscriptProvider;
+  media: SourceMedia | null;
+  transcriptWords: TranscriptWord[];
+  transcriptSentences: TranscriptSentence[];
+  semanticBlocks: SemanticBlock[];
+  strongSpeakers: SpeakerSample[];
+  chosenSpeakerId: string | null;
+  failedTaskKind: QueueTaskKind | null;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type ShortStatus = 'active' | 'rejected';
+
+export type JobSummaryRecord = Omit<JobRecord, 'transcriptWords' | 'transcriptSentences' | 'semanticBlocks'>;
+
+export type CropAnalysisStatus = 'none' | 'queued' | 'running' | 'done' | 'failed';
+
+export interface PublishCopy {
+  line1: string;
+  line2: string;
+  hashtags: string[];
+}
+
+export interface ShortRecord {
+  id: string;
+  jobId: string;
+  rank: number;
+  origin: 'planner' | 'manual';
+  title: string;
+  summary: string;
+  rationale: string;
+  hook: string;
+  payoff: string;
+  risk: 'low' | 'medium' | 'high';
+  arc: CandidateArc | null;
+  status: ShortStatus;
+  edit: ShortEdit;
+  editRevision: number;
+  cropAnalysis: CropAnalysisStatus;
+  cropAnalysisError: string | null;
+  publishCopy: PublishCopy | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type ExportStatus = 'queued' | 'rendering' | 'ready' | 'failed';
+
+export interface ExportRecord {
+  id: string;
+  jobId: string;
+  shortId: string;
+  editRevision: number;
+  edit: ShortEdit;
+  title: string;
+  status: ExportStatus;
+  artifactPath: string | null;
+  sizeBytes: number | null;
+  durationSeconds: number | null;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type PublicationStatus = 'queued' | 'publishing' | 'published' | 'deferred' | 'failed';
+
+export interface PublicationRecord {
+  id: string;
+  jobId: string;
+  shortId: string;
+  exportId: string;
+  platform: ShortVideoPlatform;
+  status: PublicationStatus;
+  forced: boolean;
+  provider: string | null;
+  batchId: string | null;
+  remoteJobs: Array<{ platform: string; jobId: string }>;
+  error: string | null;
+  availableAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type CreatorPublishMode = 'disabled' | 'global';
+
+export interface CreatorPlatformPublishConfig {
+  mode: CreatorPublishMode;
+}
+
+export interface CreatorPublishConfig {
+  instagram?: CreatorPlatformPublishConfig;
+  tiktok?: CreatorPlatformPublishConfig;
+  youtube_shorts?: CreatorPlatformPublishConfig;
+}
+
+export interface CreatorRenderConfig {
+  layoutPath: string;
+  layoutId: string;
+}
+
+export interface CreatorProfile {
+  id: string;
+  displayName: string;
+  enabled: boolean;
+  description?: string;
+  render: CreatorRenderConfig;
+  publish?: CreatorPublishConfig;
+}
+
+export interface CreatorProfileManifest {
+  version: 2;
+  defaultCreatorId?: string;
+  creators: CreatorProfile[];
 }
 
 export const SemanticBlockKindSchema = z.enum(['hook', 'setup', 'turn', 'explain', 'evidence', 'payoff']);
@@ -216,6 +253,7 @@ const PlannedCandidateLikeSchema = z.strictObject({
   title: z.string().min(1),
   summary: z.string().min(1),
   hook: z.string().min(1),
+  hook_text: z.string().min(1).max(90),
   payoff: z.string().min(1),
   rationale: z.string().min(1),
   thesis: z.string().min(1),
@@ -241,20 +279,24 @@ export const OpportunityPlanResponseSchema = z.strictObject({
 
 export type OpportunityPlanResponse = z.infer<typeof OpportunityPlanResponseSchema>;
 
+export const RevisionActionSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('retitle'), title: z.string().min(1) }),
+  z.strictObject({ kind: z.literal('set_hook'), text: z.string().min(1).max(90) }),
+  z.strictObject({ kind: z.literal('trim_start'), seconds: z.number().positive() }),
+  z.strictObject({ kind: z.literal('trim_end'), seconds: z.number().positive() }),
+  z.strictObject({ kind: z.literal('extend_start'), seconds: z.number().positive() }),
+  z.strictObject({ kind: z.literal('extend_end'), seconds: z.number().positive() }),
+  z.strictObject({ kind: z.literal('insert_span'), query: z.string().min(1) }),
+  z.strictObject({ kind: z.literal('remove_span'), query: z.string().min(1) }),
+  z.strictObject({ kind: z.literal('set_speed'), speed: z.number().min(1).max(1.5) }),
+  z.strictObject({ kind: z.literal('enable_end_card') }),
+  z.strictObject({ kind: z.literal('disable_end_card') }),
+]);
+
+export type RevisionAction = z.infer<typeof RevisionActionSchema>;
+
 export const RevisionIntentSchema = z.strictObject({
-  actions: z.array(z.discriminatedUnion('kind', [
-    z.strictObject({ kind: z.literal('retitle'), title: z.string().min(1) }),
-    z.strictObject({ kind: z.literal('caption_cleanup') }),
-    z.strictObject({ kind: z.literal('trim_start'), seconds: z.number().positive() }),
-    z.strictObject({ kind: z.literal('trim_end'), seconds: z.number().positive() }),
-    z.strictObject({ kind: z.literal('extend_start'), seconds: z.number().positive() }),
-    z.strictObject({ kind: z.literal('extend_end'), seconds: z.number().positive() }),
-    z.strictObject({ kind: z.literal('insert_span'), query: z.string().min(1) }),
-    z.strictObject({ kind: z.literal('reorder_candidate'), rank: z.number().int().min(1).max(5) }),
-    z.strictObject({ kind: z.literal('set_speed'), speed: z.number().positive().max(1.5) }),
-    z.strictObject({ kind: z.literal('enable_preview_end_card') }),
-    z.strictObject({ kind: z.literal('disable_preview_end_card') }),
-  ])).min(1),
+  actions: z.array(RevisionActionSchema).min(1),
   summary: z.string().min(1),
 });
 
@@ -268,94 +310,28 @@ export const TranscriptSpanLocateSchema = z.strictObject({
 
 export type TranscriptSpanLocate = z.infer<typeof TranscriptSpanLocateSchema>;
 
-export const InstagramReelCopySchema = z.strictObject({
+export const PublishCopyResponseSchema = z.strictObject({
   line_1: z.string().min(1).max(180),
   line_2: z.string().min(1).max(180),
   hashtags: z.array(z.string().min(2).max(40)).min(3).max(6),
 });
 
-export type InstagramReelCopy = z.infer<typeof InstagramReelCopySchema>;
+export type PublishCopyResponse = z.infer<typeof PublishCopyResponseSchema>;
 
-export interface LayoutRegion {
-  id: string;
-  sourceRect: { x: number; y: number; w: number; h: number };
-  canvasRect: { x: number; y: number; w: number; h: number };
-  fit: 'cover' | 'contain';
-}
+export const HookSuggestionsResponseSchema = z.strictObject({
+  options: z.array(z.string().min(1).max(90)).length(3),
+});
 
-export interface SubtitleSafeArea {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-}
+export type HookSuggestionsResponse = z.infer<typeof HookSuggestionsResponseSchema>;
 
-export interface LayoutProfile {
-  version: 1;
-  creatorId: string;
-  layoutId: string;
-  defaultPlaybackSpeed?: number;
-  regions: LayoutRegion[];
-  subtitleSafeArea: SubtitleSafeArea;
-}
+export const CropFocusResponseSchema = z.strictObject({
+  box_2d: z.tuple([
+    z.number().int().min(0).max(1000),
+    z.number().int().min(0).max(1000),
+    z.number().int().min(0).max(1000),
+    z.number().int().min(0).max(1000),
+  ]),
+  reason: z.string().min(1),
+}).refine(({ box_2d: [ymin, xmin, ymax, xmax] }) => ymin < ymax && xmin < xmax, { message: 'box_2d must have ymin < ymax and xmin < xmax' });
 
-export type CreatorPublishMode = 'disabled' | 'global' | 'profile';
-
-export interface CreatorPlatformPublishConfig {
-  mode: CreatorPublishMode;
-  provider?: string | null;
-  fallbackToGlobal?: boolean;
-  configRef?: string | null;
-}
-
-export interface CreatorPublishConfig {
-  instagram?: CreatorPlatformPublishConfig;
-  tiktok?: CreatorPlatformPublishConfig;
-  youtube_shorts?: CreatorPlatformPublishConfig;
-}
-
-export interface CreatorRenderConfig {
-  layoutPath?: string | null;
-  layoutId?: string | null;
-  snapshotLayoutInJobs?: boolean;
-}
-
-export interface CreatorTelegramConfig {
-  buttonLabel?: string;
-  aliases?: string[];
-}
-
-export interface CreatorProfile {
-  id: string;
-  displayName: string;
-  enabled: boolean;
-  description?: string;
-  telegram?: CreatorTelegramConfig;
-  render: CreatorRenderConfig;
-  publish?: CreatorPublishConfig;
-}
-
-export interface CreatorProfileManifest {
-  version: 1;
-  defaultCreatorId?: string;
-  creators: CreatorProfile[];
-}
-
-export type ProfileSelectionSource = 'explicit' | 'chat_default' | 'env_default' | 'manifest_default' | 'first_enabled' | 'legacy_static_layout';
-
-export interface TelegramUpdateEnvelope {
-  update_id: number;
-  message?: {
-    message_id: number;
-    text?: string;
-    chat?: { id: number | string };
-    from?: { id: number | string };
-    reply_to_message?: { message_id: number };
-  };
-  callback_query?: {
-    id: string;
-    data?: string;
-    from?: { id: number | string };
-    message?: { message_id: number; chat?: { id: number | string } };
-  };
-}
+export type CropFocusResponse = z.infer<typeof CropFocusResponseSchema>;

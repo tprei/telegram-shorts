@@ -5,7 +5,7 @@ import { runProcess } from './process.js';
 import { TranscriptProvider, TranscriptWord } from '../domain/model.js';
 
 export async function transcribeSource(config: AppConfig, audioPath: string): Promise<TranscriptWord[]> {
-  const provider = config.TELEGRAM_SHORTS_TRANSCRIPT_PROVIDER as TranscriptProvider;
+  const provider = config.SHORTS_TRANSCRIPT_PROVIDER as TranscriptProvider;
   if (provider === 'scribe') {
     if (!config.ELEVENLABS_API_KEY) {
       throw new Error('ELEVENLABS_API_KEY is required for scribe transcription.');

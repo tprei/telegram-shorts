@@ -1,8 +1,8 @@
-import { Candidate, CandidateArc, CandidateArcStep, CandidateSegment, CandidateVersion, OpportunityPlanResponse, PlannedCandidateResponse, SemanticBlock, SemanticBlockKind, SemanticBlockResponseSet, TranscriptSentence } from './model.js';
-import { createId, nowIso } from '../infra/util.js';
+import type { WordRange } from './edit.js';
+import type { CandidateArc, CandidateArcStep, OpportunityPlanResponse, PlannedCandidateResponse, SemanticBlock, SemanticBlockKind, SemanticBlockResponseSet, TranscriptSentence } from './model.js';
 
-const MIN_DURATION_SECONDS = 40;
-const MAX_DURATION_SECONDS = 220;
+const MIN_DURATION_SECONDS = 30;
+const MAX_DURATION_SECONDS = 180;
 
 export function fallbackSemanticBlocks(sentences: TranscriptSentence[]): SemanticBlock[] {
   const blocks: SemanticBlock[] = [];
@@ -94,6 +94,7 @@ export function opportunityPlanToCandidatePlan(plan: OpportunityPlanResponse): P
       title: opportunity.title,
       summary: opportunity.summary,
       hook: opportunity.hook,
+      hook_text: opportunity.hook_text,
       payoff: opportunity.payoff,
       rationale: opportunity.rationale,
       thesis: opportunity.thesis,
@@ -112,40 +113,60 @@ export interface CandidatePlanDiagnostic {
   reasons: string[];
 }
 
-export function diagnoseCandidatePlan(sentences: TranscriptSentence[], blocks: SemanticBlock[], plan: PlannedCandidateResponse, playbackSpeed = 1): CandidatePlanDiagnostic[] {
-  return plan.candidates.map((candidate, index) => diagnoseCandidateFromBlocks(sentences, blocks, candidate, index, playbackSpeed));
+export function diagnoseCandidatePlan(sentences: TranscriptSentence[], blocks: SemanticBlock[], plan: PlannedCandidateResponse, speed = 1): CandidatePlanDiagnostic[] {
+  return plan.candidates.map((candidate, index) => diagnoseCandidateFromBlocks(sentences, blocks, candidate, index, speed));
 }
 
-export function buildCandidateVersionFromBlocks(jobId: string, versionNumber: number, parentId: string | null, source: 'initial' | 'revision', sentences: TranscriptSentence[], blocks: SemanticBlock[], plan: PlannedCandidateResponse, playbackSpeed = 1): CandidateVersion {
-  const candidates: Candidate[] = [];
-  const seen = new Set<string>();
-  for (const raw of plan.candidates) {
-    const candidate = validateCandidateFromBlocks(sentences, blocks, raw, candidates.length + 1, playbackSpeed);
-    if (!candidate) {
-      continue;
-    }
-    const signature = candidate.segments.map((segment) => `${segment.startSentenceId}:${segment.endSentenceId}`).join('|');
-    if (seen.has(signature)) {
-      continue;
-    }
-    seen.add(signature);
-    candidates.push(candidate);
-    if (candidates.length >= 5) {
+export interface PlannedShort {
+  title: string;
+  summary: string;
+  hook: string;
+  hookText: string;
+  payoff: string;
+  rationale: string;
+  risk: 'low' | 'medium' | 'high';
+  arc: CandidateArc | null;
+  ranges: WordRange[];
+  rawDurationSeconds: number;
+}
+
+export function buildPlannedShorts(input: { sentences: TranscriptSentence[]; blocks: SemanticBlock[]; plan: PlannedCandidateResponse; speed: number }): PlannedShort[] {
+  const shorts: PlannedShort[] = [];
+  const seenSignatures = new Set<string>();
+  for (const raw of input.plan.candidates) {
+    if (shorts.length >= 5) {
       break;
     }
+    const diagnostic = diagnoseCandidateFromBlocks(input.sentences, input.blocks, raw, shorts.length, input.speed);
+    if (diagnostic.reasons.length > 0) {
+      continue;
+    }
+    const orderedBlocks = resolveOrderedBlocks(input.blocks, raw);
+    const spans = mergeBlocksIntoSpans(orderedBlocks, input.sentences);
+    const ranges: WordRange[] = spans.map((span) => ({ startWord: span.first.startWord, endWord: span.last.endWord }));
+    const signature = ranges.map((range) => `${range.startWord}:${range.endWord}`).join('|');
+    if (seenSignatures.has(signature)) {
+      continue;
+    }
+    seenSignatures.add(signature);
+    const arc = buildCandidateArc(raw.thesis, orderedBlocks, raw.steps);
+    shorts.push({
+      title: raw.title.trim(),
+      summary: raw.summary.trim(),
+      hook: raw.hook.trim(),
+      hookText: raw.hook_text.trim(),
+      payoff: raw.payoff.trim(),
+      rationale: raw.rationale.trim(),
+      risk: raw.risk,
+      arc: arc.steps.length > 0 ? arc : null,
+      ranges,
+      rawDurationSeconds: roundSeconds(spans.reduce((sum, span) => sum + (span.last.endSeconds - span.first.startSeconds), 0)),
+    });
   }
-  return {
-    id: createId('cv'),
-    jobId,
-    number: versionNumber,
-    parentId,
-    source,
-    createdAt: nowIso(),
-    candidates,
-  };
+  return shorts;
 }
 
-function diagnoseCandidateFromBlocks(sentences: TranscriptSentence[], blocks: SemanticBlock[], raw: PlannedCandidateResponse['candidates'][number], index: number, playbackSpeed = 1): CandidatePlanDiagnostic {
+function diagnoseCandidateFromBlocks(sentences: TranscriptSentence[], blocks: SemanticBlock[], raw: PlannedCandidateResponse['candidates'][number], index: number, speed = 1): CandidatePlanDiagnostic {
   const byBlockId = new Map(blocks.map((block) => [block.id, block]));
   const reasons: string[] = [];
   const missingBlockIds = raw.block_ids.filter((id) => !byBlockId.has(id));
@@ -167,12 +188,12 @@ function diagnoseCandidateFromBlocks(sentences: TranscriptSentence[], blocks: Se
   if (!sameOrder(selectedBlocks, orderedBlocks)) {
     reasons.push('blocks are not in chronological order');
   }
-  const segments = mergeBlocksIntoSegments(orderedBlocks, sentences);
-  if (segments.length === 0) {
+  const spans = mergeBlocksIntoSpans(orderedBlocks, sentences);
+  if (spans.length === 0) {
     reasons.push('blocks could not be converted into renderable segments');
   }
-  const rawDurationSeconds = segments.length > 0 ? segments.reduce((sum, segment) => sum + (segment.endSeconds - segment.startSeconds), 0) : null;
-  const durationSeconds = rawDurationSeconds !== null ? roundSeconds(rawDurationSeconds / Math.max(playbackSpeed, 1)) : null;
+  const rawDurationSeconds = spans.length > 0 ? spans.reduce((sum, span) => sum + (span.last.endSeconds - span.first.startSeconds), 0) : null;
+  const durationSeconds = rawDurationSeconds !== null ? roundSeconds(rawDurationSeconds / Math.max(speed, 1)) : null;
   if (rawDurationSeconds !== null && rawDurationSeconds < MIN_DURATION_SECONDS) {
     reasons.push(`duration ${roundSeconds(rawDurationSeconds)}s is below minimum ${MIN_DURATION_SECONDS}s`);
   }
@@ -193,64 +214,35 @@ function diagnoseCandidateFromBlocks(sentences: TranscriptSentence[], blocks: Se
   };
 }
 
-export function validateCandidateFromBlocks(sentences: TranscriptSentence[], blocks: SemanticBlock[], raw: PlannedCandidateResponse['candidates'][number], rank: number, playbackSpeed = 1): Candidate | null {
-  const diagnostic = diagnoseCandidateFromBlocks(sentences, blocks, raw, rank - 1, playbackSpeed);
-  if (diagnostic.reasons.length > 0) {
-    return null;
-  }
+function resolveOrderedBlocks(blocks: SemanticBlock[], raw: PlannedCandidateResponse['candidates'][number]): SemanticBlock[] {
   const byBlockId = new Map(blocks.map((block) => [block.id, block]));
   const dedupedBlockIds = raw.block_ids.filter((id, index, values) => values.indexOf(id) === index);
   const selectedBlocks = dedupedBlockIds.map((id) => byBlockId.get(id)).filter((value): value is SemanticBlock => Boolean(value));
-  const orderedBlocks = selectedBlocks.slice().sort((left, right) => left.startSeconds - right.startSeconds);
-  const segments = mergeBlocksIntoSegments(orderedBlocks, sentences);
-  const durationSeconds = roundSeconds(segments.reduce((sum, segment) => sum + (segment.endSeconds - segment.startSeconds), 0) / Math.max(playbackSpeed, 1));
-  const arc = buildCandidateArc(raw.thesis, orderedBlocks, raw.steps);
-  return {
-    id: createId('cand'),
-    rank,
-    title: raw.title.trim(),
-    summary: raw.summary.trim(),
-    hook: raw.hook.trim(),
-    payoff: raw.payoff.trim(),
-    rationale: raw.rationale.trim(),
-    durationSeconds,
-    seamCount: Math.max(0, segments.length - 1),
-    risk: raw.risk,
-    segments,
-    arc,
-    arcPreviewPath: null,
-    playbackSpeed,
-    previewEndCard: false,
-    draftReady: false,
-    rejected: false,
-  };
+  return selectedBlocks.slice().sort((left, right) => left.startSeconds - right.startSeconds);
 }
 
-export function buildArcPreviewSvg(candidate: Candidate): string {
-  const steps = candidate.arc?.steps ?? [];
-  const width = 1080;
-  const headerHeight = 220;
-  const stepHeight = 180;
-  const gap = 26;
-  const totalHeight = headerHeight + Math.max(1, steps.length) * (stepHeight + gap) + 80;
-  const cards = steps.map((step, index) => {
-    const top = headerHeight + index * (stepHeight + gap);
-    return `
-      <rect x="60" y="${top}" width="960" height="${stepHeight}" rx="28" fill="#111827" stroke="#374151" stroke-width="3" />
-      <text x="96" y="${top + 50}" fill="#f9fafb" font-size="38" font-weight="700">${escapeXml(`${index + 1}. ${step.kind.toUpperCase()}`)}</text>
-      <text x="96" y="${top + 96}" fill="#d1d5db" font-size="30">${escapeXml(summarize(step.label, 70))}</text>
-      <text x="96" y="${top + 140}" fill="#9ca3af" font-size="26">${formatSeconds(step.startSeconds)}-${formatSeconds(step.endSeconds)}</text>
-      ${index < steps.length - 1 ? `<line x1="540" y1="${top + stepHeight}" x2="540" y2="${top + stepHeight + gap}" stroke="#facc15" stroke-width="8" stroke-linecap="round" />` : ''}
-    `;
-  }).join('');
-  return `<?xml version="1.0" encoding="UTF-8"?>
-  <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${totalHeight}" viewBox="0 0 ${width} ${totalHeight}">
-    <rect width="100%" height="100%" fill="#030712" />
-    <text x="60" y="72" fill="#f9fafb" font-size="48" font-weight="700">${escapeXml(candidate.title)}</text>
-    <text x="60" y="122" fill="#d1d5db" font-size="32">${escapeXml(summarize(candidate.summary, 110))}</text>
-    <text x="60" y="170" fill="#9ca3af" font-size="28">${formatSeconds(candidate.durationSeconds)} · costuras ${candidate.seamCount} · risco ${candidate.risk}</text>
-    ${cards}
-  </svg>`;
+interface BlockSpan {
+  first: TranscriptSentence;
+  last: TranscriptSentence;
+}
+
+function mergeBlocksIntoSpans(blocks: SemanticBlock[], sentences: TranscriptSentence[]): BlockSpan[] {
+  const byId = new Map(sentences.map((sentence) => [sentence.id, sentence]));
+  const spans: BlockSpan[] = [];
+  for (const block of blocks) {
+    const start = byId.get(block.startSentenceId);
+    const end = byId.get(block.endSentenceId);
+    if (!start || !end) {
+      continue;
+    }
+    const previous = spans[spans.length - 1];
+    if (previous && previous.last.index + 1 === start.index && start.startSeconds - previous.last.endSeconds <= 1.2) {
+      previous.last = end;
+      continue;
+    }
+    spans.push({ first: start, last: end });
+  }
+  return spans;
 }
 
 function buildCandidateArc(thesis: string, blocks: SemanticBlock[], steps: PlannedCandidateResponse['candidates'][number]['steps']): CandidateArc {
@@ -298,50 +290,6 @@ function evaluateAuthoredShortStructure(steps: CandidateArcStep[], blocks: Seman
     reasons.push('short does not land on a usable payoff/conclusion');
   }
   return { reasons };
-}
-
-function mergeBlocksIntoSegments(blocks: SemanticBlock[], sentences: TranscriptSentence[]): CandidateSegment[] {
-  const byId = new Map(sentences.map((sentence) => [sentence.id, sentence]));
-  const segments: CandidateSegment[] = [];
-  let current: CandidateSegment | null = null;
-  for (const block of blocks) {
-    const start = byId.get(block.startSentenceId);
-    const end = byId.get(block.endSentenceId);
-    if (!start || !end) {
-      continue;
-    }
-    if (!current) {
-      current = {
-        id: createId('seg'),
-        startSentenceId: start.id,
-        endSentenceId: end.id,
-        startSeconds: start.startSeconds,
-        endSeconds: end.endSeconds,
-        text: block.text,
-      };
-      continue;
-    }
-    const currentEnd = byId.get(current.endSentenceId);
-    if (currentEnd && currentEnd.index + 1 === start.index && start.startSeconds - currentEnd.endSeconds <= 1.2) {
-      current.endSentenceId = end.id;
-      current.endSeconds = end.endSeconds;
-      current.text = `${current.text} ${block.text}`.trim();
-      continue;
-    }
-    segments.push(current);
-    current = {
-      id: createId('seg'),
-      startSentenceId: start.id,
-      endSentenceId: end.id,
-      startSeconds: start.startSeconds,
-      endSeconds: end.endSeconds,
-      text: block.text,
-    };
-  }
-  if (current) {
-    segments.push(current);
-  }
-  return segments;
 }
 
 function sameOrder<T>(left: T[], right: T[]): boolean {
@@ -463,20 +411,4 @@ function summarize(text: string, maxLength: number): string {
 
 function roundSeconds(value: number): number {
   return Math.round(value * 1000) / 1000;
-}
-
-function escapeXml(value: string): string {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
-}
-
-function formatSeconds(value: number): string {
-  const rounded = Math.max(0, Math.round(value));
-  const minutes = Math.floor(rounded / 60);
-  const seconds = rounded % 60;
-  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
 }

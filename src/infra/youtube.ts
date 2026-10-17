@@ -1,14 +1,12 @@
-import { readFile, rename } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { readFile, writeFile } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+import type { SourceMedia } from '../domain/model.js';
 import { runProcess } from './process.js';
 import { ensureParent, logError } from './util.js';
 
 export interface DownloadedSource {
-  sourceVideoPath: string;
-  sourceAudioPath: string;
-  sourceThumbnailPath: string | null;
-  title: string | null;
-  durationSeconds: number;
+  title: string;
+  media: SourceMedia;
 }
 
 export interface YouTubeDownloadOptions {
@@ -30,31 +28,31 @@ export function assertPublicYouTubeUrl(url: string): void {
 
 export async function downloadSource(outDir: string, url: string, options: YouTubeDownloadOptions = {}): Promise<DownloadedSource> {
   assertPublicYouTubeUrl(url);
-  const sourceBase = join(resolve(outDir), 'source');
+  const absoluteOutDir = resolve(outDir);
+  const sourceBase = join(absoluteOutDir, 'source');
   const infoPath = `${sourceBase}.info.json`;
-  const sourceVideoPattern = `${sourceBase}.%(ext)s`;
+  const videoPath = join(absoluteOutDir, 'source.mp4');
+  const audioPath = join(absoluteOutDir, 'source.m4a');
+  const thumbnailPath = join(absoluteOutDir, 'thumbnail.jpg');
   await ensureParent(sourceBase);
-  await runProcess('yt-dlp', buildYtDlpArgs(sourceVideoPattern, url, options), { capture: false });
-  const rawInfo = JSON.parse(await readFile(infoPath, 'utf-8')) as { title?: string; duration?: number; thumbnail?: string };
-  const initialVideoPath = `${sourceBase}.mp4`;
-  const normalizedVideoPath = join(resolve(outDir), 'source.mp4');
-  if (initialVideoPath !== normalizedVideoPath) {
-    await rename(initialVideoPath, normalizedVideoPath).catch(() => undefined);
-  }
-  const sourceAudioPath = join(resolve(outDir), 'source.m4a');
-  await runProcess('ffmpeg', ['-y', '-i', normalizedVideoPath, '-vn', '-ac', '1', '-ar', '16000', sourceAudioPath], { capture: false });
-  const durationSeconds = rawInfo.duration && Number.isFinite(rawInfo.duration)
-    ? rawInfo.duration
-    : await probeDuration(normalizedVideoPath);
-  const sourceThumbnailPath = rawInfo.thumbnail
-    ? await downloadThumbnail(rawInfo.thumbnail, join(resolve(outDir), 'source-thumbnail.jpg'))
+  await runProcess('yt-dlp', buildYtDlpArgs(`${sourceBase}.%(ext)s`, url, options), { capture: false });
+  const rawInfo = JSON.parse(await readFile(infoPath, 'utf-8')) as { title?: string; thumbnail?: string };
+  await runProcess('ffmpeg', ['-y', '-i', videoPath, '-vn', '-ac', '1', '-ar', '16000', audioPath], { capture: false });
+  const probed = await probeSourceMedia(videoPath);
+  const resolvedThumbnailPath = rawInfo.thumbnail
+    ? await downloadThumbnail(rawInfo.thumbnail, thumbnailPath)
     : null;
   return {
-    sourceVideoPath: normalizedVideoPath,
-    sourceAudioPath,
-    sourceThumbnailPath,
-    title: rawInfo.title ?? null,
-    durationSeconds,
+    title: rawInfo.title ?? '',
+    media: {
+      videoPath,
+      audioPath,
+      thumbnailPath: resolvedThumbnailPath,
+      width: probed.width,
+      height: probed.height,
+      fps: probed.fps,
+      durationSeconds: probed.durationSeconds,
+    },
   };
 }
 
@@ -62,7 +60,7 @@ export function buildYtDlpArgs(sourceVideoPattern: string, url: string, options:
   const args = [
     '--no-playlist',
     '--merge-output-format', 'mp4',
-    '--format', 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/best[ext=mp4]/best',
+    '--format', 'bv*[height<=1080][vcodec^=avc1]+ba[ext=m4a]/b[ext=mp4][vcodec^=avc1]/bv*[height<=1080]+ba/b',
     '--write-info-json',
     '--output', sourceVideoPattern,
   ];
@@ -78,27 +76,68 @@ export function buildYtDlpArgs(sourceVideoPattern: string, url: string, options:
   return args;
 }
 
+export function parseFrameRate(value: string): number {
+  const [numeratorText, denominatorText] = value.split('/');
+  const numerator = Number(numeratorText);
+  const denominator = denominatorText === undefined ? 1 : Number(denominatorText);
+  if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || numerator <= 0 || denominator <= 0) {
+    throw new Error(`Unsupported frame rate: ${value}`);
+  }
+  return numerator / denominator;
+}
+
+interface ProbedSourceMedia {
+  width: number;
+  height: number;
+  fps: number;
+  durationSeconds: number;
+}
+
+async function probeSourceMedia(path: string): Promise<ProbedSourceMedia> {
+  const result = await runProcess('ffprobe', [
+    '-v', 'error',
+    '-select_streams', 'v:0',
+    '-show_entries', 'stream=width,height,r_frame_rate:format=duration',
+    '-of', 'default=noprint_wrappers=1',
+    path,
+  ]);
+  const fields: Record<string, string> = {};
+  for (const line of result.stdout.split('\n')) {
+    const separator = line.indexOf('=');
+    if (separator > 0) {
+      fields[line.slice(0, separator)] = line.slice(separator + 1).trim();
+    }
+  }
+  const width = Number(fields.width);
+  const height = Number(fields.height);
+  const fpsText = fields.r_frame_rate;
+  const fps = fpsText ? parseFrameRate(fpsText) : Number.NaN;
+  const durationSeconds = Number(fields.duration);
+  if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) {
+    throw new Error('Could not determine source video dimensions.');
+  }
+  if (!Number.isFinite(fps) || fps <= 0) {
+    throw new Error('Could not determine source frame rate.');
+  }
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+    throw new Error('Could not determine source duration.');
+  }
+  return { width, height, fps, durationSeconds };
+}
+
 async function downloadThumbnail(url: string, path: string): Promise<string | null> {
   try {
     const response = await fetch(url);
     if (!response.ok) {
+      logError('YouTube thumbnail download failed', new Error(`HTTP ${response.status}`), { url, path });
       return null;
     }
     const buffer = Buffer.from(await response.arrayBuffer());
     await ensureParent(path);
-    await import('node:fs/promises').then(({ writeFile }) => writeFile(path, buffer));
+    await writeFile(path, buffer);
     return path;
   } catch (error) {
     logError('YouTube thumbnail download failed', error, { url, path });
     return null;
   }
-}
-
-export async function probeDuration(path: string): Promise<number> {
-  const result = await runProcess('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', path]);
-  const duration = Number(result.stdout.trim());
-  if (!Number.isFinite(duration) || duration <= 0) {
-    throw new Error('Could not determine source duration.');
-  }
-  return duration;
 }

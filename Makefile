@@ -1,12 +1,17 @@
-run:
-	pnpm dev
+studio:
+	pnpm studio
 
-build:
-	pnpm build
+dev:
+	make -j2 dev-server dev-web
+
+dev-server:
+	pnpm dev:server
+
+dev-web:
+	pnpm dev:web
 
 test:
 	pnpm test
 
-process-once:
-	@if [ -z "$(URL)" ]; then echo "usage: make process-once URL=https://youtu.be/... SPEAKER='Name'"; exit 1; fi
-	pnpm process-once "$(URL)" --speaker "$(SPEAKER)"
+typecheck:
+	pnpm typecheck

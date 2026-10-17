@@ -1,5 +1,6 @@
 import { PublicAssetHost } from './public-asset-host.js';
-import type { ShortVideoPlatform, ShortVideoPublishInput, ShortVideoPublishProvider, ShortVideoPublishResult } from './instagram-publisher.js';
+import type { ShortVideoPlatform } from '../domain/model.js';
+import type { ShortVideoPublishInput, ShortVideoPublishProvider, ShortVideoPublishResult } from './instagram-publisher.js';
 import { ShortVideoPublishError } from './instagram-publisher.js';
 import { logError } from './util.js';
 

@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildInstagramReelDescription, buildMallaryInstagramReelPayload, mallaryMimeType, parseMallaryRetryAfterSeconds } from '../src/infra/mallary.js';
+import { buildMallaryInstagramReelPayload, buildPublishMessage, mallaryMimeType, parseMallaryRetryAfterSeconds } from '../src/infra/mallary.js';
 
-test('instagram reel description removes irrelevant platform/meta tags only', () => {
-  const description = buildInstagramReelDescription({
-    line_1: 'O neoliberalismo é hipócrita quando pede sacrifício só de quem já perdeu tudo',
-    line_2: 'A regra muda na hora em que o prejuízo encosta em quem sempre mandou no jogo',
+test('publish message removes irrelevant platform/meta tags only', () => {
+  const description = buildPublishMessage({
+    line1: 'O neoliberalismo é hipócrita quando pede sacrifício só de quem já perdeu tudo',
+    line2: 'A regra muda na hora em que o prejuízo encosta em quem sempre mandou no jogo',
     hashtags: ['#Business', '#Neoliberalismo', '#InstagramReels', '#LutaDeClasses', '#FYP', '#PoliticaBrasileira', '#OpenAI', '#Mindset'],
   });
   const lines = description.split('\n');

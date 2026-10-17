@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "forceConsistentCasingInFileNames": true,
+    "types": ["vite/client"],
+    "paths": {
+      "@domain/*": ["../src/domain/*"],
+      "@api": ["../src/studio/api-types.ts"]
+    }
+  },
+  "include": ["src", "vite.config.ts", "../src/domain", "../src/studio/api-types.ts"]
+}
