@@ -216,34 +216,42 @@ test('long pauses inside a block shrink the on-screen seconds below raw over spe
   assert.ok(onScreen < (block.endSeconds - block.startSeconds) / pace.speed);
 });
 
-test('planned shorts enforce the 20 to 90 second on-screen window', () => {
-  const shortBlocks = materializeSemanticBlocks(sentences, {
-    blocks: [
-      { id: 'b_001', kind: 'hook', summary: 'setup', start_sentence_id: 's_0001', end_sentence_id: 's_0001' },
-      { id: 'b_002', kind: 'turn', summary: 'turn', start_sentence_id: 's_0002', end_sentence_id: 's_0002' },
-      { id: 'b_003', kind: 'payoff', summary: 'payoff', start_sentence_id: 's_0003', end_sentence_id: 's_0003' },
-    ],
-  });
-  const long: TranscriptSentence[] = [
-    sentence('l_0001', 0, 0, 50, 0, 20, 'Todo mundo acha que esse caso isolado revela um mecanismo gigante.'),
-    sentence('l_0002', 1, 50, 100, 21, 41, 'Mas a plataforma mede, distribui e monetiza cada reação do público.'),
-    sentence('l_0003', 2, 100, 140, 42, 60, 'E é por isso que o caso importa muito além do episódio em si.'),
+test('planned shorts enforce the 30 to 180 second on-screen window', () => {
+  const blocksFor = (transcript: TranscriptSentence[]): SemanticBlock[] =>
+    materializeSemanticBlocks(transcript, {
+      blocks: [
+        { id: 'b_001', kind: 'hook', summary: 'gancho', start_sentence_id: transcript[0]!.id, end_sentence_id: transcript[0]!.id },
+        { id: 'b_002', kind: 'explain', summary: 'desenvolvimento', start_sentence_id: transcript[1]!.id, end_sentence_id: transcript[1]!.id },
+        { id: 'b_003', kind: 'payoff', summary: 'aterrissagem', start_sentence_id: transcript[2]!.id, end_sentence_id: transcript[2]!.id },
+      ],
+    });
+  const below: TranscriptSentence[] = [
+    sentence('m_0001', 0, 0, 10, 0, 9, 'Todo mundo acha que esse caso isolado não revela nada de mais.'),
+    sentence('m_0002', 1, 10, 20, 10, 19, 'Mas a plataforma mede, distribui e monetiza cada reação do público.'),
+    sentence('m_0003', 2, 20, 29, 20, 28, 'No fim, isso muda como a gente entende o problema.'),
   ];
-  const longBlocks = materializeSemanticBlocks(long, {
-    blocks: [
-      { id: 'b_001', kind: 'hook', summary: 'setup', start_sentence_id: 'l_0001', end_sentence_id: 'l_0001' },
-      { id: 'b_002', kind: 'turn', summary: 'turn', start_sentence_id: 'l_0002', end_sentence_id: 'l_0002' },
-      { id: 'b_003', kind: 'payoff', summary: 'payoff', start_sentence_id: 'l_0003', end_sentence_id: 'l_0003' },
-    ],
-  });
-  const fastShort = paceFor(sentences, 1.5, 24);
-  const fastLong = paceFor(long, 1.5, 140);
-  assert.equal(buildPlannedShorts({ sentences, blocks: shortBlocks, plan: argumentPlan(), pace: fastShort }).length, 0);
-  assert.equal(buildPlannedShorts({ sentences: long, blocks: longBlocks, plan: argumentPlan(), pace: fastLong }).length, 0);
-  const shortDiagnostics = diagnoseCandidatePlan(sentences, shortBlocks, argumentPlan(), fastShort);
-  const longDiagnostics = diagnoseCandidatePlan(long, longBlocks, argumentPlan(), fastLong);
-  assert.ok(shortDiagnostics[0]?.reasons.some((reason) => reason.includes('on-screen duration 16s is below minimum 20s')));
-  assert.ok(longDiagnostics[0]?.reasons.some((reason) => reason.includes('on-screen duration 93.3s exceeds maximum 90s')));
+  const above: TranscriptSentence[] = [
+    sentence('x_0001', 0, 0, 60, 0, 29, 'Todo mundo subestima quanto dinheiro esse número movimenta por ano no país inteiro.'),
+    sentence('x_0002', 1, 60, 120, 30, 59, 'Mas a plataforma mede, distribui e monetiza cada reação do público e ainda lucra com isso.'),
+    sentence('x_0003', 2, 120, 181, 60, 89, 'E é por isso que o caso importa muito além do episódio em si, todos os dias do ano.'),
+  ];
+  const passing: TranscriptSentence[] = [
+    sentence('p_0001', 0, 0, 60, 0, 29, 'Todo mundo subestima quanto dinheiro esse número movimenta por ano no país inteiro.'),
+    sentence('p_0002', 1, 60, 120, 30, 59, 'Mas a plataforma mede, distribui e monetiza cada reação do público e ainda lucra com isso.'),
+    sentence('p_0003', 2, 120, 175, 60, 84, 'E é por isso que o caso importa muito além do episódio em si, todos os dias do ano.'),
+  ];
+  const belowPace = paceFor(below, 1, 29);
+  const abovePace = paceFor(above, 1, 181);
+  const passingPace = paceFor(passing, 1, 175);
+  assert.equal(buildPlannedShorts({ sentences: below, blocks: blocksFor(below), plan: argumentPlan(), pace: belowPace }).length, 0);
+  assert.equal(buildPlannedShorts({ sentences: above, blocks: blocksFor(above), plan: argumentPlan(), pace: abovePace }).length, 0);
+  const belowDiagnostics = diagnoseCandidatePlan(below, blocksFor(below), argumentPlan(), belowPace);
+  const aboveDiagnostics = diagnoseCandidatePlan(above, blocksFor(above), argumentPlan(), abovePace);
+  assert.ok(belowDiagnostics[0]?.reasons.some((reason) => reason.includes('on-screen duration 29s is below minimum 30s')));
+  assert.ok(aboveDiagnostics[0]?.reasons.some((reason) => reason.includes('on-screen duration 181s exceeds maximum 180s')));
+  const passingShorts = buildPlannedShorts({ sentences: passing, blocks: blocksFor(passing), plan: argumentPlan(), pace: passingPace });
+  assert.equal(passingShorts.length, 1);
+  assert.equal(passingShorts[0]?.onScreenSeconds, 175);
 });
 
 test('a continuous passage with long pauses counts as one cut and passes the critic', () => {

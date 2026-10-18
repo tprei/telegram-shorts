@@ -15,15 +15,17 @@ type PlannerBlock = { id: string; kind: SemanticBlockKind; summary: string; star
 const EDITORIAL_TEMPERATURE = 0.2;
 const PROVIDER_ERROR_ATTEMPTS = 2;
 const NETWORK_RETRY_DELAYS_MS = [2000, 5000];
-const HOOK_TEXT_RULE = 'hook_text: manchete curta para a faixa no topo do short (ideal até 45 caracteres, máx. 90), específica e provocativa, que promete exatamente o que o short entrega; sem clickbait vazio; em PT-BR.';
-const SHORT_BRIEF = 'Um bom short deste canal é uma história curta e completa sobre uma ideia só, que faz o espectador pensar. Quem assiste sai com algo que consegue repetir para outra pessoa: um número que muda a conversa, um mecanismo de causa e consequência, uma contradição exposta ou uma pergunta difícil de responder. É o vídeo que alguém manda para um amigo para provar um ponto ou começar uma discussão.';
-const STORY_RULE = 'Estrutura obrigatória: (1) gancho nos primeiros 3 segundos com a tensão (afirmação surpreendente, número, contradição ou pergunta), sem aquecimento e sem depender de contexto anterior; (2) o raciocínio: o passo de mecanismo, evidência ou comparação que faz a ideia fazer sentido; (3) aterrissagem: a conclusão que cumpre a promessa do gancho, reenquadra o tema ou deixa uma implicação para o espectador pensar. Termine na frase mais forte; nunca em transição, lista aberta, "e aí" ou chamada para outro assunto.';
-const CONCISION_RULE = `Concisão: cada bloco precisa merecer o lugar. Pule aquecimento, repetição, digressão, apartes, autorreferência ("como eu falei", "vou mostrar"), leitura longa de texto na tela e pedidos de engajamento. Prefira pular um bloco fraco a mantê-lo, desde que o corte continue fluido: nenhum pronome ou referência ("isso", "ele", "esse número") pode ficar sem o antecedente dentro do short. No máximo ${MAX_SHORT_SPANS} trechos contínuos; o ideal é de 1 a 3. Blocos com continues_previous true emendam no anterior sem corte; cada bloco escolhido com continues_previous false (ou cujo anterior não foi escolhido) abre um trecho novo.`;
+const HOOK_STYLE_RULE = 'É uma afirmação direta, não um rótulo de assunto nem pergunta genérica: nomeie quem fez (Flávio, Lula, Bolsonaro, o governo) ou fale com o espectador (você, seu, sua) e traga um número concreto ou um contraste. Promete exatamente o que o short entrega.';
+const HOOK_EXAMPLES = 'Exemplos do tom certo: "Quem aposta na sexta não compra no sábado"; "Flávio não disse quanto o mínimo vai valer em 2027"; "O mínimo é assinado por decreto"; "Seu voto vale por 2 netos". Exemplos do tom errado: "Agro vs. MEI: quem sobrevive ao corte?"; "Pronampe: reforço de R$ 750 mi dura 2 meses".';
+const HOOK_TEXT_RULE = `hook_text: manchete da faixa no topo (ideal até 50 caracteres, máx. 70), em PT-BR. ${HOOK_STYLE_RULE} ${HOOK_EXAMPLES}`;
+const SHORT_BRIEF = 'Um bom short deste canal é uma história curta e completa sobre uma ideia só, que faz o espectador pensar. Quem assiste sai com algo que consegue repetir para outra pessoa: um número que muda a conversa, um mecanismo de causa e consequência, uma contradição exposta ou uma pergunta difícil de responder. Os shorts que mais circulam mostram o efeito no bolso ou nos direitos de quem assiste (salário, aposentadoria, remédio, emprego, imposto), de preferência comparando o que cada lado fez ou promete, com números; ou expõem uma contradição de um político com as próprias palavras ou números dele. Táticas de campanha, aritmética eleitoral, bastidor e crédito para nicho de empresas rendem menos: só entram se a consequência para o espectador estiver no próprio short.';
+const STORY_RULE = 'Estrutura obrigatória: (1) gancho nos primeiros 3 segundos com a tensão (afirmação surpreendente, número, contradição ou pergunta), sem aquecimento e sem depender de contexto anterior; (2) o raciocínio: o passo de mecanismo, evidência ou comparação que faz a ideia fazer sentido; (3) aterrissagem: a conclusão do próprio autor, que cumpre a promessa do gancho. Deixe o autor terminar o raciocínio: o erro mais comum é cortar antes da conclusão dele. Se o bloco seguinte ainda fecha o argumento (consequência, número final, comparação final), ele entra. A pergunta final do autor ao público ("o que você acha?") pode fechar o short quando vem logo depois da conclusão. Termine na frase mais forte; nunca em transição, lista aberta, "e aí" ou chamada para outro assunto.';
+const CONCISION_RULE = `Concisão: cada bloco precisa merecer o lugar. Pule aquecimento, repetição, digressão, apartes, autorreferência ("como eu falei", "vou mostrar"), leitura longa de texto na tela e pedidos de like, inscrição, membros ou link. Prefira pular um bloco fraco a mantê-lo, desde que o corte continue fluido: nenhum pronome ou referência ("isso", "ele", "esse número") pode ficar sem o antecedente dentro do short. No máximo ${MAX_SHORT_SPANS} trechos contínuos; o ideal é 1 ou 2: prefira deixar um trecho correr a montar pedaços. Blocos com continues_previous true emendam no anterior sem corte; cada bloco escolhido com continues_previous false (ou cujo anterior não foi escolhido) abre um trecho novo.`;
 const STANDALONE_RULE = 'O short precisa se sustentar sozinho para quem nunca viu o canal: quem é quem e do que se fala tem que estar no próprio short. Não corte qualificações que mudam o sentido (negações, ressalvas, condições, a base de um número) e não monte trechos que façam o autor parecer dizer o que não disse; se houver esse risco, marque risk high.';
 const DIVERSITY_RULE = 'Cada proposta traz uma ideia diferente e não repete blocos de outra proposta. Ordene da mais compartilhável para a menos.';
 
 function durationRule(speed: number): string {
-  return `O vídeo final roda a ${speed}x com as pausas encurtadas; on_screen_seconds de cada bloco já é o tempo que ele ocupa na tela. Some on_screen_seconds dos blocos escolhidos: ideal de ${SHORT_DURATION.idealMinSeconds} a ${SHORT_DURATION.idealMaxSeconds} s; até ${SHORT_DURATION.stretchMaxSeconds} s só quando o raciocínio realmente exige; nunca menos de ${SHORT_DURATION.minSeconds} nem mais de ${SHORT_DURATION.maxSeconds} s. Como a fala é acelerada, cabe mais argumento por segundo: use esse espaço para o passo do raciocínio e para a aterrissagem, nunca para aquecimento.`;
+  return `O vídeo final roda a ${speed}x com as pausas encurtadas; on_screen_seconds de cada bloco já é o tempo que ele ocupa na tela. Some on_screen_seconds dos blocos escolhidos: ideal de ${SHORT_DURATION.idealMinSeconds} a ${SHORT_DURATION.idealMaxSeconds} s; até ${SHORT_DURATION.stretchMaxSeconds} s só quando o raciocínio realmente exige; nunca menos de ${SHORT_DURATION.minSeconds} nem mais de ${SHORT_DURATION.maxSeconds} s. Como a fala é acelerada, cabe mais argumento por segundo: use o espaço para o raciocínio completo e para a conclusão do autor, nunca para aquecimento.`;
 }
 const JSON_REPAIR_SYSTEM = [
   'Você corrige JSON malformado produzido por outro modelo.',
@@ -233,7 +235,7 @@ export class OpenRouterClient {
         'Você é diretor editorial de shorts em PT-BR.',
         SHORT_BRIEF,
         'Objetivo: encontrar de 3 a 6 oportunidades que realmente merecem virar short. Uma oportunidade é uma ideia publicável com promessa ao espectador, tensão, raciocínio e ponto de chegada; não é um capítulo solto nem um resumo do assunto.',
-        'Priorize contradição entre discurso e números, mecanismo que explica um efeito, consequência que o espectador não tinha percebido, caso concreto que revela a tese maior e comparação que muda a escala do problema.',
+        'Priorize, nesta ordem: efeito concreto no bolso ou nos direitos do espectador; comparação entre o que cada lado fez ou promete; contradição entre discurso e números do próprio político; mecanismo que explica um efeito; caso concreto que revela a tese maior.',
         STORY_RULE,
         CONCISION_RULE,
         STANDALONE_RULE,
@@ -299,13 +301,13 @@ export class OpenRouterClient {
       system: [
         'Você é diretor editorial de shorts em PT-BR.',
         SHORT_BRIEF,
-        'Objetivo: transformar as oportunidades em no máximo 5 shorts finais, prontos para publicar. Para cada um, escolha o menor conjunto de blocos que entrega a promessa ao espectador com o raciocínio completo; corte o que não move o argumento.',
+        'Objetivo: transformar as oportunidades em no máximo 5 shorts finais, prontos para publicar. Para cada um, escolha os blocos que entregam a promessa com o raciocínio completo e a conclusão do autor; corte só aquecimento, digressão e repetição.',
         STORY_RULE,
         CONCISION_RULE,
         STANDALONE_RULE,
         DIVERSITY_RULE,
         'Ordem cronológica estrita; use apenas os blocos fornecidos.',
-        'O título descreve o argumento do short, não só o assunto.',
+        'O título é uma manchete com sujeito e verbo que diz o argumento, no tom de "Lula aprovou a regra da sua aposentadoria até 2030; Flávio só promete"; não é só o assunto.',
         HOOK_TEXT_RULE,
         durationRule(input.speed),
         'Retorne apenas JSON válido com a chave candidates.',
@@ -362,7 +364,7 @@ export class OpenRouterClient {
       system: [
         'Você escreve manchetes curtas para a faixa no topo de shorts em PT-BR.',
         'Devolva exatamente 3 opções distintas entre si.',
-        'Cada opção deve ter idealmente até 45 caracteres (máximo 90), ser provocativa e específica do argumento, sem clickbait vazio.',
+        `Cada opção deve ter idealmente até 50 caracteres (máximo 70). ${HOOK_STYLE_RULE} ${HOOK_EXAMPLES}`,
         'Não use as palavras vídeo, short, reel, corte, assista ou veja, nem frases que descrevam a edição.',
         'A manchete atual vem apenas como referência; não repita ela.',
         'Retorne apenas JSON válido com a chave options.',

@@ -115,7 +115,7 @@ export function createInitialEdit(input: { ranges: WordRange[]; words: Transcrip
       captions: { enabled: true },
       crops: [],
       zoom: { enabled: true, strength: EDIT_LIMITS.defaultZoom },
-      endCard: { enabled: false },
+      endCard: { enabled: true },
     },
     input.words.length,
   );

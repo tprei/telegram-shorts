@@ -2,7 +2,7 @@ import { createInitialEdit, type WordRange } from './edit.js';
 import { outputDurationSeconds } from './timeline.js';
 import type { CandidateArc, CandidateArcStep, OpportunityPlanResponse, PlannedCandidateResponse, SemanticBlock, SemanticBlockKind, SemanticBlockResponseSet, TranscriptSentence, TranscriptWord } from './model.js';
 
-export const SHORT_DURATION = { minSeconds: 20, idealMinSeconds: 35, idealMaxSeconds: 60, stretchMaxSeconds: 75, maxSeconds: 90 } as const;
+export const SHORT_DURATION = { minSeconds: 30, idealMinSeconds: 60, idealMaxSeconds: 120, stretchMaxSeconds: 150, maxSeconds: 180 } as const;
 
 export const MAX_SHORT_SPANS = 4;
 

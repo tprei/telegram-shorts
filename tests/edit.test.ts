@@ -77,7 +77,7 @@ test('createInitialEdit applies defaults, detects fillers, clamps speed and shap
   assert.deepEqual(edit.captions, { enabled: true });
   assert.deepEqual(edit.crops, []);
   assert.deepEqual(edit.zoom, { enabled: true, strength: EDIT_LIMITS.defaultZoom });
-  assert.deepEqual(edit.endCard, { enabled: false });
+  assert.deepEqual(edit.endCard, { enabled: true });
 
   const capped = createInitialEdit({ ranges: [{ startWord: 0, endWord: 1 }], words, speed: 1, hookText: 'a'.repeat(120) });
   assert.equal(capped.hook.text.length, EDIT_LIMITS.maxHookChars);
