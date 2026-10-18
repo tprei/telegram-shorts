@@ -597,6 +597,119 @@ System prompts, joined with spaces in this order:
 - `export function blockContinuesPrevious(blocks: SemanticBlock[], index: number, sentences: TranscriptSentence[]): boolean` in `semantic.ts`: true when block `index > 0` starts at the word right after the previous block's last word. `PlannerBlock` gains `continues_previous: boolean`, and `CONCISION_RULE` gains a sentence after the span limit: "Blocos com continues_previous true emendam no anterior sem corte; cada bloco escolhido com continues_previous false (ou cujo anterior não foi escolhido) abre um trecho novo."
 - Pipeline test: a stubbed planner returning one candidate produces a short whose `edit.speed` equals the job snapshot's `defaultSpeed`, and every planner call receives that speed.
 
+## Scheduled publishing via Mallary (follow-up, 2026-10-17)
+
+Goal: the operator picks a time for a short instead of posting now; Mallary holds the post and publishes it at that time, even with the PC off. The operator is moving Mallary to the Starter plan (scheduling and analytics are paid-only; today `GET /api/v1/analytics/posts` returns 403 `analytics_not_available`). Instagram and TikTok are both connected in Mallary.
+
+Mallary facts (docs.mallary.ai, API 1.6.0): `POST /api/v1/post` accepts `scheduled_at` (absolute ISO timestamp, UTC); the job sits in Mallary's queue (job status `queued`/`waiting`/`delayed`) until then. `POST /api/v1/jobs/{id}/cancel` cancels one queued platform job by the job ID we already store (200 → `cancelled`; 409 → already processing/completed/failed). A plan without scheduling answers 403.
+
+### Routing
+
+- Immediate posts keep today's routing (Instagram → Mallary, TikTok → Buffer).
+- Scheduled posts go only to providers with `supportsScheduling` (Mallary). Buffer gets `supportsScheduling = false`. A scheduled TikTok post therefore goes through Mallary's TikTok connection.
+
+### Domain
+
+- `src/domain/model.ts`:
+  - `PublicationStatus` gains `'scheduled'` (the provider accepted the post for a future time) and `'cancelled'` (the operator cancelled a scheduled post before it went out).
+  - `IN_FLIGHT_PUBLICATION_STATUSES` gains `'scheduled'`; `'cancelled'` is neither in flight nor posted.
+  - `PublicationRecord.scheduledFor: string | null` (ISO UTC; null for immediate posts).
+  - `export function publicationStartedAt(publication: PublicationRecord): string | null` = `scheduledFor ?? submittedAt`.
+- New `src/domain/schedule.ts`:
+  - `export const SCHEDULE_LIMITS = { minLeadMinutes: 15, maxLeadDays: 60, slotSpacingMinutes: 120 } as const;`
+  - `export const POSTING_SLOTS: ReadonlyArray<{ hour: number; minute: number }> = [{ hour: 12, minute: 0 }, { hour: 19, minute: 0 }, { hour: 21, minute: 0 }];` (local wall-clock times; lunch and evening peaks for a Brazilian audience).
+  - `export function scheduledAtProblem(scheduledAt: Date, now: Date): string | null`: `'Pick a time at least 15 minutes from now.'` when earlier than `now + minLead`; `'Pick a time within the next 60 days.'` when later than `now + maxLead`; otherwise null.
+  - `export function suggestPostingSlots(input: { now: Date; taken: readonly Date[]; count: number }): Date[]`: walks days from today (local time, `Date#setHours`), and for each `POSTING_SLOTS` entry yields that local time when `scheduledAtProblem` is null and no `taken` time lies within `slotSpacingMinutes` of it; stops at `count` or at `maxLeadDays`.
+
+### Store (`src/infra/db.ts`)
+
+- `SCHEMA_VERSION = 6`; migration (same transaction pattern) sets `$.scheduledFor` to null on every publication payload.
+- Check backfill at startup: a `scheduled` publication without a queued/running `check_publication` task gets one with `availableAt = scheduledFor + CHECK_PUBLISH_DELAY_MS`. The 24-hour check window and the "skip old unconfirmed" filter use `publicationStartedAt` instead of `submittedAt`.
+- `listUpcomingScheduledPublications(): PublicationRecord[]`: `scheduledFor !== null` and status in `queued`, `deferred`, `publishing`, `scheduled`, ordered by `scheduledFor`.
+
+### Providers (`src/infra/instagram-publisher.ts`, `mallary.ts`, `buffer.ts`, `instagram-publisher-factory.ts`)
+
+- `ShortVideoPublishInput.scheduledAt: string | null` (required field).
+- `ShortVideoPublishProvider` gains `readonly supportsScheduling: boolean` and `cancelScheduled(input: ShortVideoCheckPublicationInput): Promise<void>`. `ShortVideoPublishErrorStage` gains `'cancel'`.
+- Mallary: payload gets `scheduled_at: input.scheduledAt` when non-null. `cancelScheduled` → `POST {BASE_URL}/api/v1/jobs/{id}/cancel`; 409 → `ShortVideoPublishError` (stage `cancel`, message "{Platform} is already publishing this post; it can't be cancelled."); other non-2xx through the existing `assertOk`.
+- Buffer: `supportsScheduling = false`; `cancelScheduled` throws `ShortVideoPublishError` (stage `cancel`, "Buffer posts can't be cancelled from the studio.").
+- Fallback provider: `supportsScheduling` = any provider supports it; `publishShortVideo` drops providers without `supportsScheduling` when `input.scheduledAt !== null` (error "No provider can schedule {platform}." when none remain); `cancelScheduled` delegates by `input.provider` like `checkPublication`.
+
+### Pipeline (`src/application/pipeline.ts`)
+
+- `publishShortVideo`:
+  - Returns early for `scheduled` and `cancelled` too.
+  - Re-reads the publication after the `platformAvailability` await and returns if it became `cancelled`.
+  - If `scheduledFor !== null` and `Date.parse(scheduledFor) < Date.now() + 2 * 60_000` right before the provider call, the publication fails with "Missed the scheduled time ({scheduledFor}); schedule it again." (never post at an unplanned hour).
+  - Passes `scheduledAt: publication.scheduledFor`.
+  - Provider accepted a scheduled post: status `scheduled`, `submittedAt = now`, check task at `scheduledFor + CHECK_PUBLISH_DELAY_MS`, action `short_video_scheduled`. Immediate posts unchanged.
+- `checkPublication`:
+  - Also runs for `scheduled`. Before `scheduledFor`, it only re-checks at `scheduledFor + CHECK_PUBLISH_DELAY_MS` (a remote `failed` still marks it failed, for example when it was cancelled in Mallary's dashboard).
+  - From `scheduledFor` on, a `scheduled` publication becomes `submitted` and follows the existing deadline logic, measured from `publicationStartedAt`.
+
+### Service and API
+
+- `PublishRequestSchema` gains `scheduledAt: z.iso.datetime({ offset: true }).nullable()` (required). `publish()`:
+  - Rejects `scheduledAtProblem` with `StudioError('invalid', …)`.
+  - Rejects platforms whose availability has `canSchedule === false` when scheduling.
+  - Stores `scheduledFor` normalized to UTC ISO on each new publication.
+  - Force repost works the same with a schedule.
+- `PlatformAvailabilityDto.canSchedule: boolean` = `available && a configured provider for the platform supportsScheduling` (from `platforms.ts`).
+- `PublicationDto.scheduledFor: string | null`.
+- `cancelPublication(publicationId): Promise<ShortDetailDto>`, route `POST /api/publications/:publicationId/cancel`:
+  - Only for `scheduledFor !== null`; otherwise conflict "Only scheduled posts can be cancelled.".
+  - `queued`/`deferred` → `cancelled` locally.
+  - `publishing` → conflict "Uploading right now. Try again in a minute.".
+  - `scheduled` → `publisher.cancelScheduled`, then `cancelled`; a `ShortVideoPublishError` becomes a conflict with its message.
+  - Other statuses → conflict "This post can no longer be cancelled.".
+  - Appends action `short_video_schedule_cancelled`.
+- `ScheduledPostDto { publicationId; jobId; shortId; shortTitle; platform; status: PublicationStatus; scheduledFor: string; provider: string | null }`; `listScheduledPosts(): ScheduledPostDto[]`, route `GET /api/schedule`.
+
+### Web
+
+- `web/src/api`: `cancelPublication`, `listScheduledPosts`; hooks `useScheduleQuery()` (refetch on focus) and `useCancelPublicationMutation(shortId)` (sets the short detail cache from the response, invalidates schedule and jobs). `usePublishMutation` also invalidates the schedule. `scheduled` is not an actively polled status (it can sit for days); `queued`/`publishing`/`submitted`/`deferred` stay polled.
+- `PublishPanel`:
+  - A **When** choice: "Post now" or "Schedule".
+  - Schedule mode:
+    - Shows the next 4 `suggestPostingSlots` (taken = upcoming scheduled times from `GET /api/schedule`) as chips, plus a custom local date-time input.
+    - Platforms with `canSchedule === false` are disabled with their reason.
+    - The button reads "Schedule for {weekday} {HH:mm}".
+  - Publication rows show `scheduled` as "Scheduled for {date time}" with **Cancel** (confirmation), and `cancelled` as "Schedule cancelled".
+  - The publish feedback resolves when every targeted platform is `scheduled` ("Scheduled on Instagram and TikTok for {date time}").
+- `InboxView`: an **Upcoming posts** list (time, platform, short title linking to its editor, **Cancel**), empty state when none.
+
+### Verification
+
+- Unit tests:
+  - Slot suggestions: lead time, spacing, day rollover.
+  - `scheduledAtProblem` bounds.
+  - Mallary payload carries `scheduled_at`; cancel maps 409.
+  - The fallback provider skips Buffer for scheduled posts.
+  - Publish with `scheduledAt` stores `scheduledFor` and ends `scheduled`, with the check task at `scheduledFor + delay`.
+  - The check before `scheduledFor` only reschedules; after it, the publication follows the submitted flow.
+  - Missed-time failure.
+  - Cancel in each status.
+  - v5→v6 migration.
+  - Schedule listing.
+- Live check, after the operator upgrades Mallary: schedule one real short 7 days out, see it as `scheduled` in Mallary's job API, cancel it, and see `cancelled` on both sides.
+
+### Hardening (after adversarial review)
+
+Rule: if Mallary may still hold a scheduled post, the studio must never let the operator schedule the same short and platform again without force.
+
+1. `checkPublication`: when the publication is `scheduled` and `now >= scheduledFor`, persist `scheduled → submitted` before the remote call, so every later error follows the submitted rules (deadline, `unconfirmed`). Before `scheduledFor` nothing changes.
+2. `checkPublication` reloads the publication after the awaited remote call and returns without writing if it became `cancelled`.
+3. Restart recovery (`failInterruptedPublishTask` and friends in `db.ts`):
+   - `scheduled` and `cancelled` publications are settled and kept as they are; the startup backfill gives a `scheduled` one its check task.
+   - An interrupted `publishing` publication with `scheduledFor` becomes `unconfirmed` with "The studio stopped while sending this scheduled post. Check Mallary's queue before scheduling it again."
+   - Immediate posts are unchanged.
+4. Ambiguous create failures: when the create POST fails with a transient network error or timeout after the request may have reached the provider, the publication becomes `unconfirmed` ("{Provider} may have received this post; check {Platform or Mallary's queue} before reposting"), not `failed`. This covers immediate and scheduled posts. The Mallary create POST gets `AbortSignal.timeout(120_000)`.
+5. Missed-time guard moves into `MallaryClient.publishShortVideo`, right before the create POST, after the uploads. It fires when `scheduledAt` is less than 2 minutes away and throws `ShortVideoPublishError` (stage `create`, `safeToFailover: false`) with "Missed the scheduled time ({time}); schedule it again." The publication fails. The pipeline-level check is removed.
+6. `publish()`: when the same export already has an in-flight publication for a platform and the requested `scheduledFor` differs (including now vs scheduled), return a conflict. The message is "{Platform} already has a post for this export scheduled for {time}. Cancel it first." or "{Platform} is already posting this export.", instead of silently returning the old record. When another export holds the platform with a scheduled post, the message says to cancel it first.
+7. A scheduled post accepted without job ids is `unconfirmed` with "Mallary accepted the scheduled post but returned no id to track; check Mallary's queue before scheduling it again."
+8. Cancel 409: use Mallary's error message when the body has one; fall back to the "already publishing" text.
+9. `scheduledAtProblem` returns 'Pick a valid date and time.' for an invalid date.
+
 ## Verification
 
 1. `pnpm typecheck` and `pnpm test` pass with zero errors.

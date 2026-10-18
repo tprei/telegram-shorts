@@ -11,6 +11,7 @@ import type {
   ReviseRequest,
   ReviseResultDto,
   SaveEditRequest,
+  ScheduledPostDto,
   SetDefaultCreatorRequest,
   SetShortStatusRequest,
   ShortDetailDto,
@@ -182,4 +183,12 @@ export function updatePublishCopy(
 
 export function publish(exportId: string, request: PublishRequest): Promise<PublicationDto[]> {
   return jsonRequest<PublicationDto[]>('POST', `/api/exports/${encodeURIComponent(exportId)}/publish`, request);
+}
+
+export function cancelPublication(publicationId: string): Promise<ShortDetailDto> {
+  return jsonRequest<ShortDetailDto>('POST', `/api/publications/${encodeURIComponent(publicationId)}/cancel`, {});
+}
+
+export function listScheduledPosts(): Promise<ScheduledPostDto[]> {
+  return request<ScheduledPostDto[]>('/api/schedule');
 }

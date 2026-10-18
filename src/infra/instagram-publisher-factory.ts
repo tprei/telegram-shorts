@@ -43,9 +43,10 @@ export function createShortVideoPublishProvider(config: AppConfig): ShortVideoPu
   });
 }
 
-class FallbackShortVideoPublishProvider implements ShortVideoPublishProvider {
+export class FallbackShortVideoPublishProvider implements ShortVideoPublishProvider {
   readonly name: string;
   readonly supportedPlatforms: ShortVideoPlatform[];
+  readonly supportsScheduling: boolean;
 
   constructor(
     private readonly providers: ShortVideoPublishProvider[],
@@ -53,6 +54,7 @@ class FallbackShortVideoPublishProvider implements ShortVideoPublishProvider {
   ) {
     this.name = providers.map((provider) => provider.name).join(',');
     this.supportedPlatforms = Array.from(new Set(providers.flatMap((provider) => provider.supportedPlatforms)));
+    this.supportsScheduling = providers.some((provider) => provider.supportsScheduling);
   }
 
   supports(platform: ShortVideoPlatform): boolean {
@@ -60,7 +62,13 @@ class FallbackShortVideoPublishProvider implements ShortVideoPublishProvider {
   }
 
   async publishShortVideo(input: ShortVideoPublishInput): Promise<ShortVideoPublishResult> {
-    const eligibleProviders = this.orderedProvidersForPlatform(input.platform);
+    let eligibleProviders = this.orderedProvidersForPlatform(input.platform);
+    if (input.scheduledAt !== null) {
+      eligibleProviders = eligibleProviders.filter((provider) => provider.supportsScheduling);
+      if (eligibleProviders.length === 0) {
+        throw new Error(`No provider can schedule ${input.platform}.`);
+      }
+    }
     if (eligibleProviders.length === 0) {
       throw new Error(`No short-video provider supports ${input.platform}.`);
     }
@@ -91,6 +99,19 @@ class FallbackShortVideoPublishProvider implements ShortVideoPublishProvider {
       });
     }
     return provider.checkPublication(input);
+  }
+
+  async cancelScheduled(input: ShortVideoCheckPublicationInput): Promise<void> {
+    const provider = this.providers.find((entry) => entry.name === input.provider);
+    if (!provider) {
+      throw new ShortVideoPublishError({
+        provider: input.provider,
+        stage: 'cancel',
+        message: `No publish provider named ${input.provider} is configured to cancel ${input.platform}.`,
+        safeToFailover: false,
+      });
+    }
+    await provider.cancelScheduled(input);
   }
 
   private orderedProvidersForPlatform(platform: ShortVideoPlatform): ShortVideoPublishProvider[] {

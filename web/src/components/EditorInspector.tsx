@@ -1,5 +1,5 @@
 import { useState, type KeyboardEvent } from 'react';
-import type { HookSuggestionsDto, ShortDetailDto } from '@api';
+import type { HookSuggestionsDto, ScheduledPostDto, ShortDetailDto } from '@api';
 import { EDIT_LIMITS, type ShortEdit } from '@domain/edit';
 import type { NormRect } from '@domain/layout';
 import type { PublishCopy, ShortVideoPlatform } from '@domain/model';
@@ -35,8 +35,11 @@ export interface EditorInspectorProps {
   publishCopy: PublishCopy | null;
   copyPending?: boolean;
   selectedPlatforms: ShortVideoPlatform[];
+  upcomingPosts: readonly ScheduledPostDto[];
   publishPending?: boolean;
   error?: string | null;
+  cancellingPublicationIds?: readonly string[];
+  cancelError?: string | null;
   initialTab?: InspectorTab;
   tab?: InspectorTab;
   onTabChange?: (tab: InspectorTab) => void;
@@ -52,7 +55,12 @@ export interface EditorInspectorProps {
   onGenerateCopy: () => void;
   onPublishCopyChange: (copy: PublishCopy) => void;
   onSelectedPlatformsChange: (platforms: ShortVideoPlatform[]) => void;
-  onPublish: (force: boolean, platforms: ShortVideoPlatform[]) => void;
+  onPublish: (
+    force: boolean,
+    platforms: ShortVideoPlatform[],
+    scheduledAt: string | null,
+  ) => void;
+  onCancelPublication: (publicationId: string) => void;
 }
 const tabLabels: Record<InspectorTab, string> = {
   edit: 'Edit',
@@ -74,8 +82,11 @@ export function EditorInspector(props: EditorInspectorProps) {
     publishCopy: savedPublishCopy,
     copyPending,
     selectedPlatforms,
+    upcomingPosts,
     publishPending,
     error,
+    cancellingPublicationIds,
+    cancelError,
     onTitleChange,
     onEditChange,
     onSuggestHooks,
@@ -89,6 +100,7 @@ export function EditorInspector(props: EditorInspectorProps) {
     onPublishCopyChange,
     onSelectedPlatformsChange,
     onPublish,
+    onCancelPublication,
   } = props;
   const [internalTab, setInternalTab] = useState<InspectorTab>(props.initialTab ?? 'edit');
   const tab = props.tab ?? internalTab;
@@ -556,6 +568,10 @@ export function EditorInspector(props: EditorInspectorProps) {
               publications={detail.publications}
               platforms={detail.platforms}
               selectedPlatforms={selectedPlatforms}
+              upcomingPosts={upcomingPosts}
+              cancellingPublicationIds={cancellingPublicationIds}
+              cancelError={cancelError}
+              onCancelPublication={onCancelPublication}
               publishPending={publishPending}
               copyReady={copyReady}
               onSelectedPlatformsChange={onSelectedPlatformsChange}

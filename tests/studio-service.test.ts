@@ -8,6 +8,7 @@ import test from 'node:test';
 import { StudioService } from '../src/application/studio-service.js';
 import { ShortsPipeline } from '../src/application/pipeline.js';
 import { StudioError } from '../src/application/errors.js';
+import { mallaryCooldownKey } from '../src/application/platforms.js';
 import { createInitialEdit, type ShortEdit, type WordRange } from '../src/domain/edit.js';
 import { buildSentences } from '../src/domain/policies.js';
 import type { LayoutProfile } from '../src/domain/layout.js';
@@ -107,9 +108,13 @@ function fakePublisher(): ShortVideoPublishProvider {
   return {
     name: 'fake',
     supportedPlatforms: ['instagram', 'tiktok', 'youtube_shorts'],
+    supportsScheduling: true,
     supports: () => true,
     publishShortVideo: async () => {
       throw new Error('publisher must not be called from the studio service');
+    },
+    cancelScheduled: async () => {
+      throw new Error('publisher cancel must not be called from the studio service');
     },
   };
 }
@@ -260,18 +265,22 @@ interface RecordingPublisher {
   provider: ShortVideoPublishProvider;
   publishInputs: ShortVideoPublishInput[];
   checkInputs: ShortVideoCheckPublicationInput[];
+  cancelInputs: ShortVideoCheckPublicationInput[];
 }
 
 function recordingPublisher(options: {
   result: ShortVideoPublishResult;
   checkState?: RemotePublicationState;
   checkError?: Error;
+  cancelError?: Error;
 }): RecordingPublisher {
   const publishInputs: ShortVideoPublishInput[] = [];
   const checkInputs: ShortVideoCheckPublicationInput[] = [];
+  const cancelInputs: ShortVideoCheckPublicationInput[] = [];
   const provider: ShortVideoPublishProvider = {
     name: 'fake',
     supportedPlatforms: ['instagram', 'tiktok', 'youtube_shorts'],
+    supportsScheduling: true,
     supports: () => true,
     publishShortVideo: async (input) => {
       publishInputs.push(input);
@@ -284,8 +293,14 @@ function recordingPublisher(options: {
       }
       return options.checkState ?? { status: 'pending', url: null, error: null };
     },
+    cancelScheduled: async (input) => {
+      cancelInputs.push(input);
+      if (options.cancelError) {
+        throw options.cancelError;
+      }
+    },
   };
-  return { provider, publishInputs, checkInputs };
+  return { provider, publishInputs, checkInputs, cancelInputs };
 }
 
 function pipelineFor(context: TestContext, publisher: ShortVideoPublishProvider, openRouter: OpenRouterClient = context.openRouter): ShortsPipeline {
@@ -322,6 +337,7 @@ function seedSubmittedPublication(store: ShortsStore, seeded: SeededJob, exportI
     remoteJobs: [{ platform: 'tiktok', jobId: 'remote_job_1' }],
     remoteUrl: null,
     submittedAt: nowIso(),
+    scheduledFor: null,
     error: null,
     availableAt: null,
     createdAt: nowIso(),
@@ -588,16 +604,16 @@ test('publish returns the in-flight publication, conflicts once posted, and forc
   try {
     const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
     const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
-    const first = await context.service.publish(exportRecord.id, { platforms: ['instagram'], force: false });
+    const first = await context.service.publish(exportRecord.id, { platforms: ['instagram'], force: false, scheduledAt: null });
     assert.equal(first.length, 1);
     assert.equal(first[0].status, 'queued');
 
-    const second = await context.service.publish(exportRecord.id, { platforms: ['instagram'], force: false });
+    const second = await context.service.publish(exportRecord.id, { platforms: ['instagram'], force: false, scheduledAt: null });
     assert.equal(second[0].id, first[0].id);
     assert.equal(context.store.listPublicationsForShort(seeded.shortId).length, 1);
 
     await assert.rejects(
-      context.service.publish(exportRecord.id, { platforms: ['instagram'], force: true }),
+      context.service.publish(exportRecord.id, { platforms: ['instagram'], force: true, scheduledAt: null }),
       isStudioErrorWithCode('conflict'),
     );
 
@@ -607,11 +623,11 @@ test('publish returns the in-flight publication, conflicts once posted, and forc
     context.store.updatePublication(record);
 
     await assert.rejects(
-      context.service.publish(exportRecord.id, { platforms: ['instagram'], force: false }),
+      context.service.publish(exportRecord.id, { platforms: ['instagram'], force: false, scheduledAt: null }),
       isStudioErrorWithCode('conflict'),
     );
 
-    const forced = await context.service.publish(exportRecord.id, { platforms: ['instagram'], force: true });
+    const forced = await context.service.publish(exportRecord.id, { platforms: ['instagram'], force: true, scheduledAt: null });
     assert.notEqual(forced[0].id, first[0].id);
     assert.equal(forced[0].forced, true);
     assert.equal(context.store.listPublicationsForShort(seeded.shortId).length, 2);
@@ -628,7 +644,7 @@ test('publish is rejected for a render-only creator', async () => {
     const detail = await context.service.getShort(seeded.shortId);
     assert.ok(detail.platforms.every((platform) => !platform.available && platform.reason !== null));
     await assert.rejects(
-      context.service.publish(exportRecord.id, { platforms: ['instagram'], force: false }),
+      context.service.publish(exportRecord.id, { platforms: ['instagram'], force: false, scheduledAt: null }),
       isStudioErrorWithCode('invalid'),
     );
   } finally {
@@ -842,6 +858,7 @@ test('requeue marks interrupted publish tasks failed and requeues other work', a
       remoteJobs: [],
       remoteUrl: null,
       submittedAt: null,
+      scheduledFor: null,
       error: null,
       availableAt: null,
       createdAt: nowIso(),
@@ -884,6 +901,7 @@ test('a second startup holding no lock cannot requeue the first instance running
       remoteJobs: [],
       remoteUrl: null,
       submittedAt: null,
+      scheduledFor: null,
       error: null,
       availableAt: null,
       createdAt: nowIso(),
@@ -935,7 +953,7 @@ test('a successful publish marks the publication submitted and schedules a delay
     const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
     const recorded = recordingPublisher({ result: PUBLISH_RESULT });
     const pipeline = pipelineFor(context, recorded.provider);
-    await context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false });
+    await context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false, scheduledAt: null });
     assert.equal(await pipeline.runNext('output'), true);
     assert.equal(await pipeline.runNext('output'), false);
 
@@ -966,7 +984,7 @@ test('the publication DTO exposes url, submittedAt, and forced', async () => {
     const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
     const recorded = recordingPublisher({ result: PUBLISH_RESULT, checkState: { status: 'live', url: 'https://www.tiktok.com/@creator/video/123', error: null } });
     const pipeline = pipelineFor(context, recorded.provider);
-    const [queued] = await context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false });
+    const [queued] = await context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false, scheduledAt: null });
     assert.equal(queued.url, null);
     assert.equal(queued.submittedAt, null);
     assert.equal(queued.forced, false);
@@ -1099,9 +1117,11 @@ test('a publication still unresolved 60 minutes after submission becomes unconfi
     const publisher: ShortVideoPublishProvider = {
       name: 'fake',
       supportedPlatforms: ['instagram', 'tiktok', 'youtube_shorts'],
+      supportsScheduling: true,
       supports: () => true,
       publishShortVideo: async () => PUBLISH_RESULT,
       checkPublication: async () => checkState,
+      cancelScheduled: async () => {},
     };
     const pipeline = pipelineFor(context, publisher);
     const publication = seedSubmittedPublication(context.store, seeded, exportRecord.id, {
@@ -1212,7 +1232,7 @@ test('checkPublication receives the provider name the publish result reported', 
       checkState: { status: 'live', url: 'https://www.tiktok.com/@creator/video/5', error: null },
     });
     const pipeline = pipelineFor(context, recorded.provider);
-    await context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false });
+    await context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false, scheduledAt: null });
     await pipeline.runNext('output');
     context.store.enqueueTask(seeded.jobId, 'check_publication', { publicationId: seedPublicationIdFor(context, seeded) });
     assert.equal(await pipeline.runNext('output'), true);
@@ -1235,7 +1255,7 @@ test('a publish result without remote job ids leaves the publication unconfirmed
     const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
     const recorded = recordingPublisher({ result: { ...PUBLISH_RESULT, jobs: [] } });
     const pipeline = pipelineFor(context, recorded.provider);
-    await context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false });
+    await context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false, scheduledAt: null });
     assert.equal(await pipeline.runNext('output'), true);
     const publication = context.store.listPublicationsForShort(seeded.shortId)[0];
     assert.ok(publication);
@@ -1253,7 +1273,7 @@ test('a normal publish returns the existing submitted publication instead of cre
     const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
     const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
     seedSubmittedPublication(context.store, seeded, exportRecord.id);
-    const results = await context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false });
+    const results = await context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false, scheduledAt: null });
     assert.equal(results.length, 1);
     assert.equal(results[0].id, 'pub_submitted');
     assert.equal(results[0].status, 'submitted');
@@ -1326,6 +1346,7 @@ test('v3 migration marks unverified published publications submitted and queues 
     assert.equal(verified.status, 'submitted');
     assert.ok(verified.submittedAt);
     assert.equal(verified.remoteUrl, null);
+    assert.equal(verified.scheduledFor, null);
 
     const unverified = store.getPublication('pub_nolinks');
     assert.ok(unverified);
@@ -1360,7 +1381,7 @@ test('v3 migration marks unverified published publications submitted and queues 
     if (typeof row !== 'object' || row === null || !('user_version' in row) || typeof row.user_version !== 'number') {
       throw new Error('Database did not report a user_version');
     }
-    assert.equal(row.user_version, 5);
+    assert.equal(row.user_version, 6);
   } finally {
     db.close();
     await rm(dir, { recursive: true, force: true });
@@ -1382,7 +1403,7 @@ test('a normal publish conflicts with an in-flight attempt on another export and
     context.store.createExport(exportB);
 
     await assert.rejects(
-      context.service.publish(exportB.id, { platforms: ['tiktok'], force: false }),
+      context.service.publish(exportB.id, { platforms: ['tiktok'], force: false, scheduledAt: null }),
       (error: unknown) => {
         assert.ok(error instanceof StudioError);
         assert.equal(error.code, 'conflict');
@@ -1394,7 +1415,7 @@ test('a normal publish conflicts with an in-flight attempt on another export and
     submitted.status = 'published';
     context.store.updatePublication(submitted);
     await assert.rejects(
-      context.service.publish(exportB.id, { platforms: ['tiktok'], force: false }),
+      context.service.publish(exportB.id, { platforms: ['tiktok'], force: false, scheduledAt: null }),
       (error: unknown) => {
         assert.ok(error instanceof StudioError);
         assert.equal(error.code, 'conflict');
@@ -1407,7 +1428,7 @@ test('a normal publish conflicts with an in-flight attempt on another export and
     submitted.error = 'No final result from fake after 60 minutes; check TikTok before reposting.';
     context.store.updatePublication(submitted);
     await assert.rejects(
-      context.service.publish(exportB.id, { platforms: ['tiktok'], force: false }),
+      context.service.publish(exportB.id, { platforms: ['tiktok'], force: false, scheduledAt: null }),
       (error: unknown) => {
         assert.ok(error instanceof StudioError);
         assert.equal(error.code, 'conflict');
@@ -1419,7 +1440,7 @@ test('a normal publish conflicts with an in-flight attempt on another export and
     submitted.status = 'failed';
     submitted.error = 'Instagram authorization was lost.';
     context.store.updatePublication(submitted);
-    const created = await context.service.publish(exportB.id, { platforms: ['tiktok'], force: false });
+    const created = await context.service.publish(exportB.id, { platforms: ['tiktok'], force: false, scheduledAt: null });
     assert.equal(created.length, 1);
     assert.notEqual(created[0].id, submitted.id);
   } finally {
@@ -1434,7 +1455,7 @@ test('force repost requires a posted or unconfirmed attempt and rejects in-fligh
     const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
 
     await assert.rejects(
-      context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: true }),
+      context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: true, scheduledAt: null }),
       (error: unknown) => {
         assert.ok(error instanceof StudioError);
         assert.equal(error.code, 'conflict');
@@ -1447,13 +1468,13 @@ test('force repost requires a posted or unconfirmed attempt and rejects in-fligh
       status: 'unconfirmed',
       error: 'No final result from fake after 60 minutes; check TikTok before reposting.',
     });
-    const forced = await context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: true });
+    const forced = await context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: true, scheduledAt: null });
     assert.equal(forced.length, 1);
     assert.equal(forced[0].forced, true);
     assert.notEqual(forced[0].id, unconfirmed.id);
 
     await assert.rejects(
-      context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: true }),
+      context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: true, scheduledAt: null }),
       (error: unknown) => {
         assert.ok(error instanceof StudioError);
         assert.equal(error.code, 'conflict');
@@ -1473,7 +1494,7 @@ test('non-forced publishes send a publication-scoped idempotency key', async () 
     const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
     const recorded = recordingPublisher({ result: PUBLISH_RESULT });
     const pipeline = pipelineFor(context, recorded.provider);
-    const [queued] = await context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false });
+    const [queued] = await context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false, scheduledAt: null });
     await pipeline.runNext('output');
     assert.equal(recorded.publishInputs.length, 1);
     assert.equal(recorded.publishInputs[0].idempotencyKey, `shorts-tiktok-${exportRecord.id}-${queued.id}`);
@@ -1544,7 +1565,7 @@ test('a failing publish task does not downgrade a submitted publication', async 
     try {
       const recorded = recordingPublisher({ result: PUBLISH_RESULT });
       const pipeline = pipelineFor(context, recorded.provider);
-      const [queued] = await context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false });
+      const [queued] = await context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false, scheduledAt: null });
       assert.equal(await pipeline.runNext('output'), true);
       const submitted = store.getPublication(queued.id);
       assert.ok(submitted);
@@ -1906,5 +1927,726 @@ test('the store migrates a v4 database by adding the host framing fields', async
   } finally {
     store.close();
     await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test('publish with scheduledAt stores scheduledFor, ends scheduled, and schedules the check at the scheduled time', async () => {
+  const context = await makeContext(copyWriter(), undefined, bufferChannelConfig());
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
+    const scheduledAt = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString();
+    const recorded = recordingPublisher({ result: PUBLISH_RESULT });
+    const pipeline = pipelineFor(context, recorded.provider);
+    const detail = await context.service.getShort(seeded.shortId);
+    const tiktok = detail.platforms.find((entry) => entry.platform === 'tiktok');
+    assert.ok(tiktok);
+    assert.equal(tiktok.available, true);
+    assert.equal(tiktok.canSchedule, true);
+    const [queued] = await context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false, scheduledAt });
+    assert.equal(queued.status, 'queued');
+    assert.equal(queued.scheduledFor, scheduledAt);
+    assert.equal(await pipeline.runNext('output'), true);
+    assert.equal(await pipeline.runNext('output'), false);
+
+    const publication = context.store.getPublication(queued.id);
+    assert.ok(publication);
+    assert.equal(publication.status, 'scheduled');
+    assert.equal(publication.scheduledFor, scheduledAt);
+    assert.ok(publication.submittedAt);
+    assert.equal(publication.error, null);
+    assert.equal(recorded.publishInputs.length, 1);
+    assert.equal(recorded.publishInputs[0].scheduledAt, scheduledAt);
+
+    const checks = queuedTasks(context.dbPath, 'check_publication');
+    assert.equal(checks.length, 1);
+    assert.equal(checks[0].status, 'queued');
+    assert.deepEqual(checks[0].payload, { publicationId: publication.id });
+    assert.equal(checks[0].available_at, new Date(Date.parse(scheduledAt) + 15_000).toISOString());
+
+    const after = await context.service.getShort(seeded.shortId);
+    const scheduled = after.publications.find((entry) => entry.id === queued.id);
+    assert.ok(scheduled);
+    assert.equal(scheduled.status, 'scheduled');
+    assert.equal(scheduled.scheduledFor, scheduledAt);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('the check before scheduledFor only reschedules at the scheduled time and follows the submitted flow after it', async () => {
+  const context = await makeContext();
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
+    const scheduledFor = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    const recorded = recordingPublisher({ result: PUBLISH_RESULT, checkState: { status: 'pending', url: null, error: null } });
+    const pipeline = pipelineFor(context, recorded.provider);
+    const publication = seedSubmittedPublication(context.store, seeded, exportRecord.id, {
+      status: 'scheduled',
+      scheduledFor,
+    });
+    context.store.enqueueTask(seeded.jobId, 'check_publication', { publicationId: publication.id });
+    assert.equal(await pipeline.runNext('output'), true);
+
+    const before = context.store.getPublication(publication.id);
+    assert.ok(before);
+    assert.equal(before.status, 'scheduled');
+    assert.deepEqual(recorded.checkInputs, [{ provider: 'fake', platform: 'tiktok', remoteJobId: 'remote_job_1' }]);
+    const checks = queuedTasks(context.dbPath, 'check_publication');
+    assert.equal(checks.length, 1);
+    assert.equal(checks[0].status, 'queued');
+    assert.equal(checks[0].available_at, new Date(Date.parse(scheduledFor) + 15_000).toISOString());
+
+    before.scheduledFor = new Date(Date.now() - 60 * 1000).toISOString();
+    context.store.updatePublication(before);
+    context.store.enqueueTask(seeded.jobId, 'check_publication', { publicationId: publication.id });
+    assert.equal(await pipeline.runNext('output'), true);
+
+    const after = context.store.getPublication(publication.id);
+    assert.ok(after);
+    assert.equal(after.status, 'submitted');
+    const checksAfter = queuedTasks(context.dbPath, 'check_publication');
+    assert.equal(checksAfter.length, 2);
+    assert.equal(checksAfter[0].status, 'queued');
+    assertRescheduledInAboutSeconds(checksAfter[1].available_at, 20);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('a remote failed result before the scheduled time fails the publication', async () => {
+  const context = await makeContext();
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
+    const scheduledFor = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    const recorded = recordingPublisher({
+      result: PUBLISH_RESULT,
+      checkState: { status: 'failed', url: null, error: 'The job was cancelled in the dashboard.' },
+    });
+    const pipeline = pipelineFor(context, recorded.provider);
+    const publication = seedSubmittedPublication(context.store, seeded, exportRecord.id, {
+      status: 'scheduled',
+      scheduledFor,
+    });
+    context.store.enqueueTask(seeded.jobId, 'check_publication', { publicationId: publication.id });
+    assert.equal(await pipeline.runNext('output'), true);
+
+    const failed = context.store.getPublication(publication.id);
+    assert.ok(failed);
+    assert.equal(failed.status, 'failed');
+    assert.equal(failed.error, 'The job was cancelled in the dashboard.');
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('a missed scheduled time fails the publication with the provider error', async () => {
+  const context = await makeContext(copyWriter(), undefined, bufferChannelConfig());
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
+    const scheduledFor = new Date(Date.now() + 60 * 1000).toISOString();
+    const rejecting: ShortVideoPublishProvider = {
+      ...recordingPublisher({ result: PUBLISH_RESULT }).provider,
+      publishShortVideo: async () => {
+        throw new ShortVideoPublishError({
+          provider: 'mallary',
+          stage: 'create',
+          message: `Missed the scheduled time (${scheduledFor}); schedule it again.`,
+          safeToFailover: false,
+        });
+      },
+    };
+    const pipeline = pipelineFor(context, rejecting);
+    const publication = seedSubmittedPublication(context.store, seeded, exportRecord.id, {
+      id: 'pub_missed',
+      status: 'queued',
+      provider: null,
+      batchId: null,
+      remoteJobs: [],
+      submittedAt: null,
+      scheduledFor,
+    });
+    context.store.enqueueTask(seeded.jobId, 'publish_short_video', { publicationId: publication.id });
+    assert.equal(await pipeline.runNext('output'), true);
+
+    const failed = context.store.getPublication(publication.id);
+    assert.ok(failed);
+    assert.equal(failed.status, 'failed');
+    assert.equal(failed.error, `Missed the scheduled time (${scheduledFor}); schedule it again.`);
+    assert.equal(queuedTasks(context.dbPath, 'check_publication').length, 0);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('cancelPublication cancels queued and deferred scheduled posts locally', async () => {
+  const context = await makeContext(undefined, undefined, bufferChannelConfig());
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
+    const scheduledAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    const [queued] = await context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false, scheduledAt });
+    const cancelledQueued = await context.service.cancelPublication(queued.id);
+    assert.equal(cancelledQueued.publications.find((entry) => entry.id === queued.id)?.status, 'cancelled');
+
+    context.store.setSetting(mallaryCooldownKey('instagram'), new Date(Date.now() + 30 * 60 * 1000).toISOString());
+    const [deferred] = await context.service.publish(exportRecord.id, { platforms: ['instagram'], force: false, scheduledAt: new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString() });
+    assert.equal(deferred.status, 'deferred');
+    const cancelledDeferred = await context.service.cancelPublication(deferred.id);
+    assert.equal(cancelledDeferred.publications.find((entry) => entry.id === deferred.id)?.status, 'cancelled');
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('cancelPublication cancels a scheduled post through the provider', async () => {
+  const recorded = recordingPublisher({ result: PUBLISH_RESULT });
+  const context = await makeContext(copyWriter(), recorded.provider);
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
+    const publication = seedSubmittedPublication(context.store, seeded, exportRecord.id, {
+      status: 'scheduled',
+      scheduledFor: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+    });
+    const detail = await context.service.cancelPublication(publication.id);
+    const cancelled = detail.publications.find((entry) => entry.id === publication.id);
+    assert.ok(cancelled);
+    assert.equal(cancelled.status, 'cancelled');
+    assert.deepEqual(recorded.cancelInputs, [{ provider: 'fake', platform: 'tiktok', remoteJobId: 'remote_job_1' }]);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('cancelPublication surfaces a provider cancel failure as a conflict and keeps the post scheduled', async () => {
+  const failingCancel = {
+    ...fakePublisher(),
+    cancelScheduled: async () => {
+      throw new ShortVideoPublishError({
+        provider: 'fake',
+        stage: 'cancel',
+        message: "TikTok is already publishing this post; it can't be cancelled.",
+        safeToFailover: false,
+        httpStatus: 409,
+      });
+    },
+  };
+  const context = await makeContext(copyWriter(), failingCancel);
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
+    const publication = seedSubmittedPublication(context.store, seeded, exportRecord.id, {
+      status: 'scheduled',
+      scheduledFor: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+    });
+    await assert.rejects(
+      context.service.cancelPublication(publication.id),
+      (error: unknown) => error instanceof StudioError
+        && error.code === 'conflict'
+        && error.message === "TikTok is already publishing this post; it can't be cancelled.",
+    );
+    const kept = context.store.getPublication(publication.id);
+    assert.ok(kept);
+    assert.equal(kept.status, 'scheduled');
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('cancelPublication conflicts while uploading and for posts that cannot be cancelled', async () => {
+  const context = await makeContext();
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
+    const scheduledAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    const publishing = seedSubmittedPublication(context.store, seeded, exportRecord.id, {
+      id: 'pub_publishing',
+      status: 'publishing',
+      scheduledFor: scheduledAt,
+    });
+    await assert.rejects(
+      context.service.cancelPublication(publishing.id),
+      (error: unknown) => error instanceof StudioError && error.code === 'conflict' && error.message === 'Uploading right now. Try again in a minute.',
+    );
+
+    const submitted = seedSubmittedPublication(context.store, seeded, exportRecord.id, {
+      id: 'pub_submitted_late',
+      scheduledFor: scheduledAt,
+    });
+    await assert.rejects(
+      context.service.cancelPublication(submitted.id),
+      (error: unknown) => error instanceof StudioError && error.code === 'conflict' && error.message === 'This post can no longer be cancelled.',
+    );
+
+    const immediate = seedSubmittedPublication(context.store, seeded, exportRecord.id, {
+      id: 'pub_immediate',
+      status: 'queued',
+      provider: null,
+      batchId: null,
+      remoteJobs: [],
+      submittedAt: null,
+      scheduledFor: null,
+    });
+    await assert.rejects(
+      context.service.cancelPublication(immediate.id),
+      (error: unknown) => error instanceof StudioError && error.code === 'conflict' && error.message === 'Only scheduled posts can be cancelled.',
+    );
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('publish rejects schedule times outside the lead window', async () => {
+  const context = await makeContext();
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
+    await assert.rejects(
+      context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false, scheduledAt: new Date(Date.now() + 5 * 60 * 1000).toISOString() }),
+      (error: unknown) => error instanceof StudioError && error.code === 'invalid' && error.message === 'Pick a time at least 15 minutes from now.',
+    );
+    await assert.rejects(
+      context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false, scheduledAt: new Date(Date.now() + 61 * 24 * 60 * 60 * 1000).toISOString() }),
+      (error: unknown) => error instanceof StudioError && error.code === 'invalid' && error.message === 'Pick a time within the next 60 days.',
+    );
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('publish rejects scheduling for platforms without a scheduling provider', async () => {
+  const context = await makeContext(copyWriter(), undefined, { MALLARY_AI_API_TOKEN: undefined, ...bufferChannelConfig() });
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
+    const detail = await context.service.getShort(seeded.shortId);
+    const tiktok = detail.platforms.find((entry) => entry.platform === 'tiktok');
+    assert.ok(tiktok);
+    assert.equal(tiktok.available, true);
+    assert.equal(tiktok.canSchedule, false);
+    await assert.rejects(
+      context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false, scheduledAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() }),
+      (error: unknown) => error instanceof StudioError && error.code === 'invalid' && error.message === 'Scheduling is not available for TikTok.',
+    );
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('listScheduledPosts returns upcoming scheduled posts ordered by time with short titles', async () => {
+  const context = await makeContext();
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
+    const base = Date.now();
+    const later = seedSubmittedPublication(context.store, seeded, exportRecord.id, {
+      id: 'pub_later',
+      status: 'scheduled',
+      scheduledFor: new Date(base + 3 * 24 * 60 * 60 * 1000).toISOString(),
+    });
+    const sooner = seedSubmittedPublication(context.store, seeded, exportRecord.id, {
+      id: 'pub_sooner',
+      status: 'queued',
+      provider: null,
+      batchId: null,
+      remoteJobs: [],
+      submittedAt: null,
+      scheduledFor: new Date(base + 24 * 60 * 60 * 1000).toISOString(),
+    });
+    const middle = seedSubmittedPublication(context.store, seeded, exportRecord.id, {
+      id: 'pub_middle',
+      status: 'deferred',
+      provider: null,
+      batchId: null,
+      remoteJobs: [],
+      submittedAt: null,
+      scheduledFor: new Date(base + 2 * 24 * 60 * 60 * 1000).toISOString(),
+    });
+    seedSubmittedPublication(context.store, seeded, exportRecord.id, {
+      id: 'pub_cancelled',
+      status: 'cancelled',
+      scheduledFor: new Date(base + 4 * 24 * 60 * 60 * 1000).toISOString(),
+    });
+    seedSubmittedPublication(context.store, seeded, exportRecord.id, {
+      id: 'pub_live',
+      status: 'published',
+      scheduledFor: new Date(base + 5 * 24 * 60 * 60 * 1000).toISOString(),
+    });
+
+    const posts = context.service.listScheduledPosts();
+    assert.deepEqual(posts.map((post) => post.publicationId), [sooner.id, middle.id, later.id]);
+    assert.deepEqual(posts[0], {
+      publicationId: sooner.id,
+      jobId: seeded.jobId,
+      shortId: seeded.shortId,
+      shortTitle: 'Short de teste',
+      platform: 'tiktok',
+      status: 'queued',
+      scheduledFor: sooner.scheduledFor,
+      provider: null,
+    });
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('startup backfills the check task for scheduled publications at the scheduled time', async () => {
+  const context = await makeContext();
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
+    const scheduledFor = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    seedSubmittedPublication(context.store, seeded, exportRecord.id, {
+      status: 'scheduled',
+      scheduledFor,
+    });
+
+    context.store.enqueueMissingPublicationChecks();
+    const checks = queuedTasks(context.dbPath, 'check_publication');
+    assert.equal(checks.length, 1);
+    assert.equal(checks[0].status, 'queued');
+    assert.equal(checks[0].available_at, new Date(Date.parse(scheduledFor) + 15_000).toISOString());
+
+    context.store.enqueueMissingPublicationChecks();
+    assert.equal(queuedTasks(context.dbPath, 'check_publication').length, 1);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('a version-5 database gains scheduledFor on publications and lands on version 6', async () => {
+  const context = await makeContext();
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
+    const dbPath = context.dbPath;
+
+    const legacy = new DatabaseSync(dbPath);
+    legacy.exec('PRAGMA user_version = 5');
+    const payload = JSON.stringify({
+      id: 'pub_legacy',
+      jobId: seeded.jobId,
+      shortId: seeded.shortId,
+      exportId: exportRecord.id,
+      platform: 'tiktok',
+      status: 'submitted',
+      forced: false,
+      provider: 'fake',
+      batchId: 'batch_1',
+      remoteJobs: [{ platform: 'tiktok', jobId: 'remote_job_1' }],
+      remoteUrl: null,
+      submittedAt: nowIso(),
+      error: null,
+      availableAt: null,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    });
+    legacy.prepare('INSERT INTO publications(id, export_id, short_id, platform, status, created_at, payload_json) VALUES(?, ?, ?, ?, ?, ?, ?)')
+      .run('pub_legacy', exportRecord.id, seeded.shortId, 'tiktok', 'submitted', nowIso(), payload);
+    legacy.close();
+
+    const migrated = await ShortsStore.open(dbPath);
+    try {
+      const record = migrated.getPublication('pub_legacy');
+      assert.ok(record);
+      assert.equal(record.scheduledFor, null);
+    } finally {
+      migrated.close();
+    }
+    const versionDb = new DatabaseSync(dbPath);
+    const versionRow = versionDb.prepare('PRAGMA user_version').get();
+    versionDb.close();
+    assert.ok(typeof versionRow === 'object' && versionRow !== null && 'user_version' in versionRow && versionRow.user_version === 6);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('a version-4 database with current payloads gains scheduledFor on publications', async () => {
+  const context = await makeContext();
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
+    const dbPath = context.dbPath;
+    const publication = seedSubmittedPublication(context.store, seeded, exportRecord.id);
+    const legacy = new DatabaseSync(dbPath);
+    legacy.exec("UPDATE publications SET payload_json = json_remove(payload_json, '$.scheduledFor')");
+    legacy.exec('PRAGMA user_version = 4');
+    legacy.close();
+
+    const migrated = await ShortsStore.open(dbPath);
+    try {
+      const record = migrated.getPublication(publication.id);
+      assert.ok(record);
+      assert.equal(record.scheduledFor, null);
+      migrated.enqueueMissingPublicationChecks();
+    } finally {
+      migrated.close();
+    }
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('a check at the scheduled time applies the submitted rules to later errors', async () => {
+  const context = await makeContext();
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
+    let checkState: RemotePublicationState = { status: 'pending', url: null, error: null };
+    let checkError: Error | null = null;
+    const gated: ShortVideoPublishProvider = {
+      ...fakePublisher(),
+      checkPublication: async () => {
+        if (checkError) {
+          throw checkError;
+        }
+        return checkState;
+      },
+    };
+    const pipeline = pipelineFor(context, gated);
+    const hardFailure = seedSubmittedPublication(context.store, seeded, exportRecord.id, {
+      id: 'pub_hard_fail',
+      status: 'scheduled',
+      scheduledFor: new Date(Date.now() - 60 * 1000).toISOString(),
+    });
+    context.store.enqueueTask(seeded.jobId, 'check_publication', { publicationId: hardFailure.id });
+    checkError = new ShortVideoPublishError({ provider: 'fake', stage: 'discovery', message: 'Mallary job status request failed: 404 not found', safeToFailover: false, httpStatus: 404 });
+    assert.equal(await pipeline.runNext('output'), true);
+    const afterHardFailure = context.store.getPublication(hardFailure.id);
+    assert.ok(afterHardFailure);
+    assert.equal(afterHardFailure.status, 'unconfirmed');
+    assert.equal(afterHardFailure.error, 'ShortVideoPublishError: Mallary job status request failed: 404 not found');
+    assert.equal(queuedTasks(context.dbPath, 'check_publication').filter((task) => task.status === 'queued').length, 0);
+
+    const transient = seedSubmittedPublication(context.store, seeded, exportRecord.id, {
+      id: 'pub_transient',
+      status: 'scheduled',
+      scheduledFor: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+    });
+    context.store.enqueueTask(seeded.jobId, 'check_publication', { publicationId: transient.id });
+    checkError = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+    assert.equal(await pipeline.runNext('output'), true);
+    const afterTransient = context.store.getPublication(transient.id);
+    assert.ok(afterTransient);
+    assert.equal(afterTransient.status, 'unconfirmed');
+    const checks = queuedTasks(context.dbPath, 'check_publication').filter((task) => task.status === 'queued');
+    assert.equal(checks.length, 1);
+    assert.equal(checks[0].payload.publicationId, transient.id);
+    assertRescheduledInAboutSeconds(checks[0].available_at, 600);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('a cancelled scheduled publication is left alone when its pre-time check finishes', async () => {
+  const checkStarted = Promise.withResolvers<void>();
+  const releaseCheck = Promise.withResolvers<void>();
+  const cancelCalls: ShortVideoCheckPublicationInput[] = [];
+  const gated: ShortVideoPublishProvider = {
+    ...fakePublisher(),
+    checkPublication: async () => {
+      checkStarted.resolve();
+      await releaseCheck.promise;
+      return { status: 'pending', url: null, error: null };
+    },
+    cancelScheduled: async (input) => {
+      cancelCalls.push(input);
+    },
+  };
+  const context = await makeContext(copyWriter(), gated);
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
+    const publication = seedSubmittedPublication(context.store, seeded, exportRecord.id, {
+      status: 'scheduled',
+      scheduledFor: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    });
+    context.store.enqueueTask(seeded.jobId, 'check_publication', { publicationId: publication.id });
+    const running = pipelineFor(context, gated).runNext('output');
+    await checkStarted.promise;
+    await context.service.cancelPublication(publication.id);
+    assert.deepEqual(cancelCalls, [{ provider: 'fake', platform: 'tiktok', remoteJobId: 'remote_job_1' }]);
+    releaseCheck.resolve();
+    assert.equal(await running, true);
+
+    const after = context.store.getPublication(publication.id);
+    assert.ok(after);
+    assert.equal(after.status, 'cancelled');
+    assert.equal(queuedTasks(context.dbPath, 'check_publication').filter((task) => task.status === 'queued').length, 0);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('restart keeps settled scheduled publications and marks an interrupted scheduled upload unconfirmed', async () => {
+  const context = await makeContext();
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
+    const scheduledFor = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString();
+    const settled = seedSubmittedPublication(context.store, seeded, exportRecord.id, {
+      id: 'pub_settled',
+      status: 'scheduled',
+      scheduledFor,
+    });
+    const cancelled = seedSubmittedPublication(context.store, seeded, exportRecord.id, {
+      id: 'pub_settled_cancelled',
+      status: 'cancelled',
+      scheduledFor,
+    });
+    const interrupted = seedSubmittedPublication(context.store, seeded, exportRecord.id, {
+      id: 'pub_interrupted',
+      status: 'publishing',
+      provider: null,
+      batchId: null,
+      remoteJobs: [],
+      submittedAt: null,
+      scheduledFor,
+    });
+    context.store.enqueueTask(seeded.jobId, 'publish_short_video', { publicationId: settled.id });
+    context.store.enqueueTask(seeded.jobId, 'publish_short_video', { publicationId: cancelled.id });
+    context.store.enqueueTask(seeded.jobId, 'publish_short_video', { publicationId: interrupted.id });
+    assert.ok(context.store.claimNextTask(QUEUE_LANES.output));
+    assert.ok(context.store.claimNextTask(QUEUE_LANES.output));
+    assert.ok(context.store.claimNextTask(QUEUE_LANES.output));
+    context.store.requeueRunningTasks();
+
+    const keptScheduled = context.store.getPublication(settled.id);
+    assert.ok(keptScheduled);
+    assert.equal(keptScheduled.status, 'scheduled');
+    const keptCancelled = context.store.getPublication(cancelled.id);
+    assert.ok(keptCancelled);
+    assert.equal(keptCancelled.status, 'cancelled');
+    const stopped = context.store.getPublication(interrupted.id);
+    assert.ok(stopped);
+    assert.equal(stopped.status, 'unconfirmed');
+    assert.equal(stopped.error, "The studio stopped while sending this scheduled post. Check Mallary's queue before scheduling it again.");
+
+    context.store.enqueueMissingPublicationChecks();
+    const checks = queuedTasks(context.dbPath, 'check_publication').filter((task) => task.status === 'queued');
+    const scheduledCheck = checks.find((task) => task.payload.publicationId === settled.id);
+    assert.ok(scheduledCheck);
+    assert.equal(scheduledCheck.available_at, new Date(Date.parse(scheduledFor) + 15_000).toISOString());
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('an ambiguous create failure marks the publication unconfirmed instead of failed', async () => {
+  const ambiguous: ShortVideoPublishProvider = {
+    ...fakePublisher(),
+    publishShortVideo: async () => {
+      throw Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+    },
+  };
+  const context = await makeContext(copyWriter(), ambiguous, bufferChannelConfig());
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
+    const scheduledFor = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString();
+    const scheduled = seedSubmittedPublication(context.store, seeded, exportRecord.id, {
+      id: 'pub_ambiguous_scheduled',
+      status: 'queued',
+      provider: null,
+      batchId: null,
+      remoteJobs: [],
+      submittedAt: null,
+      scheduledFor,
+    });
+    context.store.enqueueTask(seeded.jobId, 'publish_short_video', { publicationId: scheduled.id });
+    assert.equal(await pipelineFor(context, ambiguous).runNext('output'), true);
+    const afterScheduled = context.store.getPublication(scheduled.id);
+    assert.ok(afterScheduled);
+    assert.equal(afterScheduled.status, 'unconfirmed');
+    assert.equal(afterScheduled.error, "fake may have received this post; check Mallary's queue before reposting");
+
+    const immediate = seedSubmittedPublication(context.store, seeded, exportRecord.id, {
+      id: 'pub_ambiguous_immediate',
+      status: 'queued',
+      provider: null,
+      batchId: null,
+      remoteJobs: [],
+      submittedAt: null,
+      scheduledFor: null,
+    });
+    context.store.enqueueTask(seeded.jobId, 'publish_short_video', { publicationId: immediate.id });
+    assert.equal(await pipelineFor(context, ambiguous).runNext('output'), true);
+    const afterImmediate = context.store.getPublication(immediate.id);
+    assert.ok(afterImmediate);
+    assert.equal(afterImmediate.status, 'unconfirmed');
+    assert.equal(afterImmediate.error, 'fake may have received this post; check TikTok before reposting');
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('publish conflicts instead of returning a same-export post with a different schedule', async () => {
+  const context = await makeContext(copyWriter(), undefined, bufferChannelConfig());
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
+    const first = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString();
+    const [queued] = await context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false, scheduledAt: first });
+    const scheduledForMessage = `TikTok already has a post for this export scheduled for ${queued.scheduledFor}. Cancel it first.`;
+    await assert.rejects(
+      context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false, scheduledAt: new Date(Date.now() + 5 * 24 * 60 * 60 * 1000).toISOString() }),
+      (error: unknown) => error instanceof StudioError && error.code === 'conflict' && error.message === scheduledForMessage,
+    );
+    await assert.rejects(
+      context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false, scheduledAt: null }),
+      (error: unknown) => error instanceof StudioError && error.code === 'conflict' && error.message === scheduledForMessage,
+    );
+
+    const otherExport: ExportRecord = {
+      ...exportRecord,
+      id: 'export_other',
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    };
+    context.store.createExport(otherExport);
+    await assert.rejects(
+      context.service.publish(otherExport.id, { platforms: ['tiktok'], force: false, scheduledAt: new Date(Date.now() + 5 * 24 * 60 * 60 * 1000).toISOString() }),
+      (error: unknown) => error instanceof StudioError
+        && error.code === 'conflict'
+        && error.message === 'TikTok has a scheduled post on another export; cancel it first.',
+    );
+
+    await context.service.cancelPublication(queued.id);
+    const [immediate] = await context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false, scheduledAt: null });
+    assert.equal(immediate.scheduledFor, null);
+    await assert.rejects(
+      context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false, scheduledAt: new Date(Date.now() + 5 * 24 * 60 * 60 * 1000).toISOString() }),
+      (error: unknown) => error instanceof StudioError
+        && error.code === 'conflict'
+        && error.message === 'TikTok is already posting this export.',
+    );
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('a scheduled post accepted without job ids becomes unconfirmed with the Mallary queue message', async () => {
+  const context = await makeContext(copyWriter(), undefined, bufferChannelConfig());
+  try {
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
+    const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
+    const recorded = recordingPublisher({ result: { ...PUBLISH_RESULT, jobs: [] } });
+    const pipeline = pipelineFor(context, recorded.provider);
+    const scheduledFor = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString();
+    const [queued] = await context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false, scheduledAt: scheduledFor });
+    assert.equal(await pipeline.runNext('output'), true);
+
+    const publication = context.store.getPublication(queued.id);
+    assert.ok(publication);
+    assert.equal(publication.status, 'unconfirmed');
+    assert.equal(publication.error, "Mallary accepted the scheduled post but returned no id to track; check Mallary's queue before scheduling it again.");
+    assert.equal(publication.scheduledFor, scheduledFor);
+  } finally {
+    await cleanup(context);
   }
 });

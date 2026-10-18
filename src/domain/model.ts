@@ -187,9 +187,9 @@ export interface ExportRecord {
   updatedAt: string;
 }
 
-export type PublicationStatus = 'queued' | 'publishing' | 'submitted' | 'published' | 'unconfirmed' | 'deferred' | 'failed';
+export type PublicationStatus = 'queued' | 'publishing' | 'submitted' | 'scheduled' | 'published' | 'unconfirmed' | 'deferred' | 'failed' | 'cancelled';
 
-export const IN_FLIGHT_PUBLICATION_STATUSES: readonly PublicationStatus[] = ['queued', 'publishing', 'submitted', 'deferred'];
+export const IN_FLIGHT_PUBLICATION_STATUSES: readonly PublicationStatus[] = ['queued', 'publishing', 'submitted', 'scheduled', 'deferred'];
 
 export const POSTED_OR_UNKNOWN_PUBLICATION_STATUSES: readonly PublicationStatus[] = ['published', 'unconfirmed'];
 
@@ -206,10 +206,15 @@ export interface PublicationRecord {
   remoteJobs: Array<{ platform: string; jobId: string }>;
   remoteUrl: string | null;
   submittedAt: string | null;
+  scheduledFor: string | null;
   error: string | null;
   availableAt: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export function publicationStartedAt(publication: PublicationRecord): string | null {
+  return publication.scheduledFor ?? publication.submittedAt;
 }
 
 export type CreatorPublishMode = 'disabled' | 'global';

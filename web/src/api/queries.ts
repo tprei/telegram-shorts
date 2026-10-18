@@ -23,6 +23,7 @@ export const queryKeys = {
   job: (jobId: string) => ['job', jobId] as const,
   transcript: (jobId: string) => ['transcript', jobId] as const,
   short: (shortId: string) => ['short', shortId] as const,
+  schedule: ['schedule'] as const,
 };
 
 const POLL_INTERVAL_MS = 2000;
@@ -209,6 +210,30 @@ export function usePublishMutation(shortId: string) {
       });
       void queryClient.invalidateQueries({ queryKey: queryKeys.short(shortId) });
       void queryClient.invalidateQueries({ queryKey: queryKeys.jobs });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.schedule });
+    },
+  });
+}
+
+export function useScheduleQuery() {
+  return useQuery({
+    queryKey: queryKeys.schedule,
+    queryFn: api.listScheduledPosts,
+    refetchOnWindowFocus: true,
+  });
+}
+
+export function useCancelScheduledPostMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { publicationId: string; shortId: string }) =>
+      api.cancelPublication(input.publicationId),
+    onSuccess: (detail, input) => {
+      queryClient.setQueryData(queryKeys.short(input.shortId), detail);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.short(input.shortId) });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.schedule });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.jobs });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.job(detail.job.id) });
     },
   });
 }

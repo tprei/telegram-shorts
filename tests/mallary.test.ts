@@ -149,11 +149,158 @@ test('publish message removes irrelevant platform/meta tags only', () => {
 
 test('mallary instagram payload includes sanitized follow-up comments', () => {
   const payload = buildMallaryInstagramReelPayload({
+    message: 'Legenda',
+    mediaUrl: 'https://files.example/video.mp4',
+    mediaType: 'video/mp4',
+    commentsUnderPost: ['  Fonte:  https://example.com  ', '', 'Segunda'],
+    scheduledAt: null,
+  });
+  assert.deepEqual(payload.comments_under_post, ['Fonte: https://example.com', 'Segunda']);
+});
+
+test('mallary instagram payload carries scheduled_at only for scheduled posts', () => {
+  const scheduled = buildMallaryInstagramReelPayload({
+    message: 'Legenda',
+    mediaUrl: 'https://files.example/video.mp4',
+    mediaType: 'video/mp4',
+    scheduledAt: '2026-10-25T19:00:00.000Z',
+  });
+  assert.equal(scheduled.scheduled_at, '2026-10-25T19:00:00.000Z');
+  const immediate = buildMallaryInstagramReelPayload({
+    message: 'Legenda',
+    mediaUrl: 'https://files.example/video.mp4',
+    mediaType: 'video/mp4',
+    scheduledAt: null,
+  });
+  assert.equal('scheduled_at' in immediate, false);
+});
+
+test('Mallary publish sends scheduled_at for scheduled posts', async () => {
+  const fake = await startFakeMallary({
+    uploadUrl: (_attempt, _request, response, baseUrl) => presignedUpload(response, baseUrl),
+    put: (_attempt, response) => response.writeHead(200).end(),
+  });
+  try {
+    await withVideoFile(async (path) => {
+      await withFetch(async () => {
+        const realFetch = globalThis.fetch;
+        const bodies: Array<Record<string, unknown>> = [];
+        globalThis.fetch = async (input, init) => {
+          if (String(input) === 'https://mallary.ai/api/v1/post') {
+            bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+            return new Response(JSON.stringify({ status: 'queued', batch_id: 'b1', jobs: [{ platform: 'instagram', jobId: 'job_sched' }] }), { status: 200 });
+          }
+          return realFetch(input, init);
+        };
+        const client = new MallaryClient('token', null, new MallaryUploadClient('token', { baseUrl: fake.baseUrl, retryDelaysMs: [1, 1] }));
+        const result = await client.publishShortVideo({
+          platform: 'instagram',
+          filePath: path,
+          message: 'Legenda',
+          idempotencyKey: 'sched-1',
+          scheduledAt: '2026-10-25T19:00:00.000Z',
+        });
+        assert.deepEqual(result.jobs, [{ platform: 'instagram', jobId: 'job_sched' }]);
+        assert.equal(bodies.length, 1);
+        assert.equal(bodies[0]?.scheduled_at, '2026-10-25T19:00:00.000Z');
+      });
+    });
+  } finally {
+    await fake.close();
+  }
+});
+
+test('Mallary cancel maps 409 to an already-publishing error and posts to the job cancel route', async () => {
+  await withFetch(async () => {
+    const record = { url: '', headers: {} as Record<string, string> };
+    const client = new MallaryClient('token', null, new MallaryUploadClient('token'));
+    globalThis.fetch = withJobFetch('', 409, record);
+    await assert.rejects(
+      client.cancelScheduled({ provider: 'mallary', platform: 'tiktok', remoteJobId: 'job_20' }),
+      (error: unknown) => error instanceof ShortVideoPublishError
+        && error.stage === 'cancel'
+        && error.message === "TikTok is already publishing this post; it can't be cancelled."
+        && error.httpStatus === 409
+        && error.safeToFailover === false,
+    );
+    assert.equal(record.url, 'https://mallary.ai/api/v1/jobs/job_20/cancel');
+    assert.equal(record.headers.Authorization, 'Bearer token');
+
+    globalThis.fetch = withJobFetch('', 200, record);
+    await client.cancelScheduled({ provider: 'mallary', platform: 'tiktok', remoteJobId: 'job_20' });
+
+    globalThis.fetch = withJobFetch(JSON.stringify({ error: { message: 'Job lookup failed' } }), 404, record);
+    await assert.rejects(
+      client.cancelScheduled({ provider: 'mallary', platform: 'tiktok', remoteJobId: 'job_21' }),
+      (error: unknown) => error instanceof ShortVideoPublishError
+        && error.stage === 'cancel'
+        && error.message === 'Mallary cancel request failed: Job lookup failed',
+    );
+  });
+});
+
+test('Mallary cancel 409 prefers the error message from the response body', async () => {
+  await withFetch(async () => {
+    const client = new MallaryClient('token', null, new MallaryUploadClient('token'));
+    globalThis.fetch = withJobFetch(JSON.stringify({ error: { message: 'Job is already being processed by the platform' } }), 409, { url: '', headers: {} });
+    await assert.rejects(
+      client.cancelScheduled({ provider: 'mallary', platform: 'instagram', remoteJobId: 'job_30' }),
+      (error: unknown) => error instanceof ShortVideoPublishError
+        && error.stage === 'cancel'
+        && error.message === 'Job is already being processed by the platform'
+        && error.httpStatus === 409,
+    );
+  });
+});
+
+test('Mallary rejects a scheduled post whose time is less than two minutes away before creating it', async () => {
+  const fake = await startFakeMallary({
+    uploadUrl: (_attempt, _request, response, baseUrl) => presignedUpload(response, baseUrl),
+    put: (_attempt, response) => response.writeHead(200).end(),
+  });
+  try {
+    await withVideoFile(async (path) => {
+      await withFetch(async () => {
+        const realFetch = globalThis.fetch;
+        let createPostRequests = 0;
+        globalThis.fetch = async (input, init) => {
+          if (String(input) === 'https://mallary.ai/api/v1/post') {
+            createPostRequests += 1;
+            return new Response('{}', { status: 200 });
+          }
+          return realFetch(input, init);
+        };
+        const client = new MallaryClient('token', null, new MallaryUploadClient('token', { baseUrl: fake.baseUrl, retryDelaysMs: [1, 1] }));
+        const scheduledAt = new Date(Date.now() + 60 * 1000).toISOString();
+        await assert.rejects(
+          client.publishShortVideo({
+            platform: 'instagram',
+            filePath: path,
+            message: 'Legenda',
+            idempotencyKey: 'missed-1',
+            scheduledAt,
+          }),
+          (error: unknown) => error instanceof ShortVideoPublishError
+            && error.stage === 'create'
+            && error.safeToFailover === false
+            && error.message === `Missed the scheduled time (${scheduledAt}); schedule it again.`,
+        );
+        assert.equal(createPostRequests, 0);
+      });
+    });
+  } finally {
+    await fake.close();
+  }
+});
+
+test('mallary instagram payload keeps the cover thumbnail', () => {
+  const payload = buildMallaryInstagramReelPayload({
     message: 'Legenda principal',
     mediaUrl: 'https://files.mallary.ai/video.mp4',
     mediaType: 'video/mp4',
     thumbnailUrl: 'https://files.mallary.ai/cover.jpg',
     commentsUnderPost: ['  Vídeo completo: https://youtube.com/watch?v=abc  ', '', 'Fonte: @canal  ', 'extra'],
+    scheduledAt: null,
   }) as {
     comments_under_post?: string[];
     media?: Array<{ thumbnail_url?: string }>;

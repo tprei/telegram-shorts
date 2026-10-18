@@ -24,12 +24,14 @@ import { ApiRequestError, errorMessage } from '../api/client';
 import {
   queryKeys,
   useAnalyzeCropsMutation,
+  useCancelScheduledPostMutation,
   useCorrectWordMutation,
   useExportShortMutation,
   useGeneratePublishCopyMutation,
   usePublishMutation,
   useReviseMutation,
   useSaveEditMutation,
+  useScheduleQuery,
   useShortQuery,
   useSuggestHooksMutation,
   useTranscriptQuery,
@@ -134,7 +136,14 @@ function ShortEditorSurface({ detail, transcript, refetchShort }: ShortEditorSur
   const generateCopyMutation = useGeneratePublishCopyMutation(detail.short.id);
   const updatePublishCopyMutation = useUpdatePublishCopyMutation(detail.short.id);
   const publishMutation = usePublishMutation(detail.short.id);
+  const cancelPublicationMutation = useCancelScheduledPostMutation();
+  const scheduleQuery = useScheduleQuery();
   const correctWordMutation = useCorrectWordMutation(detail.job.id, detail.short.id);
+
+  const cancellingPublicationIds =
+    cancelPublicationMutation.isPending && cancelPublicationMutation.variables
+      ? [cancelPublicationMutation.variables.publicationId]
+      : [];
 
   const transcriptWords = useMemo<TranscriptWord[]>(
     () =>
@@ -398,7 +407,7 @@ function ShortEditorSurface({ detail, transcript, refetchShort }: ShortEditorSur
   }, [generateCopyMutation.mutateAsync, runAction]);
 
   const onPublish = useCallback(
-    (force: boolean, platforms: ShortVideoPlatform[]) => {
+    (force: boolean, platforms: ShortVideoPlatform[], scheduledAt: string | null) => {
       void runAction(async () => {
         const readyExport = detail.exports.find(
           (exportRecord) => exportRecord.status === 'ready',
@@ -406,11 +415,18 @@ function ShortEditorSurface({ detail, transcript, refetchShort }: ShortEditorSur
         if (readyExport === undefined) throw new Error('Export the short before publishing.');
         await publishMutation.mutateAsync({
           exportId: readyExport.id,
-          request: { platforms, force },
+          request: { platforms, force, scheduledAt },
         });
       });
     },
     [detail.exports, publishMutation.mutateAsync, runAction],
+  );
+
+  const onCancelPublication = useCallback(
+    (publicationId: string) => {
+      cancelPublicationMutation.mutate({ publicationId, shortId: detail.short.id });
+    },
+    [cancelPublicationMutation, detail.short.id],
   );
 
   const frameUrl = useCallback(
@@ -487,8 +503,13 @@ function ShortEditorSurface({ detail, transcript, refetchShort }: ShortEditorSur
       publishCopy={publishCopyDraft}
       copyPending={generateCopyMutation.isPending}
       selectedPlatforms={selectedPlatforms}
+      upcomingPosts={scheduleQuery.data ?? []}
       publishPending={publishMutation.isPending}
       error={actionError}
+      cancellingPublicationIds={cancellingPublicationIds}
+      cancelError={
+        cancelPublicationMutation.error ? errorMessage(cancelPublicationMutation.error) : null
+      }
       onTitleChange={onTitleChange}
       onEditChange={changeEdit}
       onSuggestHooks={onSuggestHooks}
@@ -502,6 +523,7 @@ function ShortEditorSurface({ detail, transcript, refetchShort }: ShortEditorSur
       onPublishCopyChange={onPublishCopyChange}
       onSelectedPlatformsChange={setSelectedPlatforms}
       onPublish={onPublish}
+      onCancelPublication={onCancelPublication}
     />
   );
 }

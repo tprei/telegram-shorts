@@ -274,7 +274,8 @@
   }
   .status--ready,
   .status--done,
-  .status--published {
+  .status--published,
+  .status--scheduled {
     color: #a4e2c5;
     background: #203b30;
   }
@@ -297,7 +298,8 @@
     color: #ffb2b5;
     background: #49282e;
   }
-  .status--rejected {
+  .status--rejected,
+  .status--cancelled {
     color: #bac0c9;
     background: #303138;
   }
@@ -541,6 +543,138 @@
   .section-heading > div > p {
     margin-top: 7px;
     font-size: 12px;
+  }
+  .upcoming-posts {
+    margin-bottom: 36px;
+    min-width: 0;
+  }
+  .upcoming-heading {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+  }
+  .upcoming-count {
+    padding: 3px 7px;
+    border: 1px solid #36554b;
+    border-radius: 5px;
+    background: var(--accent-dim);
+    color: var(--accent);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+  }
+  .upcoming-zone {
+    color: var(--muted);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+    text-align: right;
+  }
+  .upcoming-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+  }
+  .upcoming-post {
+    display: grid;
+    grid-template-columns: 116px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 12px 22px;
+    padding: 18px 22px;
+  }
+  .upcoming-post + .upcoming-post {
+    border-top: 1px solid var(--line-soft);
+  }
+  .upcoming-time {
+    display: grid;
+    gap: 5px;
+    font-variant-numeric: tabular-nums;
+  }
+  .upcoming-time strong {
+    color: var(--accent);
+    font-size: 22px;
+    font-weight: 550;
+    letter-spacing: -0.5px;
+    line-height: 1.2;
+  }
+  .upcoming-time span {
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .upcoming-post-main {
+    display: grid;
+    justify-items: start;
+    gap: 7px;
+    min-width: 0;
+  }
+  .upcoming-platform {
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .upcoming-short-link {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    max-width: 100%;
+    font-size: 14px;
+    font-weight: 550;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+    transition: color 120ms;
+  }
+  .upcoming-short-link svg {
+    color: var(--faint);
+  }
+  .upcoming-short-link:hover,
+  .upcoming-short-link:hover svg {
+    color: var(--accent);
+  }
+  .upcoming-post-note {
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  .upcoming-post .schedule-cancel {
+    display: contents;
+  }
+  .upcoming-post .schedule-cancel-trigger {
+    grid-column: 3;
+    grid-row: 1;
+    align-self: center;
+  }
+  .upcoming-post .schedule-cancel-confirmation {
+    grid-column: 1 / -1;
+    margin-top: 0;
+  }
+  .upcoming-empty {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 23px;
+    border: 1px dashed #3a454a;
+    border-radius: var(--radius);
+    background: var(--surface);
+  }
+  .upcoming-empty-icon {
+    display: grid;
+    place-items: center;
+    flex-shrink: 0;
+    width: 42px;
+    height: 42px;
+    border-radius: 50%;
+    background: var(--surface-raised);
+    color: var(--muted);
+  }
+  .upcoming-empty h3 {
+    font-size: 14px;
+  }
+  .upcoming-empty p {
+    margin-top: 5px;
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1.6;
   }
   .job-list {
     border: 1px solid var(--line);
@@ -2165,6 +2299,186 @@
     font-size: 12px;
     line-height: 1.6;
   }
+  .publish-when {
+    min-width: 0;
+    margin: 0 0 20px;
+    padding: 0;
+    border: 0;
+  }
+  .publish-when legend {
+    margin-bottom: 9px;
+    padding: 0;
+    color: var(--text);
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .publish-when-options {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 4px;
+    padding: 4px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    background: #121519;
+  }
+  .publish-when-options label {
+    position: relative;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 7px;
+    min-height: 38px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: color 120ms, background 120ms, border-color 120ms;
+  }
+  .publish-when-options label:hover {
+    background: var(--surface-raised);
+    color: var(--text);
+  }
+  .publish-when-options label.is-selected {
+    border-color: #3f6256;
+    color: var(--accent);
+    background: var(--accent-dim);
+  }
+  .publish-when-options label:has(input:focus-visible) {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .publish-when-options input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+  }
+  .publish-when:disabled .publish-when-options label {
+    cursor: not-allowed;
+    opacity: 0.7;
+  }
+  .publish-schedule {
+    margin-top: 16px;
+    animation: publish-confirm-in 140ms ease-out;
+  }
+  .publish-schedule-label,
+  .publish-custom-time {
+    display: block;
+    margin-bottom: 8px;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .publish-slot-options {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 7px;
+    margin-bottom: 16px;
+  }
+  .publish-slot {
+    display: grid;
+    justify-items: start;
+    gap: 5px;
+    min-width: 0;
+    min-height: 65px;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    background: #14181d;
+    color: var(--text);
+    text-align: left;
+    transition: border-color 120ms, background 120ms;
+  }
+  .publish-slot span {
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.4;
+  }
+  .publish-slot strong {
+    font-size: 17px;
+    font-weight: 550;
+    line-height: 1.2;
+    font-variant-numeric: tabular-nums;
+  }
+  .publish-slot:hover:not(:disabled) {
+    border-color: #527268;
+    background: var(--surface-raised);
+  }
+  .publish-slot.is-selected {
+    border-color: var(--accent);
+    background: #1a302a;
+  }
+  .publish-slot.is-selected strong,
+  .publish-slot.is-selected span {
+    color: var(--accent);
+  }
+  .publish-slot:disabled {
+    cursor: not-allowed;
+    opacity: 0.65;
+  }
+  .publish-schedule input[type='datetime-local'] {
+    min-width: 0;
+    max-width: 100%;
+    scroll-margin-block: 100px;
+    font-variant-numeric: tabular-nums;
+  }
+  .publish-schedule input[aria-invalid='true'] {
+    border-color: var(--danger);
+  }
+  .publish-timezone,
+  .publish-time-error {
+    margin-top: 9px;
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.6;
+    overflow-wrap: anywhere;
+  }
+  .publish-time-error {
+    color: var(--danger);
+  }
+  .schedule-cancel {
+    margin-top: 7px;
+  }
+  .schedule-cancel-trigger {
+    min-height: 36px;
+    padding: 7px 10px;
+    border-color: var(--line);
+    color: var(--text);
+    font-size: 12px;
+  }
+  .schedule-cancel-trigger[aria-busy='true'] {
+    opacity: 1;
+    color: var(--muted);
+  }
+  .schedule-cancel-confirmation {
+    margin-top: 9px;
+    padding: 14px;
+    border: 1px solid #73553c;
+    border-radius: 8px;
+    background: #29231e;
+    color: var(--text);
+    font-size: 12px;
+    line-height: 1.6;
+    overflow-wrap: anywhere;
+    scroll-margin-block: 24px;
+    animation: publish-confirm-in 140ms ease-out;
+  }
+  .schedule-cancel-confirmation strong {
+    color: #f1dbc0;
+    font-weight: 600;
+  }
+  .schedule-cancel-confirmation p {
+    margin: 5px 0 13px;
+    color: #d7c9bc;
+  }
+  .schedule-cancel-confirmation .button-group {
+    justify-content: flex-end;
+  }
+  .schedule-cancel-confirmation .button {
+    white-space: normal;
+  }
   .publish-platforms {
     display: grid;
     gap: 12px;
@@ -2229,6 +2543,7 @@
   .publish-outcome--submitted {
     color: #b2ccf7;
   }
+  .publish-outcome--scheduled,
   .publish-outcome--published {
     color: var(--accent);
   }
@@ -2238,6 +2553,9 @@
   }
   .publish-outcome--failed {
     color: var(--danger);
+  }
+  .publish-outcome--cancelled {
+    color: var(--muted);
   }
   .publish-attempt-meta {
     display: flex;
@@ -2508,6 +2826,69 @@
     }
   }
   @media (max-width: 700px) {
+    .publish-when legend,
+    .publish-when-options label,
+    .publish-schedule-label,
+    .publish-custom-time,
+    .publish-slot span,
+    .schedule-cancel-confirmation,
+    .schedule-cancel-trigger {
+      font-size: 14px;
+    }
+    .publish-when-options label,
+    .schedule-cancel .button,
+    .upcoming-post .schedule-cancel-trigger {
+      min-height: 44px;
+    }
+    .publish-timezone,
+    .publish-time-error {
+      font-size: 12px;
+    }
+    .publish-schedule input[type='datetime-local'] {
+      min-height: 46px;
+      font-size: 16px;
+    }
+    .upcoming-posts .section-heading {
+      align-items: flex-start;
+      gap: 12px;
+    }
+    .upcoming-zone {
+      max-width: 46%;
+      font-size: 11px;
+      line-height: 1.5;
+    }
+    .upcoming-post {
+      grid-template-columns: 86px minmax(0, 1fr);
+      gap: 12px 14px;
+      padding: 17px 15px;
+    }
+    .upcoming-post .schedule-cancel-trigger {
+      grid-column: 2;
+      grid-row: auto;
+      justify-self: start;
+    }
+    .upcoming-time {
+      align-self: start;
+    }
+    .upcoming-time strong {
+      font-size: 21px;
+    }
+    .upcoming-platform,
+    .upcoming-post-note,
+    .upcoming-time span {
+      font-size: 12px;
+    }
+    .upcoming-short-link,
+    .upcoming-empty p {
+      font-size: 14px;
+    }
+    .upcoming-empty {
+      align-items: flex-start;
+      padding: 20px 16px;
+    }
+    .schedule-cancel-confirmation .button {
+      flex: 1;
+    }
     .publish-panel-heading h3 {
       font-size: 17px;
     }

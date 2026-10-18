@@ -1,8 +1,10 @@
 import { DatabaseSync } from 'node:sqlite';
-import type { ExportRecord, JobRecord, JobSummaryRecord, PublicationRecord, QueueTask, QueueTaskKind, QueueTaskPayloads, ShortRecord } from '../domain/model.js';
+import { publicationStartedAt, type ExportRecord, type JobRecord, type JobSummaryRecord, type PublicationRecord, type QueueTask, type QueueTaskKind, type QueueTaskPayloads, type ShortRecord } from '../domain/model.js';
 import { createId, ensureParent, nowIso, parseJson } from './util.js';
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
+
+export const CHECK_PUBLISH_DELAY_MS = 15_000;
 
 export const CHECK_WINDOW_MS = 24 * 60 * 60 * 1000;
 
@@ -97,7 +99,7 @@ export class ShortsStore {
     if (versionRow !== null && typeof versionRow === 'object' && 'user_version' in versionRow && typeof versionRow.user_version === 'number') {
       userVersion = versionRow.user_version;
     }
-    if (userVersion !== 0 && userVersion !== 2 && userVersion !== 3 && userVersion !== 4 && userVersion !== SCHEMA_VERSION) {
+    if (userVersion !== 0 && (userVersion < 2 || userVersion > SCHEMA_VERSION)) {
       db.close();
       throw new Error(`Incompatible database at ${path}; delete it to start fresh`);
     }
@@ -115,6 +117,9 @@ export class ShortsStore {
       if (userVersion >= 2 && userVersion <= 4) {
         db.exec(`UPDATE jobs SET payload_json = json_set(payload_json, '$.hostFraming', json('null'), '$.hostFramingAnalyzedAt', json('null'))`);
         db.exec(`UPDATE exports SET payload_json = json_set(payload_json, '$.hostFraming', json('null'))`);
+      }
+      if (userVersion >= 2 && userVersion <= 5) {
+        db.exec(`UPDATE publications SET payload_json = json_set(payload_json, '$.scheduledFor', json('null'))`);
       }
       db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
       db.exec('COMMIT');
@@ -219,15 +224,27 @@ export class ShortsStore {
     return rows.map((row) => payloadJsonColumn(row)).filter((payload): payload is string => payload !== null).map((payload) => parseJson<PublicationRecord>(payload));
   }
 
+  listUpcomingScheduledPublications(): PublicationRecord[] {
+    const rows = this.db.prepare("SELECT payload_json FROM publications WHERE status IN ('queued', 'deferred', 'publishing', 'scheduled') AND json_extract(payload_json, '$.scheduledFor') IS NOT NULL ORDER BY json_extract(payload_json, '$.scheduledFor') ASC").all();
+    return rows.map((row) => payloadJsonColumn(row)).filter((payload): payload is string => payload !== null).map((payload) => parseJson<PublicationRecord>(payload));
+  }
+
   enqueueMissingPublicationChecks(): void {
-    const rows = this.db.prepare("SELECT payload_json FROM publications WHERE status IN ('submitted', 'unconfirmed') ORDER BY created_at ASC").all();
+    const rows = this.db.prepare("SELECT payload_json FROM publications WHERE status IN ('submitted', 'unconfirmed', 'scheduled') ORDER BY created_at ASC").all();
     for (const payload of rows.map((row) => payloadJsonColumn(row)).filter((value): value is string => value !== null)) {
       const record = parseJson<PublicationRecord>(payload);
-      if (record.status === 'unconfirmed' && (record.submittedAt === null || Date.now() >= Date.parse(record.submittedAt) + CHECK_WINDOW_MS)) {
+      const startedAt = publicationStartedAt(record);
+      if (record.status === 'unconfirmed' && (startedAt === null || Date.now() >= Date.parse(startedAt) + CHECK_WINDOW_MS)) {
         continue;
       }
       const pending = this.db.prepare("SELECT 1 FROM queue_tasks WHERE kind = 'check_publication' AND status IN ('queued', 'running') AND json_extract(payload_json, '$.payload.publicationId') = ? LIMIT 1").get(record.id);
       if (pending !== null && typeof pending === 'object') {
+        continue;
+      }
+      if (record.status === 'scheduled' && record.scheduledFor !== null) {
+        this.enqueueTask(record.jobId, 'check_publication', { publicationId: record.id }, {
+          availableAt: new Date(Date.parse(record.scheduledFor) + CHECK_PUBLISH_DELAY_MS).toISOString(),
+        });
         continue;
       }
       this.enqueueTask(record.jobId, 'check_publication', { publicationId: record.id });
@@ -333,11 +350,18 @@ export class ShortsStore {
       return;
     }
     const publication = this.getPublication(payload.publicationId);
-    if (!publication || publication.status === 'published' || publication.status === 'failed' || publication.status === 'unconfirmed') {
+    if (!publication || publication.status === 'published' || publication.status === 'failed' || publication.status === 'unconfirmed' || publication.status === 'scheduled' || publication.status === 'cancelled') {
       return;
     }
     if (publication.status === 'submitted') {
       this.enqueueTask(publication.jobId, 'check_publication', { publicationId: publication.id });
+      return;
+    }
+    if (publication.status === 'publishing' && publication.scheduledFor !== null) {
+      publication.status = 'unconfirmed';
+      publication.error = "The studio stopped while sending this scheduled post. Check Mallary's queue before scheduling it again.";
+      publication.updatedAt = nowIso();
+      this.updatePublication(publication);
       return;
     }
     publication.status = 'failed';

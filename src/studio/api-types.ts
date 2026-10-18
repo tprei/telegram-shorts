@@ -116,6 +116,7 @@ export interface PublicationDto {
   forced: boolean;
   availableAt: string | null;
   submittedAt: string | null;
+  scheduledFor: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -124,6 +125,18 @@ export interface PlatformAvailabilityDto {
   platform: ShortVideoPlatform;
   available: boolean;
   reason: string | null;
+  canSchedule: boolean;
+}
+
+export interface ScheduledPostDto {
+  publicationId: string;
+  jobId: string;
+  shortId: string;
+  shortTitle: string;
+  platform: ShortVideoPlatform;
+  status: PublicationStatus;
+  scheduledFor: string;
+  provider: string | null;
 }
 
 export interface ShortDetailDto {
@@ -232,6 +245,7 @@ export const PublishRequestSchema = z.strictObject({
     .min(1)
     .refine((platforms) => new Set(platforms).size === platforms.length, { message: 'Platforms must not contain duplicates' }),
   force: z.boolean(),
+  scheduledAt: z.iso.datetime({ offset: true }).nullable(),
 });
 export type PublishRequest = z.infer<typeof PublishRequestSchema>;
 
@@ -259,6 +273,8 @@ export interface StudioApi {
   generatePublishCopy(shortId: string): Promise<ShortDetailDto>;
   updatePublishCopy(shortId: string, request: UpdatePublishCopyRequest): Promise<ShortDetailDto>;
   publish(exportId: string, request: PublishRequest): Promise<PublicationDto[]>;
+  cancelPublication(publicationId: string): Promise<ShortDetailDto>;
+  listScheduledPosts(): ScheduledPostDto[];
 }
 
 export const MEDIA_ROUTES = {

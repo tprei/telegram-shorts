@@ -23,6 +23,7 @@ import {
   type ReviseRequest,
   type ReviseResultDto,
   type SaveEditRequest,
+  type ScheduledPostDto,
   type SetDefaultCreatorRequest,
   type SetShortStatusRequest,
   type ShortDetailDto,
@@ -211,6 +212,16 @@ class FakeStudioApi implements StudioApi {
     this.note('publish', [exportId, request]);
     return [publicationDto(exportId)];
   }
+
+  listScheduledPosts(): ScheduledPostDto[] {
+    this.note('listScheduledPosts', []);
+    return [scheduledPostDto()];
+  }
+
+  async cancelPublication(publicationId: string): Promise<ShortDetailDto> {
+    this.note('cancelPublication', [publicationId]);
+    return shortDetailDto('j1', 's1');
+  }
 }
 
 function buildApp(options?: { api?: FakeStudioApi; media?: FakeMediaResolver; webDistDir?: string }) {
@@ -328,8 +339,22 @@ function publicationDto(exportId: string): PublicationDto {
     forced: false,
     availableAt: null,
     submittedAt: null,
+    scheduledFor: null,
     createdAt: '2026-10-16T11:10:00.000Z',
     updatedAt: '2026-10-16T11:10:00.000Z',
+  };
+}
+
+function scheduledPostDto(): ScheduledPostDto {
+  return {
+    publicationId: 'pub_sched',
+    jobId: 'j1',
+    shortId: 's1',
+    shortTitle: 'Short title',
+    platform: 'instagram',
+    status: 'scheduled',
+    scheduledFor: '2026-10-25T19:00:00.000Z',
+    provider: 'mallary',
   };
 }
 
@@ -620,8 +645,10 @@ test('every StudioApi route dispatches with parsed bodies', async () => {
     ['/api/shorts/s1/exports', { method: 'POST' }, 'exportShort', ['s1']],
     ['/api/shorts/s1/copy/generate', { method: 'POST' }, 'generatePublishCopy', ['s1']],
     ['/api/shorts/s1/copy', { method: 'PUT', body: JSON.stringify({ copy: { line1: 'First line', line2: 'Second line', hashtags: ['#shorts'] } }) }, 'updatePublishCopy', ['s1', { copy: { line1: 'First line', line2: 'Second line', hashtags: ['#shorts'] } }]],
-    ['/api/exports/e1/publish', { method: 'POST', body: JSON.stringify({ platforms: ['instagram'], force: false }) }, 'publish', ['e1', { platforms: ['instagram'], force: false }]],
+    ['/api/exports/e1/publish', { method: 'POST', body: JSON.stringify({ platforms: ['instagram'], force: false, scheduledAt: null }) }, 'publish', ['e1', { platforms: ['instagram'], force: false, scheduledAt: null }]],
     ['/api/jobs/j1/host-framing/analyze', { method: 'POST' }, 'analyzeHostFraming', ['j1']],
+    ['/api/schedule', {}, 'listScheduledPosts', []],
+    ['/api/publications/pub_9/cancel', { method: 'POST' }, 'cancelPublication', ['pub_9']],
   ];
   for (const [route, init, method] of cases) {
     const res = await app.request(route, init);
@@ -706,7 +733,7 @@ test('duplicate publish platforms are rejected with 400 before dispatch', async 
   const app = buildApp({ api });
   const res = await app.request('/api/exports/e1/publish', {
     method: 'POST',
-    body: JSON.stringify({ platforms: ['instagram', 'instagram'], force: false }),
+    body: JSON.stringify({ platforms: ['instagram', 'instagram'], force: false, scheduledAt: null }),
   });
   assert.equal(res.status, 400);
   const body = await res.json();
@@ -728,4 +755,22 @@ test('POST /api/jobs/:jobId/host-framing/analyze dispatches and maps conflict to
   assert.equal(conflict.status, 409);
   assert.deepEqual(await conflict.json(), { error: 'Job must be ready to analyze host framing.', code: 'conflict' });
   assert.deepEqual(api.calls, [{ method: 'analyzeHostFraming', args: ['j1'] }]);
+});
+
+test('GET /api/schedule returns the upcoming scheduled posts', async () => {
+  const api = new FakeStudioApi();
+  const app = buildApp({ api });
+  const res = await app.request('/api/schedule');
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), [scheduledPostDto()]);
+  assert.deepEqual(api.calls, [{ method: 'listScheduledPosts', args: [] }]);
+});
+
+test('POST /api/publications/:publicationId/cancel returns the short detail', async () => {
+  const api = new FakeStudioApi();
+  const app = buildApp({ api });
+  const res = await app.request('/api/publications/pub_9/cancel', { method: 'POST' });
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), shortDetailDto('j1', 's1'));
+  assert.deepEqual(api.calls, [{ method: 'cancelPublication', args: ['pub_9'] }]);
 });

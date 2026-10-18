@@ -1,4 +1,4 @@
-import type { ButtonHTMLAttributes, ReactNode } from 'react';
+import { useEffect, useId, useRef, useState, type ButtonHTMLAttributes, type ReactNode } from 'react';
 import { Link } from 'react-router';
 
 export type IconName =
@@ -15,7 +15,8 @@ export type IconName =
   | 'check'
   | 'video'
   | 'spark'
-  | 'alert';
+  | 'alert'
+  | 'clock';
 export interface IconProps {
   name: IconName;
   size?: number;
@@ -35,6 +36,7 @@ const paths: Record<IconName, string> = {
   video: 'M3 5h13v14H3ZM16 10l5-3v10l-5-3',
   spark: 'm12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5Z',
   alert: 'm12 3 10 18H2Zm0 6v5m0 3v1',
+  clock: 'M12 8v4l3 2M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0Z',
 };
 export function Icon({ name, size = 18 }: IconProps) {
   return (
@@ -94,6 +96,8 @@ const labels: Record<string, string> = {
   running: 'Analyzing',
   done: 'Framing ready',
   youtube_shorts: 'YouTube Shorts',
+  scheduled: 'Scheduled',
+  cancelled: 'Schedule cancelled',
 };
 export function StatusBadge({ status, label }: StatusBadgeProps) {
   return (
@@ -101,6 +105,97 @@ export function StatusBadge({ status, label }: StatusBadgeProps) {
       <span className="status-dot" />
       {label ?? labels[status] ?? status.replaceAll('_', ' ')}
     </span>
+  );
+}
+
+export const scheduleDateTime = new Intl.DateTimeFormat(undefined, {
+  weekday: 'short',
+  month: 'short',
+  day: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
+  hourCycle: 'h23',
+});
+export const scheduleDay = new Intl.DateTimeFormat(undefined, {
+  weekday: 'short',
+  month: 'short',
+  day: 'numeric',
+});
+export const scheduleTime = new Intl.DateTimeFormat(undefined, {
+  hour: '2-digit',
+  minute: '2-digit',
+  hourCycle: 'h23',
+});
+const scheduleWeekday = new Intl.DateTimeFormat(undefined, { weekday: 'short' });
+export function scheduleButtonTime(date: Date): string {
+  return `${scheduleWeekday.format(date)} ${scheduleTime.format(date)}`;
+}
+export function localDateTimeValue(date: Date): string {
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+export interface ScheduleCancelButtonProps {
+  description: string;
+  pending?: boolean;
+  disabled?: boolean;
+  onConfirm: () => void;
+}
+export function ScheduleCancelButton({ description, pending = false, disabled = false, onConfirm }: ScheduleCancelButtonProps) {
+  const id = useId();
+  const [open, setOpen] = useState(false);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const keepButton = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (open) keepButton.current?.focus({ preventScroll: true });
+  }, [open]);
+  useEffect(() => {
+    if (pending || disabled) setOpen(false);
+  }, [pending, disabled]);
+  function close() {
+    setOpen(false);
+    trigger.current?.focus({ preventScroll: true });
+  }
+  return (
+    <div className="schedule-cancel">
+      <button
+        ref={trigger}
+        type="button"
+        className="button button--ghost schedule-cancel-trigger"
+        disabled={pending || disabled}
+        aria-busy={pending || undefined}
+        aria-label={`${pending ? 'Cancelling' : 'Cancel'} ${description}`}
+        aria-expanded={open}
+        aria-controls={open ? `${id}-confirmation` : undefined}
+        onClick={() => setOpen(!open)}
+      >
+        {pending && <span className="spinner" aria-hidden="true" />}
+        {pending ? 'Cancelling…' : 'Cancel'}
+      </button>
+      {open && (
+        <div
+          id={`${id}-confirmation`}
+          className="schedule-cancel-confirmation"
+          role="group"
+          aria-labelledby={`${id}-question`}
+          onKeyDown={(event) => {
+            if (event.key === 'Escape') {
+              event.preventDefault();
+              close();
+            }
+          }}
+        >
+          <strong id={`${id}-question`}>Cancel this scheduled post?</strong>
+          <p>{description} won’t be published.</p>
+          <div className="button-group">
+            <button ref={keepButton} type="button" className="button button--secondary" onClick={close}>Keep post</button>
+            <Button variant="danger" onClick={() => {
+              setOpen(false);
+              onConfirm();
+            }}>Cancel post</Button>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 export interface ApiErrorProps {

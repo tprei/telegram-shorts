@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { BufferClient } from '../src/infra/buffer.js';
+import { FallbackShortVideoPublishProvider } from '../src/infra/instagram-publisher-factory.js';
 import { ShortVideoPublishError } from '../src/infra/instagram-publisher.js';
+import type { ShortVideoCheckPublicationInput, ShortVideoPublishInput, ShortVideoPublishProvider, ShortVideoPublishResult } from '../src/infra/instagram-publisher.js';
 
 test('Buffer Instagram reels omit rejected custom video thumbnails', async () => {
   const originalFetch = globalThis.fetch;
@@ -23,6 +25,7 @@ test('Buffer Instagram reels omit rejected custom video thumbnails', async () =>
       commentsUnderPost: ['Fonte: https://example.com'],
       message: 'Legenda',
       idempotencyKey: 'key',
+      scheduledAt: null,
     });
     assert.deepEqual(result.jobs, [{ platform: 'instagram', jobId: 'post-123' }]);
     assert.ok(requestBody?.query);
@@ -44,7 +47,7 @@ test('Buffer does not report success without a post id', async () => {
       publicAssetHost: { name: 'test', hostFile: async () => 'https://cdn.test/video.mp4' },
     });
     await assert.rejects(
-      client.publishShortVideo({ platform: 'instagram', filePath: 'video.mp4', message: 'Legenda', idempotencyKey: 'key' }),
+      client.publishShortVideo({ platform: 'instagram', filePath: 'video.mp4', message: 'Legenda', idempotencyKey: 'key', scheduledAt: null }),
       (error: unknown) => error instanceof ShortVideoPublishError
         && error.message === 'Buffer createPost succeeded without a post id.'
         && error.safeToFailover === false,
@@ -65,7 +68,7 @@ test('Buffer propagates concrete mutation errors instead of reporting queued', a
       publicAssetHost: { name: 'test', hostFile: async () => 'https://cdn.test/video.mp4' },
     });
     await assert.rejects(
-      client.publishShortVideo({ platform: 'instagram', filePath: 'video.mp4', message: 'Legenda', idempotencyKey: 'key' }),
+      client.publishShortVideo({ platform: 'instagram', filePath: 'video.mp4', message: 'Legenda', idempotencyKey: 'key', scheduledAt: null }),
       (error: unknown) => error instanceof ShortVideoPublishError && error.message === 'Buffer createPost failed: thumbnailUrl is not supported',
     );
   } finally {
@@ -160,4 +163,135 @@ test('Buffer check tolerates empty links and non-string error shapes', async () 
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('Buffer cannot schedule and refuses to cancel scheduled posts', async () => {
+  const client = bufferStatusClient();
+  assert.equal(client.supportsScheduling, false);
+  await assert.rejects(
+    client.cancelScheduled({ provider: 'buffer', platform: 'instagram', remoteJobId: 'post-1' }),
+    (error: unknown) => error instanceof ShortVideoPublishError
+      && error.stage === 'cancel'
+      && error.message === "Buffer posts can't be cancelled from the studio."
+      && error.safeToFailover === false,
+  );
+});
+
+interface ScriptedProviderOptions {
+  supportsScheduling: boolean;
+  result: ShortVideoPublishResult;
+  cancelError?: Error;
+}
+
+function scriptedProvider(
+  name: string,
+  publishCalls: ShortVideoPublishInput[],
+  cancelCalls: ShortVideoCheckPublicationInput[],
+  options: ScriptedProviderOptions,
+): ShortVideoPublishProvider {
+  return {
+    name,
+    supportedPlatforms: ['instagram', 'tiktok', 'youtube_shorts'],
+    supportsScheduling: options.supportsScheduling,
+    supports: () => true,
+    publishShortVideo: async (input) => {
+      publishCalls.push(input);
+      return options.result;
+    },
+    checkPublication: async () => ({ status: 'pending', url: null, error: null }),
+    cancelScheduled: async (input) => {
+      cancelCalls.push(input);
+      if (options.cancelError) {
+        throw options.cancelError;
+      }
+    },
+  };
+}
+
+const BUFFER_STYLE_RESULT: ShortVideoPublishResult = { provider: 'buffer', platform: 'instagram', status: 'queued', batchId: null, jobs: [{ platform: 'instagram', jobId: 'buffer-1' }] };
+const MALLARY_STYLE_RESULT: ShortVideoPublishResult = { provider: 'mallary', platform: 'instagram', status: 'queued', batchId: null, jobs: [{ platform: 'instagram', jobId: 'mallary-1' }] };
+
+function fallbackProviderOrder(): Record<'instagram' | 'tiktok' | 'youtube_shorts', Array<'mallary' | 'buffer'>> {
+  return { instagram: ['buffer', 'mallary'], tiktok: ['buffer', 'mallary'], youtube_shorts: ['buffer', 'mallary'] };
+}
+
+test('the fallback provider skips providers without scheduling support for scheduled posts', async () => {
+  const bufferPublishCalls: ShortVideoPublishInput[] = [];
+  const mallaryPublishCalls: ShortVideoPublishInput[] = [];
+  const fallback = new FallbackShortVideoPublishProvider(
+    [
+      scriptedProvider('buffer', bufferPublishCalls, [], { supportsScheduling: false, result: BUFFER_STYLE_RESULT }),
+      scriptedProvider('mallary', mallaryPublishCalls, [], { supportsScheduling: true, result: MALLARY_STYLE_RESULT }),
+    ],
+    fallbackProviderOrder(),
+  );
+  assert.equal(fallback.supportsScheduling, true);
+
+  const scheduled = await fallback.publishShortVideo({
+    platform: 'instagram',
+    filePath: 'video.mp4',
+    message: 'Legenda',
+    idempotencyKey: 'k1',
+    scheduledAt: '2026-10-25T19:00:00.000Z',
+  });
+  assert.equal(scheduled.provider, 'mallary');
+  assert.equal(bufferPublishCalls.length, 0);
+  assert.equal(mallaryPublishCalls.length, 1);
+
+  const immediate = await fallback.publishShortVideo({
+    platform: 'instagram',
+    filePath: 'video.mp4',
+    message: 'Legenda',
+    idempotencyKey: 'k2',
+    scheduledAt: null,
+  });
+  assert.equal(immediate.provider, 'buffer');
+  assert.equal(bufferPublishCalls.length, 1);
+  assert.equal(mallaryPublishCalls.length, 1);
+});
+
+test('the fallback provider refuses scheduled posts when no provider can schedule', async () => {
+  const bufferPublishCalls: ShortVideoPublishInput[] = [];
+  const fallback = new FallbackShortVideoPublishProvider(
+    [scriptedProvider('buffer', bufferPublishCalls, [], { supportsScheduling: false, result: BUFFER_STYLE_RESULT })],
+    fallbackProviderOrder(),
+  );
+  assert.equal(fallback.supportsScheduling, false);
+  await assert.rejects(
+    fallback.publishShortVideo({
+      platform: 'instagram',
+      filePath: 'video.mp4',
+      message: 'Legenda',
+      idempotencyKey: 'k3',
+      scheduledAt: '2026-10-25T19:00:00.000Z',
+    }),
+    /No provider can schedule instagram\./,
+  );
+  assert.equal(bufferPublishCalls.length, 0);
+});
+
+test('the fallback provider cancels scheduled posts by provider name', async () => {
+  const cancelCalls: ShortVideoCheckPublicationInput[] = [];
+  const fallback = new FallbackShortVideoPublishProvider(
+    [
+      bufferStatusClient(),
+      scriptedProvider('mallary', [], cancelCalls, { supportsScheduling: true, result: MALLARY_STYLE_RESULT }),
+    ],
+    fallbackProviderOrder(),
+  );
+  await fallback.cancelScheduled({ provider: 'mallary', platform: 'instagram', remoteJobId: 'mallary-9' });
+  assert.deepEqual(cancelCalls, [{ provider: 'mallary', platform: 'instagram', remoteJobId: 'mallary-9' }]);
+
+  await assert.rejects(
+    fallback.cancelScheduled({ provider: 'buffer', platform: 'instagram', remoteJobId: 'post-1' }),
+    (error: unknown) => error instanceof ShortVideoPublishError
+      && error.stage === 'cancel'
+      && error.message === "Buffer posts can't be cancelled from the studio.",
+  );
+  await assert.rejects(
+    fallback.cancelScheduled({ provider: 'unknown', platform: 'instagram', remoteJobId: 'post-2' }),
+    (error: unknown) => error instanceof ShortVideoPublishError
+      && error.stage === 'cancel'
+      && error.message === 'No publish provider named unknown is configured to cancel instagram.',
+  );
 });

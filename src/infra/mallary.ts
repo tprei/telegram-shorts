@@ -28,6 +28,8 @@ const DISALLOWED_HASHTAGS = new Set([
 
 const UPLOAD_IDLE_TIMEOUT_MS = 60_000;
 const DEFAULT_RETRY_DELAYS_MS = [2_000, 5_000];
+const CREATE_POST_TIMEOUT_MS = 120_000;
+const MISSED_SCHEDULE_MARGIN_MS = 2 * 60_000;
 
 export interface MallaryUpload {
   uploadUrl: string;
@@ -206,6 +208,7 @@ function isTransientNetworkError(error: unknown): boolean {
 export class MallaryClient implements ShortVideoPublishProvider {
   readonly name = 'mallary';
   readonly supportedPlatforms: ShortVideoPlatform[] = ['instagram', 'tiktok', 'youtube_shorts'];
+  readonly supportsScheduling = true;
 
   constructor(
     private readonly apiToken: string,
@@ -249,6 +252,37 @@ export class MallaryClient implements ShortVideoPublishProvider {
     return mallaryJobToRemoteState(parsed.data.data.job);
   }
 
+  async cancelScheduled(input: ShortVideoCheckPublicationInput): Promise<void> {
+    let response: Response;
+    try {
+      response = await fetch(`${BASE_URL}/api/v1/jobs/${encodeURIComponent(input.remoteJobId)}/cancel`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${this.apiToken}` },
+        signal: AbortSignal.timeout(30_000),
+      });
+    } catch (error) {
+      logError('Mallary cancel request failed', error, { remoteJobId: input.remoteJobId });
+      throw new ShortVideoPublishError({
+        provider: this.name,
+        stage: 'cancel',
+        message: `Mallary cancel request failed for ${input.remoteJobId}.`,
+        safeToFailover: false,
+        cause: error,
+      });
+    }
+    if (response.status === 409) {
+      const bodyText = await response.text().catch(() => '');
+      throw new ShortVideoPublishError({
+        provider: this.name,
+        stage: 'cancel',
+        message: mallaryErrorMessage(bodyText) ?? `${input.platform === 'instagram' ? 'Instagram' : input.platform === 'tiktok' ? 'TikTok' : 'YouTube Shorts'} is already publishing this post; it can't be cancelled.`,
+        safeToFailover: false,
+        httpStatus: 409,
+      });
+    }
+    await assertOk(this.name, 'cancel', 'Mallary cancel request failed')(response);
+  }
+
   async publishShortVideo(input: ShortVideoPublishInput): Promise<ShortVideoPublishResult> {
     const upload = await this.uploadClient.uploadFile(input.filePath);
     const thumbnailUpload = input.platform === 'instagram' && input.thumbnailPath
@@ -263,7 +297,16 @@ export class MallaryClient implements ShortVideoPublishProvider {
       profileId: this.profileId,
       thumbnailUrl: thumbnailUpload?.mediaUrl ?? null,
       commentsUnderPost: input.commentsUnderPost,
+      scheduledAt: input.scheduledAt,
     });
+    if (input.scheduledAt !== null && Date.parse(input.scheduledAt) < Date.now() + MISSED_SCHEDULE_MARGIN_MS) {
+      throw new ShortVideoPublishError({
+        provider: this.name,
+        stage: 'create',
+        message: `Missed the scheduled time (${input.scheduledAt}); schedule it again.`,
+        safeToFailover: false,
+      });
+    }
     let response: Response;
     try {
       response = await withNetworkRetries('Mallary create post request', DEFAULT_RETRY_DELAYS_MS, isTransientNetworkError, () => fetch(`${BASE_URL}/api/v1/post`, {
@@ -273,6 +316,7 @@ export class MallaryClient implements ShortVideoPublishProvider {
           'Content-Type': 'application/json',
           'Idempotency-Key': input.idempotencyKey,
         },
+        signal: AbortSignal.timeout(CREATE_POST_TIMEOUT_MS),
         body: JSON.stringify(payload),
       }));
     } catch (error) {
@@ -309,12 +353,14 @@ export function buildMallaryInstagramReelPayload(input: {
   profileId?: string | null;
   thumbnailUrl?: string | null;
   commentsUnderPost?: string[];
+  scheduledAt: string | null;
 }): Record<string, unknown> {
   const commentsUnderPost = normalizeCommentsUnderPost(input.commentsUnderPost);
   return {
     message: input.message,
     platforms: ['instagram'],
     ...(input.profileId ? { profile_id: input.profileId } : {}),
+    ...(input.scheduledAt !== null ? { scheduled_at: input.scheduledAt } : {}),
     media: [{
       url: input.mediaUrl,
       type: input.mediaType,
@@ -338,6 +384,7 @@ function buildMallaryShortVideoPayload(input: {
   profileId?: string | null;
   thumbnailUrl?: string | null;
   commentsUnderPost?: string[];
+  scheduledAt: string | null;
 }): Record<string, unknown> {
   if (input.platform === 'instagram') {
     return buildMallaryInstagramReelPayload(input);
@@ -347,6 +394,7 @@ function buildMallaryShortVideoPayload(input: {
       message: input.message,
       platforms: ['tiktok'],
       ...(input.profileId ? { profile_id: input.profileId } : {}),
+      ...(input.scheduledAt !== null ? { scheduled_at: input.scheduledAt } : {}),
       media: [{
         url: input.mediaUrl,
         type: input.mediaType,
@@ -364,6 +412,7 @@ function buildMallaryShortVideoPayload(input: {
     message: input.message,
     platforms: ['youtube'],
     ...(input.profileId ? { profile_id: input.profileId } : {}),
+    ...(input.scheduledAt !== null ? { scheduled_at: input.scheduledAt } : {}),
     media: [{
       url: input.mediaUrl,
       type: input.mediaType,

@@ -8,6 +8,7 @@ export interface ShortVideoPublishInput {
   filePath: string;
   message: string;
   idempotencyKey: string;
+  scheduledAt: string | null;
   title?: string | null;
   thumbnailPath?: string | null;
   commentsUnderPost?: string[];
@@ -33,7 +34,7 @@ export interface RemotePublicationState {
   error: string | null;
 }
 
-export type ShortVideoPublishErrorStage = 'configuration' | 'discovery' | 'upload' | 'create';
+export type ShortVideoPublishErrorStage = 'configuration' | 'discovery' | 'upload' | 'create' | 'cancel';
 
 const TRANSIENT_NETWORK_CODES: Record<string, true> = {
   ETIMEDOUT: true,
@@ -102,7 +103,9 @@ export class ShortVideoPublishError extends Error {
 export interface ShortVideoPublishProvider {
   readonly name: string;
   readonly supportedPlatforms: ShortVideoPlatform[];
+  readonly supportsScheduling: boolean;
   supports(platform: ShortVideoPlatform): boolean;
   publishShortVideo(input: ShortVideoPublishInput): Promise<ShortVideoPublishResult>;
   checkPublication(input: ShortVideoCheckPublicationInput): Promise<RemotePublicationState>;
+  cancelScheduled(input: ShortVideoCheckPublicationInput): Promise<void>;
 }

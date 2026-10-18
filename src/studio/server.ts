@@ -146,6 +146,10 @@ export function createStudioApp(input: StudioAppInput): Hono {
   app.post('/api/exports/:exportId/publish', async (c) =>
     c.json(await api.publish(c.req.param('exportId'), PublishRequestSchema.parse(await parseBody(c)))),
   );
+  app.get('/api/schedule', (c) => c.json(api.listScheduledPosts()));
+  app.post('/api/publications/:publicationId/cancel', async (c) =>
+    c.json(await api.cancelPublication(c.req.param('publicationId'))),
+  );
 
   app.all('/api/*', (c) => c.json({ error: 'Not found', code: 'not_found' }, 404));
 

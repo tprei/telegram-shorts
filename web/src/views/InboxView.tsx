@@ -1,20 +1,30 @@
 import { useState, type FormEvent } from 'react';
 import { Link } from 'react-router';
-import type { CreatorDto, CreateJobRequest, JobSummaryDto } from '@api';
+import type { CreatorDto, CreateJobRequest, JobSummaryDto, ScheduledPostDto } from '@api';
 import {
   ApiError,
   Button,
   EmptyState,
   Icon,
+  ScheduleCancelButton,
   StatusBadge,
   StudioShell,
   relativeTime,
+  scheduleDateTime,
+  scheduleDay,
+  scheduleTime,
 } from '../components/StudioPrimitives';
 import '../styles/studio.css';
 
 export interface InboxViewProps {
   creators: CreatorDto[];
   jobs: JobSummaryDto[];
+  upcomingPosts: readonly ScheduledPostDto[];
+  onCancelPublication: (publicationId: string, shortId: string) => void;
+  scheduleLoading?: boolean;
+  scheduleError?: string | null;
+  cancellingPublicationIds?: readonly string[];
+  cancelError?: string | null;
   loading?: boolean;
   pending?: boolean;
   error?: string | null;
@@ -23,6 +33,12 @@ export interface InboxViewProps {
 export function InboxView({
   creators,
   jobs,
+  upcomingPosts,
+  onCancelPublication,
+  scheduleLoading = false,
+  scheduleError,
+  cancellingPublicationIds = [],
+  cancelError,
   loading = false,
   pending = false,
   error,
@@ -97,6 +113,60 @@ export function InboxView({
           </Button>
         </form>
         <ApiError message={error} title="Couldn’t add this video" />
+      </section>
+      <section className="upcoming-posts" aria-labelledby="upcoming-title">
+        <div className="section-heading">
+          <div className="upcoming-heading">
+            <h2 id="upcoming-title">Upcoming posts</h2>
+            {upcomingPosts.length > 0 && <span className="upcoming-count">{upcomingPosts.length}</span>}
+          </div>
+          <span className="upcoming-zone">{Intl.DateTimeFormat().resolvedOptions().timeZone.replaceAll('_', ' ')}</span>
+        </div>
+        <ApiError message={scheduleError} title="Couldn’t load upcoming posts" />
+        <ApiError message={cancelError} title="Couldn’t cancel the scheduled post" />
+        {scheduleLoading && upcomingPosts.length === 0 ? (
+          <div className="loading-state" role="status"><span className="spinner" />Loading upcoming posts…</div>
+        ) : upcomingPosts.length > 0 ? (
+          <ul className="upcoming-list" aria-label="Scheduled posts">
+            {upcomingPosts.map((post) => {
+              const date = new Date(post.scheduledFor);
+              const platform = post.platform === 'instagram' ? 'Instagram' : post.platform === 'tiktok' ? 'TikTok' : 'YouTube Shorts';
+              const cancellable = post.status === 'scheduled' || post.status === 'queued' || post.status === 'deferred';
+              return (
+                <li className="upcoming-post" key={post.publicationId}>
+                  <time className="upcoming-time" dateTime={post.scheduledFor} title={scheduleDateTime.format(date)}>
+                    <strong>{scheduleTime.format(date)}</strong>
+                    <span>{scheduleDay.format(date)}</span>
+                  </time>
+                  <div className="upcoming-post-main">
+                    <span className={`upcoming-platform upcoming-platform--${post.platform}`}>{platform}</span>
+                    <Link to={`/shorts/${post.shortId}`} className="upcoming-short-link" title={post.shortTitle}>
+                      {post.shortTitle}
+                      <Icon name="arrow" size={15} />
+                    </Link>
+                    {post.status === 'publishing' && <span className="upcoming-post-note" role="status">Uploading now — cancellation is temporarily unavailable.</span>}
+                    {post.status === 'queued' && <span className="upcoming-post-note">Sending to Mallary</span>}
+                    {post.status === 'deferred' && <span className="upcoming-post-note">Waiting for the posting limit</span>}
+                  </div>
+                  <ScheduleCancelButton
+                    description={`${platform} post “${post.shortTitle}” for ${scheduleDateTime.format(date)}`}
+                    pending={cancellingPublicationIds.includes(post.publicationId)}
+                    disabled={!cancellable}
+                    onConfirm={() => onCancelPublication(post.publicationId, post.shortId)}
+                  />
+                </li>
+              );
+            })}
+          </ul>
+        ) : !scheduleError ? (
+          <div className="upcoming-empty">
+            <span className="upcoming-empty-icon"><Icon name="clock" size={21} /></span>
+            <div>
+              <h3>No posts scheduled</h3>
+              <p>Choose Schedule when publishing a short. Your upcoming posts will appear here.</p>
+            </div>
+          </div>
+        ) : null}
       </section>
       <section aria-labelledby="recent-title">
         <div className="section-heading">

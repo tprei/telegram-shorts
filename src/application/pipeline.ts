@@ -2,7 +2,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { z } from 'zod';
 import { createInitialEdit, keptWordIndices, replaceAutoCrops, type ShortEdit } from '../domain/edit.js';
-import { QUEUE_LANES, type ExportRecord, type HostFraming, type JobRecord, type PublicationRecord, type PublicationStatus, type QueueLane, type QueueTask, type ShortRecord, type SourceMedia, type TranscriptWord } from '../domain/model.js';
+import { publicationStartedAt, QUEUE_LANES, type ExportRecord, type HostFraming, type JobRecord, type PublicationRecord, type PublicationStatus, type QueueLane, type QueueTask, type ShortRecord, type SourceMedia, type TranscriptWord } from '../domain/model.js';
 import { computeSourceClips, buildTimeline, type SourceClip } from '../domain/timeline.js';
 import { buildSentences, detectStrongSpeakers } from '../domain/policies.js';
 import type { ContentPanel, HostPanel, LayoutProfile } from '../domain/layout.js';
@@ -14,8 +14,8 @@ import { transcribeSource } from '../infra/transcript.js';
 import { analyzeContentCrops, detectHostHead } from '../infra/vision.js';
 import { downloadSource } from '../infra/youtube.js';
 import type { AppConfig } from '../infra/env.js';
-import { CHECK_WINDOW_MS, ShortsStore } from '../infra/db.js';
-import { ShortVideoPublishError, isTransientCheckError, isTransientNetworkError, type RemotePublicationState, type ShortVideoPublishProvider } from '../infra/instagram-publisher.js';
+import { CHECK_PUBLISH_DELAY_MS, CHECK_WINDOW_MS, ShortsStore } from '../infra/db.js';
+import { ShortVideoPublishError, isTransientCheckError, isTransientNetworkError, type RemotePublicationState, type ShortVideoPublishProvider, type ShortVideoPublishResult } from '../infra/instagram-publisher.js';
 import { createId, describeError, logError, nowIso } from '../infra/util.js';
 import type { OpenRouterClient } from '../infra/openrouter.js';
 import { mallaryCooldownKey, platformAvailability, platformLabel } from './platforms.js';
@@ -26,12 +26,11 @@ const ExportShortPayloadSchema = z.strictObject({ exportId: z.string().min(1) })
 const PublishShortVideoPayloadSchema = z.strictObject({ publicationId: z.string().min(1) });
 const CheckPublicationPayloadSchema = z.strictObject({ publicationId: z.string().min(1) });
 
-const CHECK_PUBLISH_DELAY_MS = 15_000;
 const CHECK_RETRY_DELAY_MS = 20_000;
 const CHECK_UNCONFIRMED_DELAY_MS = 10 * 60 * 1000;
 const CHECK_DEADLINE_MS = 60 * 60 * 1000;
 
-const PRESERVED_PUBLICATION_STATUSES: readonly PublicationStatus[] = ['submitted', 'published', 'unconfirmed'];
+const PRESERVED_PUBLICATION_STATUSES: readonly PublicationStatus[] = ['submitted', 'published', 'unconfirmed', 'scheduled', 'cancelled'];
 
 class PublicationCheckRetry extends Error {
   constructor(readonly availableAt: string, readonly reason: string) {
@@ -395,8 +394,8 @@ export class ShortsPipeline {
   }
 
   private async publishShortVideo(publicationId: string): Promise<void> {
-    const publication = this.requirePublication(publicationId);
-    if (publication.status === 'published' || publication.status === 'failed' || publication.status === 'submitted' || publication.status === 'unconfirmed') {
+    let publication = this.requirePublication(publicationId);
+    if (publication.status === 'published' || publication.status === 'failed' || publication.status === 'submitted' || publication.status === 'unconfirmed' || publication.status === 'scheduled' || publication.status === 'cancelled') {
       return;
     }
     const exportRecord = this.deps.store.getExport(publication.exportId);
@@ -409,6 +408,14 @@ export class ShortsPipeline {
       throw new Error(`No provider configured for ${publication.platform}.`);
     }
     const availability = await platformAvailability(job, this.deps.publisher, this.deps.config, this.deps.profiles);
+    const reloaded = this.deps.store.getPublication(publicationId);
+    if (reloaded === null) {
+      throw new Error(`Publication not found: ${publicationId}`);
+    }
+    if (reloaded.status === 'cancelled') {
+      return;
+    }
+    publication = reloaded;
     const platformAvailabilityEntry = availability.find((entry) => entry.platform === publication.platform);
     if (!platformAvailabilityEntry?.available) {
       const reason = platformAvailabilityEntry?.reason ?? `No provider configured for ${publication.platform}.`;
@@ -454,19 +461,42 @@ export class ShortsPipeline {
         }
       }
     }
-    const result = await this.deps.publisher.publishShortVideo({
-      platform: publication.platform,
-      filePath: exportRecord.artifactPath,
-      message: buildPublishMessage(copy),
-      title: publication.platform === 'youtube_shorts' ? short.title : null,
-      idempotencyKey: `shorts-${publication.platform}-${exportRecord.id}-${publication.id}`,
-      thumbnailPath: coverPath,
-      commentsUnderPost: publication.platform === 'instagram' && job.sourceUrl
-        ? [`Vídeo completo: ${job.sourceUrl}`]
-        : [],
-    });
+    let result: ShortVideoPublishResult;
+    try {
+      result = await this.deps.publisher.publishShortVideo({
+        platform: publication.platform,
+        filePath: exportRecord.artifactPath,
+        message: buildPublishMessage(copy),
+        title: publication.platform === 'youtube_shorts' ? short.title : null,
+        idempotencyKey: `shorts-${publication.platform}-${exportRecord.id}-${publication.id}`,
+        scheduledAt: publication.scheduledFor,
+        thumbnailPath: coverPath,
+        commentsUnderPost: publication.platform === 'instagram' && job.sourceUrl
+          ? [`Vídeo completo: ${job.sourceUrl}`]
+          : [],
+      });
+    } catch (error) {
+      if (isTransientNetworkError(error)) {
+        const target = publication.scheduledFor !== null ? "Mallary's queue" : platformLabel(publication.platform);
+        const message = `${this.requirePublisher().name} may have received this post; check ${target} before reposting`;
+        publication.status = 'unconfirmed';
+        publication.error = message;
+        publication.updatedAt = nowIso();
+        this.deps.store.updatePublication(publication);
+        this.deps.store.appendAction(job.id, 'short_video_unconfirmed', {
+          publicationId: publication.id,
+          platform: publication.platform,
+          provider: null,
+          error: message,
+        });
+        return;
+      }
+      throw error;
+    }
     if (result.jobs.length === 0) {
-      const message = `${result.provider} accepted the post but returned no id to track; check ${platformLabel(publication.platform)} before reposting.`;
+      const message = publication.scheduledFor !== null
+        ? "Mallary accepted the scheduled post but returned no id to track; check Mallary's queue before scheduling it again."
+        : `${result.provider} accepted the post but returned no id to track; check ${platformLabel(publication.platform)} before reposting.`;
       publication.status = 'unconfirmed';
       publication.provider = result.provider;
       publication.batchId = result.batchId;
@@ -478,6 +508,29 @@ export class ShortsPipeline {
         platform: publication.platform,
         provider: result.provider,
         error: message,
+      });
+      return;
+    }
+    if (publication.scheduledFor !== null) {
+      publication.status = 'scheduled';
+      publication.provider = result.provider;
+      publication.batchId = result.batchId;
+      publication.remoteJobs = result.jobs;
+      publication.submittedAt = nowIso();
+      publication.error = null;
+      publication.updatedAt = nowIso();
+      this.deps.store.updatePublication(publication);
+      this.deps.store.enqueueTask(job.id, 'check_publication', { publicationId: publication.id }, {
+        availableAt: new Date(Date.parse(publication.scheduledFor) + CHECK_PUBLISH_DELAY_MS).toISOString(),
+      });
+      this.deps.store.appendAction(job.id, 'short_video_scheduled', {
+        publicationId: publication.id,
+        platform: publication.platform,
+        provider: result.provider,
+        batchId: result.batchId,
+        jobs: result.jobs,
+        scheduledFor: publication.scheduledFor,
+        forced: publication.forced,
       });
       return;
     }
@@ -503,8 +556,8 @@ export class ShortsPipeline {
   }
 
   private async checkPublication(publicationId: string): Promise<void> {
-    const publication = this.requirePublication(publicationId);
-    if (publication.status !== 'submitted' && publication.status !== 'unconfirmed') {
+    let publication = this.requirePublication(publicationId);
+    if (publication.status !== 'submitted' && publication.status !== 'unconfirmed' && publication.status !== 'scheduled') {
       return;
     }
     if (publication.status === 'unconfirmed' && !this.insideCheckWindowAt(publication, Date.now())) {
@@ -519,6 +572,17 @@ export class ShortsPipeline {
       this.markUnconfirmed(publication, `${publication.provider} accepted the post but returned no id to track; check ${platformLabel(publication.platform)} before reposting.`);
       return;
     }
+    let waitingForScheduledTimeMs: number | null = null;
+    if (publication.status === 'scheduled' && publication.scheduledFor !== null) {
+      const scheduledForMs = Date.parse(publication.scheduledFor);
+      if (Date.now() < scheduledForMs) {
+        waitingForScheduledTimeMs = scheduledForMs;
+      } else {
+        publication.status = 'submitted';
+        publication.updatedAt = nowIso();
+        this.deps.store.updatePublication(publication);
+      }
+    }
     let state: RemotePublicationState;
     try {
       state = await this.requirePublisher().checkPublication({
@@ -528,6 +592,12 @@ export class ShortsPipeline {
       });
     } catch (error) {
       logError('Publication check failed', error, { publicationId: publication.id, provider: publication.provider, remoteJobId: remoteJob.jobId });
+      if (this.deps.store.getPublication(publicationId)?.status === 'cancelled') {
+        return;
+      }
+      if (waitingForScheduledTimeMs !== null) {
+        throw new PublicationCheckRetry(new Date(waitingForScheduledTimeMs + CHECK_PUBLISH_DELAY_MS).toISOString(), describeError(error));
+      }
       if (!isTransientCheckError(error)) {
         if (publication.status === 'submitted') {
           this.markUnconfirmed(publication, describeError(error));
@@ -537,6 +607,18 @@ export class ShortsPipeline {
       this.deferCheck(publication, describeError(error));
       return;
     }
+    const reloaded = this.deps.store.getPublication(publicationId);
+    if (reloaded === null || reloaded.status === 'cancelled') {
+      return;
+    }
+    if (waitingForScheduledTimeMs !== null) {
+      if (state.status === 'failed') {
+        this.failPublication(reloaded, state.error ?? `No final result from ${reloaded.provider}; check ${platformLabel(reloaded.platform)} before reposting.`);
+        return;
+      }
+      throw new PublicationCheckRetry(new Date(waitingForScheduledTimeMs + CHECK_PUBLISH_DELAY_MS).toISOString(), `Waiting for the scheduled time at ${reloaded.scheduledFor}.`);
+    }
+    publication = reloaded;
     if (state.status === 'live') {
       publication.status = 'published';
       publication.remoteUrl = state.url;
@@ -560,8 +642,8 @@ export class ShortsPipeline {
 
   private deferCheck(publication: PublicationRecord, reason: string): void {
     const now = Date.now();
-    const submittedAtMs = Date.parse(publication.submittedAt ?? nowIso());
-    if (publication.status === 'submitted' && now < submittedAtMs + CHECK_DEADLINE_MS) {
+    const startedAtMs = Date.parse(publicationStartedAt(publication) ?? nowIso());
+    if (publication.status === 'submitted' && now < startedAtMs + CHECK_DEADLINE_MS) {
       throw new PublicationCheckRetry(new Date(now + CHECK_RETRY_DELAY_MS).toISOString(), reason);
     }
     if (publication.status === 'submitted') {
@@ -573,7 +655,8 @@ export class ShortsPipeline {
   }
 
   private insideCheckWindowAt(publication: PublicationRecord, nowMs: number): boolean {
-    return publication.submittedAt !== null && nowMs < Date.parse(publication.submittedAt) + CHECK_WINDOW_MS;
+    const startedAt = publicationStartedAt(publication);
+    return startedAt !== null && nowMs < Date.parse(startedAt) + CHECK_WINDOW_MS;
   }
 
   private markUnconfirmed(publication: PublicationRecord, message: string): void {

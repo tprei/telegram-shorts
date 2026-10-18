@@ -39,6 +39,7 @@ interface BufferChannel {
 export class BufferClient implements ShortVideoPublishProvider {
   readonly name = 'buffer';
   readonly supportedPlatforms: ShortVideoPlatform[] = ['instagram', 'tiktok', 'youtube_shorts'];
+  readonly supportsScheduling = false;
 
   private readonly cachedChannelIds = new Map<ShortVideoPlatform, string>();
 
@@ -46,6 +47,15 @@ export class BufferClient implements ShortVideoPublishProvider {
 
   supports(platform: ShortVideoPlatform): boolean {
     return this.supportedPlatforms.includes(platform);
+  }
+
+  async cancelScheduled(_input: ShortVideoCheckPublicationInput): Promise<void> {
+    throw new ShortVideoPublishError({
+      provider: this.name,
+      stage: 'cancel',
+      message: "Buffer posts can't be cancelled from the studio.",
+      safeToFailover: false,
+    });
   }
 
   async publishShortVideo(input: ShortVideoPublishInput): Promise<ShortVideoPublishResult> {

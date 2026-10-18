@@ -5,6 +5,7 @@ import { addRange, createInitialEdit, extendEndBySeconds, extendStartBySeconds, 
 import { outputDurationSeconds } from '../domain/timeline.js';
 import { sentenceText } from '../domain/policies.js';
 import { IN_FLIGHT_PUBLICATION_STATUSES, POSTED_OR_UNKNOWN_PUBLICATION_STATUSES, type ExportRecord, type JobRecord, type JobSummaryRecord, type PublicationRecord, type ShortRecord, type ShortVideoPlatform, type SourceMedia } from '../domain/model.js';
+import { scheduledAtProblem } from '../domain/schedule.js';
 import type { RevisionIntent } from '../domain/model.js';
 import {
   MEDIA_ROUTES,
@@ -29,6 +30,7 @@ import {
   type ShortDetailDto,
   type ShortSummaryDto,
   type SpeakerSampleDto,
+  type ScheduledPostDto,
   type TranscriptDto,
   type UpdatePublishCopyRequest,
   type UpdateShortMetaRequest,
@@ -42,7 +44,7 @@ import type { AppConfig } from '../infra/env.js';
 import { ShortsStore } from '../infra/db.js';
 import { extractFrame } from '../infra/render.js';
 import { assertPublicYouTubeUrl } from '../infra/youtube.js';
-import type { ShortVideoPublishProvider } from '../infra/instagram-publisher.js';
+import { ShortVideoPublishError, type ShortVideoPublishProvider } from '../infra/instagram-publisher.js';
 import { clamp, createId, nowIso } from '../infra/util.js';
 import type { OpenRouterClient } from '../infra/openrouter.js';
 
@@ -514,6 +516,13 @@ export class StudioService implements StudioApi, StudioMediaResolver {
       throw new StudioError('conflict', `Export is ${exportRecord.status}; publishing needs a ready render.`);
     }
     const job = this.requireJob(exportRecord.jobId);
+    if (request.scheduledAt !== null) {
+      const problem = scheduledAtProblem(new Date(request.scheduledAt), new Date());
+      if (problem !== null) {
+        throw new StudioError('invalid', problem);
+      }
+    }
+    const scheduling = request.scheduledAt !== null;
     const availability = await platformAvailability(job, this.deps.publisher, this.deps.config, this.deps.profiles);
     const unavailable = request.platforms
       .map((platform) => availability.find((entry) => entry.platform === platform))
@@ -521,12 +530,22 @@ export class StudioService implements StudioApi, StudioMediaResolver {
     if (unavailable.length > 0) {
       throw new StudioError('invalid', unavailable.map((entry) => entry.reason).join(' '));
     }
+    if (scheduling) {
+      const unschedulable = request.platforms
+        .map((platform) => availability.find((entry) => entry.platform === platform))
+        .filter((entry): entry is PlatformAvailabilityDto => entry !== undefined && entry.available && !entry.canSchedule)
+        .map((entry) => `Scheduling is not available for ${platformLabel(entry.platform)}.`);
+      if (unschedulable.length > 0) {
+        throw new StudioError('invalid', unschedulable.join(' '));
+      }
+    }
     const attemptsByShort = this.deps.store.listPublicationsForShort(exportRecord.shortId);
     const planned: Array<{ platform: ShortVideoPlatform; existing: PublicationRecord | null }> = [];
     for (const platform of request.platforms) {
       const attempts = attemptsByShort.filter((entry) => entry.platform === platform);
       const inFlight = attempts.find((entry) => IN_FLIGHT_PUBLICATION_STATUSES.includes(entry.status));
       const posted = attempts.find((entry) => POSTED_OR_UNKNOWN_PUBLICATION_STATUSES.includes(entry.status));
+      const requestedScheduledFor = request.scheduledAt === null ? null : new Date(request.scheduledAt).toISOString();
       if (request.force) {
         if (inFlight) {
           throw new StudioError('conflict', `Cannot force repost to ${platformLabel(platform)} while an attempt is still in flight.`);
@@ -539,11 +558,18 @@ export class StudioService implements StudioApi, StudioMediaResolver {
       }
       const sameExportInFlight = attempts.find((entry) => entry.exportId === exportRecord.id && IN_FLIGHT_PUBLICATION_STATUSES.includes(entry.status));
       if (sameExportInFlight) {
+        if (sameExportInFlight.scheduledFor !== requestedScheduledFor) {
+          throw new StudioError('conflict', sameExportInFlight.scheduledFor !== null
+            ? `${platformLabel(platform)} already has a post for this export scheduled for ${sameExportInFlight.scheduledFor}. Cancel it first.`
+            : `${platformLabel(platform)} is already posting this export.`);
+        }
         planned.push({ platform, existing: sameExportInFlight });
         continue;
       }
       if (inFlight) {
-        throw new StudioError('conflict', `${platformLabel(platform)} has an attempt still in flight on another export; use Force repost once it settles.`);
+        throw new StudioError('conflict', inFlight.scheduledFor !== null
+          ? `${platformLabel(platform)} has a scheduled post on another export; cancel it first.`
+          : `${platformLabel(platform)} has an attempt still in flight on another export; use Force repost once it settles.`);
       }
       if (posted) {
         throw new StudioError('conflict', posted.status === 'published'
@@ -559,6 +585,7 @@ export class StudioService implements StudioApi, StudioMediaResolver {
         continue;
       }
       const cooldownUntil = activeMallaryCooldownUntil(this.deps.config, this.deps.store, platform);
+      const scheduledFor = request.scheduledAt === null ? null : new Date(request.scheduledAt).toISOString();
       const publication: PublicationRecord = {
         id: createId('pub'),
         jobId: exportRecord.jobId,
@@ -572,6 +599,7 @@ export class StudioService implements StudioApi, StudioMediaResolver {
         remoteJobs: [],
         remoteUrl: null,
         submittedAt: null,
+        scheduledFor,
         error: null,
         availableAt: cooldownUntil,
         createdAt: nowIso(),
@@ -584,10 +612,85 @@ export class StudioService implements StudioApi, StudioMediaResolver {
         platform,
         forced: request.force,
         availableAt: cooldownUntil,
+        scheduledFor,
       });
       results.push(this.publicationDto(publication));
     }
     return results;
+  }
+
+  listScheduledPosts(): ScheduledPostDto[] {
+    return this.deps.store.listUpcomingScheduledPublications().map((record) => {
+      const short = this.requireShort(record.shortId);
+      const scheduledFor = record.scheduledFor;
+      if (scheduledFor === null) {
+        throw new StudioError('conflict', `Scheduled publication ${record.id} has no scheduled time.`);
+      }
+      return {
+        publicationId: record.id,
+        jobId: record.jobId,
+        shortId: record.shortId,
+        shortTitle: short.title,
+        platform: record.platform,
+        status: record.status,
+        scheduledFor,
+        provider: record.provider,
+      };
+    });
+  }
+
+  async cancelPublication(publicationId: string): Promise<ShortDetailDto> {
+    const publication = this.requirePublication(publicationId);
+    if (publication.scheduledFor === null) {
+      throw new StudioError('conflict', 'Only scheduled posts can be cancelled.');
+    }
+    const short = this.requireShort(publication.shortId);
+    const job = this.requireJob(publication.jobId);
+    if (publication.status === 'queued' || publication.status === 'deferred') {
+      publication.status = 'cancelled';
+      publication.error = null;
+      publication.updatedAt = nowIso();
+      this.deps.store.updatePublication(publication);
+    } else if (publication.status === 'publishing') {
+      throw new StudioError('conflict', 'Uploading right now. Try again in a minute.');
+    } else if (publication.status === 'scheduled') {
+      const remoteJobId = publication.remoteJobs[0]?.jobId ?? '';
+      try {
+        await this.requirePublisher().cancelScheduled({ provider: publication.provider ?? '', platform: publication.platform, remoteJobId });
+      } catch (error) {
+        if (error instanceof ShortVideoPublishError) {
+          throw new StudioError('conflict', error.message);
+        }
+        throw error;
+      }
+      publication.status = 'cancelled';
+      publication.error = null;
+      publication.updatedAt = nowIso();
+      this.deps.store.updatePublication(publication);
+    } else {
+      throw new StudioError('conflict', 'This post can no longer be cancelled.');
+    }
+    this.deps.store.appendAction(job.id, 'short_video_schedule_cancelled', {
+      publicationId: publication.id,
+      platform: publication.platform,
+      scheduledFor: publication.scheduledFor,
+    });
+    return this.shortDetailWithAvailability(job, short);
+  }
+
+  private requirePublication(publicationId: string): PublicationRecord {
+    const publication = this.deps.store.getPublication(publicationId);
+    if (!publication) {
+      throw new StudioError('not_found', `Publication not found: ${publicationId}`);
+    }
+    return publication;
+  }
+
+  private requirePublisher(): ShortVideoPublishProvider {
+    if (!this.deps.publisher) {
+      throw new StudioError('conflict', 'No publish provider is configured.');
+    }
+    return this.deps.publisher;
   }
 
   sourceVideoPath(jobId: string): string {
@@ -815,6 +918,7 @@ export class StudioService implements StudioApi, StudioMediaResolver {
       forced: record.forced,
       availableAt: record.availableAt,
       submittedAt: record.submittedAt,
+      scheduledFor: record.scheduledFor,
       createdAt: record.createdAt,
       updatedAt: record.updatedAt,
     };
