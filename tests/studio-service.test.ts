@@ -12,7 +12,7 @@ import { mallaryCooldownKey } from '../src/application/platforms.js';
 import { createInitialEdit, type ShortEdit, type WordRange } from '../src/domain/edit.js';
 import { buildSentences } from '../src/domain/policies.js';
 import type { LayoutProfile } from '../src/domain/layout.js';
-import { QUEUE_LANES, type CreatorProfile, type ExportRecord, type JobRecord, type PublicationRecord, type PublishCopyResponse, type RevisionIntent, type ShortRecord, type TranscriptWord } from '../src/domain/model.js';
+import { QUEUE_LANES, type AutopilotVideoRecord, type CreatorProfile, type ExportRecord, type JobRecord, type JobSummaryRecord, type PublicationRecord, type PublishCopyResponse, type RevisionIntent, type ShortRecord, type TranscriptWord } from '../src/domain/model.js';
 import { acquireStudioLock } from '../src/infra/studio-lock.js';
 import { ShortsStore } from '../src/infra/db.js';
 import { runProcess } from '../src/infra/process.js';
@@ -34,6 +34,7 @@ const CREATOR_A: CreatorProfile = {
     tiktok: { mode: 'global' },
     youtube_shorts: { mode: 'global' },
   },
+  schedule: { timeZone: 'America/Sao_Paulo', slots: ['12:00', '19:00', '21:00'] },
 };
 
 const CREATOR_B: CreatorProfile = {
@@ -46,6 +47,7 @@ const CREATOR_B: CreatorProfile = {
     tiktok: { mode: 'disabled' },
     youtube_shorts: { mode: 'disabled' },
   },
+  schedule: { timeZone: 'America/Sao_Paulo', slots: ['12:00', '19:00', '21:00'] },
 };
 
 interface TestContext {
@@ -255,6 +257,20 @@ function seedReadyExport(store: ShortsStore, seeded: SeededJob, rootDir: string)
   };
   store.createExport(record);
   return record;
+}
+
+function autopilotVideo(videoId: string, overrides: Partial<AutopilotVideoRecord> = {}): AutopilotVideoRecord {
+  return {
+    creatorId: 'filipe_boni',
+    videoId,
+    title: `Video ${videoId}`,
+    status: 'baseline',
+    jobId: null,
+    detectedAt: '2026-10-18T12:00:00.000Z',
+    retries: 0,
+    lastRetryAt: null,
+    ...overrides,
+  };
 }
 
 function isStudioErrorWithCode(code: StudioError['code']): (error: unknown) => boolean {
@@ -1381,7 +1397,7 @@ test('v3 migration marks unverified published publications submitted and queues 
     if (typeof row !== 'object' || row === null || !('user_version' in row) || typeof row.user_version !== 'number') {
       throw new Error('Database did not report a user_version');
     }
-    assert.equal(row.user_version, 6);
+    assert.equal(row.user_version, 7);
   } finally {
     db.close();
     await rm(dir, { recursive: true, force: true });
@@ -1605,6 +1621,7 @@ test('an export stays ready without a cover when the cover render throws', { tim
     ]);
     const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
     exportRecord.status = 'queued';
+    exportRecord.edit = { ...exportRecord.edit, endCard: { enabled: false } };
     context.store.updateExport(exportRecord);
     context.store.enqueueTask(seeded.jobId, 'export_short', { exportId: exportRecord.id });
     const pipeline = pipelineFor(context, fakePublisher());
@@ -1614,6 +1631,43 @@ test('an export stays ready without a cover when the cover render throws', { tim
     assert.equal(exported.status, 'ready');
     assert.equal(exported.coverPath, null);
     assert.ok(exported.artifactPath);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('a broken end-card thumbnail fails the export instead of hanging', { timeout: 120_000 }, async () => {
+  const context = await makeContext(undefined, undefined, {
+    fontsDir: join(import.meta.dirname, '..', 'assets', 'fonts'),
+  });
+  try {
+    const words = transcriptWords().slice(0, 4);
+    const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir, words);
+    const job = context.store.getJob(seeded.jobId);
+    assert.ok(job?.media);
+    const thumbnailPath = join(context.rootDir, 'thumbnail.jpg');
+    await writeFile(thumbnailPath, 'not an image', 'utf-8');
+    job.media = { ...job.media, thumbnailPath };
+    context.store.updateJob(job);
+    await runProcess('ffmpeg', [
+      '-y',
+      '-f', 'lavfi', '-i', `testsrc2=size=${job.media.width}x${job.media.height}:rate=30`,
+      '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
+      '-t', String(job.media.durationSeconds),
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-pix_fmt', 'yuv420p',
+      '-ac', '2', '-c:a', 'aac', '-b:a', '96k',
+      join(context.rootDir, 'source.mp4'),
+    ]);
+    const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
+    exportRecord.status = 'queued';
+    context.store.updateExport(exportRecord);
+    context.store.enqueueTask(seeded.jobId, 'export_short', { exportId: exportRecord.id });
+    const pipeline = pipelineFor(context, fakePublisher());
+    assert.equal(await pipeline.runNext('output'), true);
+    const exported = context.store.getExport(exportRecord.id);
+    assert.ok(exported);
+    assert.equal(exported.status, 'failed');
+    assert.ok(exported.error);
   } finally {
     await cleanup(context);
   }
@@ -2287,6 +2341,7 @@ test('listScheduledPosts returns upcoming scheduled posts ordered by time with s
       platform: 'tiktok',
       status: 'queued',
       scheduledFor: sooner.scheduledFor,
+      timeZone: 'America/Sao_Paulo',
       provider: null,
     });
   } finally {
@@ -2318,7 +2373,7 @@ test('startup backfills the check task for scheduled publications at the schedul
   }
 });
 
-test('a version-5 database gains scheduledFor on publications and lands on version 6', async () => {
+test('a version-5 database gains scheduledFor on publications and lands on version 7', async () => {
   const context = await makeContext();
   try {
     const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
@@ -2360,7 +2415,7 @@ test('a version-5 database gains scheduledFor on publications and lands on versi
     const versionDb = new DatabaseSync(dbPath);
     const versionRow = versionDb.prepare('PRAGMA user_version').get();
     versionDb.close();
-    assert.ok(typeof versionRow === 'object' && versionRow !== null && 'user_version' in versionRow && versionRow.user_version === 6);
+    assert.ok(typeof versionRow === 'object' && versionRow !== null && 'user_version' in versionRow && versionRow.user_version === 7);
   } finally {
     await cleanup(context);
   }
@@ -2646,6 +2701,55 @@ test('a scheduled post accepted without job ids becomes unconfirmed with the Mal
     assert.equal(publication.status, 'unconfirmed');
     assert.equal(publication.error, "Mallary accepted the scheduled post but returned no id to track; check Mallary's queue before scheduling it again.");
     assert.equal(publication.scheduledFor, scheduledFor);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('a v6 database migrates to v7 adding the schedule to job snapshots', async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'store-v6-'));
+  try {
+    const dbPath = join(rootDir, 'shorts.sqlite');
+    const legacy = new DatabaseSync(dbPath);
+    legacy.exec('PRAGMA user_version = 6');
+    legacy.exec('CREATE TABLE jobs (id TEXT PRIMARY KEY, status TEXT NOT NULL, updated_at TEXT NOT NULL, payload_json TEXT NOT NULL)');
+    const legacyPayload = JSON.stringify({
+      id: 'job_old',
+      status: 'ready',
+      creatorProfileId: 'creator_a',
+      creatorProfileSnapshot: { id: 'creator_a', displayName: 'Creator A', schedule: null },
+    });
+    legacy.prepare("INSERT INTO jobs(id, status, updated_at, payload_json) VALUES('job_old', 'ready', '2026-10-17T10:00:00.000Z', ?)").run(legacyPayload);
+    legacy.close();
+
+    const store = await ShortsStore.open(dbPath);
+    try {
+      const migrated = store.getJob('job_old');
+      assert.ok(migrated);
+      assert.deepEqual(migrated.creatorProfileSnapshot.schedule, { timeZone: 'America/Sao_Paulo', slots: ['12:00', '19:00', '21:00'] });
+    } finally {
+      store.close();
+    }
+  } finally {
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test('autopilot video records upsert and list newest first', async () => {
+  const context = await makeContext();
+  try {
+    const older = autopilotVideo('vid_old', { detectedAt: '2026-10-17T12:00:00.000Z' });
+    const newer = autopilotVideo('vid_new', { detectedAt: '2026-10-18T12:00:00.000Z', status: 'tracked', jobId: 'job_1' });
+    context.store.saveAutopilotVideo(older);
+    context.store.saveAutopilotVideo(newer);
+    context.store.saveAutopilotVideo({ ...older, retries: 1, lastRetryAt: '2026-10-17T13:00:00.000Z' });
+
+    assert.deepEqual(context.store.listAutopilotVideos('filipe_boni').map((record) => record.videoId), ['vid_new', 'vid_old']);
+    const updated = context.store.getAutopilotVideo('filipe_boni', 'vid_old');
+    assert.equal(updated?.retries, 1);
+    assert.equal(updated?.lastRetryAt, '2026-10-17T13:00:00.000Z');
+    assert.equal(context.store.getAutopilotVideo('filipe_boni', 'missing'), null);
+    assert.deepEqual(context.store.listAutopilotVideos('other_creator'), []);
   } finally {
     await cleanup(context);
   }

@@ -2,11 +2,13 @@ import { z } from 'zod';
 import { ShortEditSchema, WordRangeSchema, type ShortEdit } from '../domain/edit.js';
 import type { LayoutProfile } from '../domain/layout.js';
 import type {
+  AutopilotShortState,
   CandidateArc,
   CropAnalysisStatus,
   ExportStatus,
   HostFraming,
   JobStatus,
+  PostingSchedule,
   PublicationStatus,
   PublishCopy,
   ShortStatus,
@@ -137,6 +139,7 @@ export interface ScheduledPostDto {
   status: PublicationStatus;
   scheduledFor: string;
   provider: string | null;
+  timeZone: string;
 }
 
 export interface ShortDetailDto {
@@ -160,6 +163,7 @@ export interface ShortDetailDto {
     layout: LayoutProfile;
     hostFraming: HostFraming | null;
     fontUrl: string;
+    schedule: PostingSchedule;
   };
   exports: ExportDto[];
   publications: PublicationDto[];
@@ -275,6 +279,50 @@ export interface StudioApi {
   publish(exportId: string, request: PublishRequest): Promise<PublicationDto[]>;
   cancelPublication(publicationId: string): Promise<ShortDetailDto>;
   listScheduledPosts(): ScheduledPostDto[];
+}
+
+export interface AutopilotShortDto {
+  shortId: string;
+  rank: number;
+  title: string;
+  state: AutopilotShortState;
+  scheduledFor: string | null;
+  reason: string | null;
+}
+
+export interface AutopilotVideoDto {
+  videoId: string;
+  title: string | null;
+  jobId: string | null;
+  jobStatus: JobStatus | null;
+  detectedAt: string;
+  shorts: AutopilotShortDto[];
+}
+
+export interface AutopilotStatusDto {
+  creatorId: string;
+  displayName: string;
+  enabled: boolean;
+  channelUrl: string;
+  schedule: PostingSchedule;
+  shortsPerVideo: number;
+  platforms: ShortVideoPlatform[];
+  reviewWindowHours: number;
+  lastCheckedAt: string | null;
+  lastCheckError: string | null;
+  checkRequested: boolean;
+  videos: AutopilotVideoDto[];
+}
+
+export const SetAutopilotRequestSchema = z.strictObject({
+  enabled: z.boolean(),
+});
+export type SetAutopilotRequest = z.infer<typeof SetAutopilotRequestSchema>;
+
+export interface AutopilotApi {
+  list(): Promise<AutopilotStatusDto[]>;
+  setEnabled(creatorId: string, request: SetAutopilotRequest): Promise<AutopilotStatusDto>;
+  checkNow(creatorId: string): Promise<AutopilotStatusDto>;
 }
 
 export const MEDIA_ROUTES = {

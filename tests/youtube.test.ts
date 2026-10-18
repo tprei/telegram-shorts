@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildYtDlpArgs, parseFrameRate } from '../src/infra/youtube.js';
+import { buildYtDlpArgs, parseChannelUploads, parseFrameRate, youTubeVideoId } from '../src/infra/youtube.js';
 
 test('yt-dlp args request avc1-first formats with cookies and JS runtime before the URL', () => {
   const args = buildYtDlpArgs('/tmp/source.%(ext)s', 'https://youtu.be/t1TFNy1VdGI', {
@@ -47,4 +47,46 @@ test('parseFrameRate rejects zero, negative, and malformed rates', () => {
   assert.throws(() => parseFrameRate('10/0'));
   assert.throws(() => parseFrameRate('abc'));
   assert.throws(() => parseFrameRate(''));
+});
+
+test('parseChannelUploads reads a flat-playlist JSON payload in listing order', () => {
+  const payload = JSON.stringify({
+    id: 'UC_x5XG1OV2P6uZZ5FSM9Ttw',
+    _type: 'playlist',
+    title: 'Filipe Boni - Videos',
+    entries: [
+      { id: 'dQw4w9WgXcQ', title: 'Video novo', duration: 1500.5, live_status: 'not_live', view_count: 12 },
+      { id: 'abcdefghijk', title: null, duration: null, live_status: 'is_upcoming' },
+      { id: 'lmnopqrstuv' },
+    ],
+  });
+  assert.deepEqual(parseChannelUploads(payload), [
+    { videoId: 'dQw4w9WgXcQ', title: 'Video novo', durationSeconds: 1500.5, liveStatus: 'not_live' },
+    { videoId: 'abcdefghijk', title: null, durationSeconds: null, liveStatus: 'is_upcoming' },
+    { videoId: 'lmnopqrstuv', title: null, durationSeconds: null, liveStatus: null },
+  ]);
+});
+
+test('parseChannelUploads rejects payloads without valid entries', () => {
+  assert.throws(() => parseChannelUploads('{"id": "x"}'));
+  assert.throws(() => parseChannelUploads('{"entries": [{"duration": 10}]}'));
+  assert.throws(() => parseChannelUploads('not json'));
+});
+
+test('youTubeVideoId extracts ids from supported URL shapes', () => {
+  assert.equal(youTubeVideoId('https://www.youtube.com/watch?v=dQw4w9WgXcQ'), 'dQw4w9WgXcQ');
+  assert.equal(youTubeVideoId('https://youtube.com/watch?v=dQw4w9WgXcQ&t=30s'), 'dQw4w9WgXcQ');
+  assert.equal(youTubeVideoId('https://youtu.be/dQw4w9WgXcQ'), 'dQw4w9WgXcQ');
+  assert.equal(youTubeVideoId('https://www.youtube.com/shorts/dQw4w9WgXcQ'), 'dQw4w9WgXcQ');
+  assert.equal(youTubeVideoId('https://www.youtube.com/live/dQw4w9WgXcQ?feature=share'), 'dQw4w9WgXcQ');
+  assert.equal(youTubeVideoId('https://www.youtube.com/embed/dQw4w9WgXcQ'), 'dQw4w9WgXcQ');
+  assert.equal(youTubeVideoId('https://m.youtube.com/shorts/dQw4w9WgXcQ'), 'dQw4w9WgXcQ');
+});
+
+test('youTubeVideoId returns null for non-video URLs and malformed ids', () => {
+  assert.equal(youTubeVideoId('https://www.youtube.com/@filipe_boni/videos'), null);
+  assert.equal(youTubeVideoId('https://youtu.be/short'), null);
+  assert.equal(youTubeVideoId('https://www.youtube.com/watch?v=tooshort'), null);
+  assert.equal(youTubeVideoId('https://www.youtube.com/shorts/bad*chars11'), null);
+  assert.equal(youTubeVideoId('not a url'), null);
 });

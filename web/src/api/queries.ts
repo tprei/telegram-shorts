@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type {
+  AutopilotStatusDto,
   ChooseSpeakerRequest,
   CorrectWordRequest,
   CreateJobRequest,
@@ -24,9 +25,12 @@ export const queryKeys = {
   transcript: (jobId: string) => ['transcript', jobId] as const,
   short: (shortId: string) => ['short', shortId] as const,
   schedule: ['schedule'] as const,
+  autopilot: ['autopilot'] as const,
 };
 
 const POLL_INTERVAL_MS = 2000;
+const AUTOPILOT_POLL_INTERVAL_MS = 5000;
+const AUTOPILOT_IDLE_POLL_INTERVAL_MS = 30000;
 
 const ACTIVE_JOB_STATUSES: Partial<Record<JobStatus, true>> = {
   queued: true,
@@ -220,6 +224,7 @@ export function useScheduleQuery() {
     queryKey: queryKeys.schedule,
     queryFn: api.listScheduledPosts,
     refetchOnWindowFocus: true,
+    refetchInterval: 30_000,
   });
 }
 
@@ -234,6 +239,55 @@ export function useCancelScheduledPostMutation() {
       void queryClient.invalidateQueries({ queryKey: queryKeys.schedule });
       void queryClient.invalidateQueries({ queryKey: queryKeys.jobs });
       void queryClient.invalidateQueries({ queryKey: queryKeys.job(detail.job.id) });
+    },
+  });
+}
+
+export function useAutopilotQuery() {
+  return useQuery({
+    queryKey: queryKeys.autopilot,
+    queryFn: api.listAutopilotStatuses,
+    refetchInterval: (query) => {
+      const statuses = query.state.data;
+      const active =
+        statuses !== undefined &&
+        statuses.some((status) => status.enabled || status.checkRequested);
+      return active ? AUTOPILOT_POLL_INTERVAL_MS : AUTOPILOT_IDLE_POLL_INTERVAL_MS;
+    },
+  });
+}
+
+export function useSetAutopilotMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { creatorId: string; enabled: boolean }) =>
+      api.setAutopilot(input.creatorId, { enabled: input.enabled }),
+    onSuccess: (status, input) => {
+      queryClient.setQueryData<AutopilotStatusDto[]>(queryKeys.autopilot, (statuses) =>
+        statuses?.map((existing) =>
+          existing.creatorId === input.creatorId ? status : existing,
+        ),
+      );
+      void queryClient.invalidateQueries({ queryKey: queryKeys.autopilot });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.jobs });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.schedule });
+    },
+  });
+}
+
+export function useCheckAutopilotNowMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { creatorId: string }) => api.checkAutopilotNow(input.creatorId),
+    onSuccess: (status, input) => {
+      queryClient.setQueryData<AutopilotStatusDto[]>(queryKeys.autopilot, (statuses) =>
+        statuses?.map((existing) =>
+          existing.creatorId === input.creatorId ? status : existing,
+        ),
+      );
+      void queryClient.invalidateQueries({ queryKey: queryKeys.autopilot });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.jobs });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.schedule });
     },
   });
 }

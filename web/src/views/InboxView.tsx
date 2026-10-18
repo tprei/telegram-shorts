@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from 'react';
 import { Link } from 'react-router';
-import type { CreatorDto, CreateJobRequest, JobSummaryDto, ScheduledPostDto } from '@api';
+import type { AutopilotStatusDto, CreatorDto, CreateJobRequest, JobSummaryDto, ScheduledPostDto } from '@api';
 import {
   ApiError,
   Button,
@@ -10,16 +10,20 @@ import {
   StatusBadge,
   StudioShell,
   relativeTime,
-  scheduleDateTime,
-  scheduleDay,
-  scheduleTime,
 } from '../components/StudioPrimitives';
+import { AutopilotPanel } from '../components/AutopilotPanel';
+import { PostingTime, postingDateFormatters, postingTimeZoneLabel } from '../components/PostingTime';
 import '../styles/studio.css';
 
 export interface InboxViewProps {
   creators: CreatorDto[];
   jobs: JobSummaryDto[];
   upcomingPosts: readonly ScheduledPostDto[];
+  autopilotStatuses: readonly AutopilotStatusDto[];
+  onToggleAutopilot: (creatorId: string, enabled: boolean) => void;
+  onCheckAutopilotNow: (creatorId: string) => void;
+  pendingAutopilotCreatorIds?: readonly string[];
+  autopilotError?: string | null;
   onCancelPublication: (publicationId: string, shortId: string) => void;
   scheduleLoading?: boolean;
   scheduleError?: string | null;
@@ -34,6 +38,11 @@ export function InboxView({
   creators,
   jobs,
   upcomingPosts,
+  autopilotStatuses,
+  onToggleAutopilot,
+  onCheckAutopilotNow,
+  pendingAutopilotCreatorIds,
+  autopilotError,
   onCancelPublication,
   scheduleLoading = false,
   scheduleError,
@@ -114,13 +123,20 @@ export function InboxView({
         </form>
         <ApiError message={error} title="Couldn’t add this video" />
       </section>
+      <AutopilotPanel
+        statuses={autopilotStatuses}
+        onToggle={onToggleAutopilot}
+        onCheckNow={onCheckAutopilotNow}
+        pendingCreatorIds={pendingAutopilotCreatorIds}
+        error={autopilotError}
+      />
       <section className="upcoming-posts" aria-labelledby="upcoming-title">
         <div className="section-heading">
           <div className="upcoming-heading">
             <h2 id="upcoming-title">Upcoming posts</h2>
             {upcomingPosts.length > 0 && <span className="upcoming-count">{upcomingPosts.length}</span>}
           </div>
-          <span className="upcoming-zone">{Intl.DateTimeFormat().resolvedOptions().timeZone.replaceAll('_', ' ')}</span>
+          <span className="upcoming-zone">Posting time first · your local time below</span>
         </div>
         <ApiError message={scheduleError} title="Couldn’t load upcoming posts" />
         <ApiError message={cancelError} title="Couldn’t cancel the scheduled post" />
@@ -134,10 +150,7 @@ export function InboxView({
               const cancellable = post.status === 'scheduled' || post.status === 'queued' || post.status === 'deferred';
               return (
                 <li className="upcoming-post" key={post.publicationId}>
-                  <time className="upcoming-time" dateTime={post.scheduledFor} title={scheduleDateTime.format(date)}>
-                    <strong>{scheduleTime.format(date)}</strong>
-                    <span>{scheduleDay.format(date)}</span>
-                  </time>
+                  <PostingTime className="upcoming-time" dateTime={post.scheduledFor} timeZone={post.timeZone} />
                   <div className="upcoming-post-main">
                     <span className={`upcoming-platform upcoming-platform--${post.platform}`}>{platform}</span>
                     <Link to={`/shorts/${post.shortId}`} className="upcoming-short-link" title={post.shortTitle}>
@@ -149,7 +162,7 @@ export function InboxView({
                     {post.status === 'deferred' && <span className="upcoming-post-note">Waiting for the posting limit</span>}
                   </div>
                   <ScheduleCancelButton
-                    description={`${platform} post “${post.shortTitle}” for ${scheduleDateTime.format(date)}`}
+                    description={`${platform} post “${post.shortTitle}” for ${postingDateFormatters(post.timeZone).dateTime.format(date)} · ${postingTimeZoneLabel(post.timeZone)}`}
                     pending={cancellingPublicationIds.includes(post.publicationId)}
                     disabled={!cancellable}
                     onConfirm={() => onCancelPublication(post.publicationId, post.shortId)}

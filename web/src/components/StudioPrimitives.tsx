@@ -108,32 +108,6 @@ export function StatusBadge({ status, label }: StatusBadgeProps) {
   );
 }
 
-export const scheduleDateTime = new Intl.DateTimeFormat(undefined, {
-  weekday: 'short',
-  month: 'short',
-  day: 'numeric',
-  hour: '2-digit',
-  minute: '2-digit',
-  hourCycle: 'h23',
-});
-export const scheduleDay = new Intl.DateTimeFormat(undefined, {
-  weekday: 'short',
-  month: 'short',
-  day: 'numeric',
-});
-export const scheduleTime = new Intl.DateTimeFormat(undefined, {
-  hour: '2-digit',
-  minute: '2-digit',
-  hourCycle: 'h23',
-});
-const scheduleWeekday = new Intl.DateTimeFormat(undefined, { weekday: 'short' });
-export function scheduleButtonTime(date: Date): string {
-  return `${scheduleWeekday.format(date)} ${scheduleTime.format(date)}`;
-}
-export function localDateTimeValue(date: Date): string {
-  const pad = (value: number) => String(value).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
-}
 export interface ScheduleCancelButtonProps {
   description: string;
   pending?: boolean;

@@ -537,6 +537,7 @@ async function postCompletion(config: AppConfig, input: {
           'HTTP-Referer': 'http://127.0.0.1',
           'X-Title': input.title,
         },
+        signal: AbortSignal.timeout(20 * 60_000),
         body: JSON.stringify({
           model: input.model,
           temperature: input.temperature,
@@ -558,6 +559,10 @@ async function postCompletion(config: AppConfig, input: {
         }),
       });
     } catch (error) {
+      if (error instanceof DOMException && error.name === 'TimeoutError') {
+        logError('OpenRouter request timed out', error, { title: input.title, model: input.model });
+        throw error;
+      }
       const delay = NETWORK_RETRY_DELAYS_MS[attempt];
       if (delay === undefined || !isTransientNetworkError(error)) {
         logError('OpenRouter request failed', error, { title: input.title, model: input.model });

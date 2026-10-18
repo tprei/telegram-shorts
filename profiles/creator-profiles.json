@@ -15,6 +15,16 @@
         "instagram": { "mode": "global" },
         "tiktok": { "mode": "global" },
         "youtube_shorts": { "mode": "global" }
+      },
+      "schedule": { "timeZone": "America/Sao_Paulo", "slots": ["12:00", "19:00", "21:00"] },
+      "autopilot": {
+        "channelUrl": "https://www.youtube.com/@filipe_boni/videos",
+        "shortsPerVideo": 2,
+        "platforms": ["instagram", "tiktok"],
+        "reviewWindowHours": 3,
+        "bookingHorizonHours": 24,
+        "maxShortAgeHours": 48,
+        "minVideoSeconds": 480
       }
     },
     {
@@ -30,7 +40,8 @@
         "instagram": { "mode": "disabled" },
         "tiktok": { "mode": "disabled" },
         "youtube_shorts": { "mode": "disabled" }
-      }
+      },
+      "schedule": { "timeZone": "America/Sao_Paulo", "slots": ["12:00", "19:00", "21:00"] }
     }
   ]
 }

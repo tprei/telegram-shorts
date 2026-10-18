@@ -1,8 +1,9 @@
 import { DatabaseSync } from 'node:sqlite';
-import { publicationStartedAt, type ExportRecord, type JobRecord, type JobSummaryRecord, type PublicationRecord, type QueueTask, type QueueTaskKind, type QueueTaskPayloads, type ShortRecord } from '../domain/model.js';
+import { z } from 'zod';
+import { publicationStartedAt, type AutopilotVideoRecord, type ExportRecord, type JobRecord, type JobSummaryRecord, type PublicationRecord, type QueueTask, type QueueTaskKind, type QueueTaskPayloads, type ShortRecord } from '../domain/model.js';
 import { createId, ensureParent, nowIso, parseJson } from './util.js';
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 
 export const CHECK_PUBLISH_DELAY_MS = 15_000;
 
@@ -75,6 +76,15 @@ CREATE TABLE IF NOT EXISTS actions (
   payload_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_actions_job ON actions(job_id, created_at);
+
+CREATE TABLE IF NOT EXISTS autopilot_videos (
+  creator_id TEXT NOT NULL,
+  video_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  detected_at TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  PRIMARY KEY (creator_id, video_id)
+);
 `;
 
 function payloadJsonColumn(row: unknown): string | null {
@@ -83,6 +93,21 @@ function payloadJsonColumn(row: unknown): string | null {
   }
   const value = row.payload_json;
   return typeof value === 'string' ? value : null;
+}
+
+const AutopilotVideoRecordSchema = z.strictObject({
+  creatorId: z.string().min(1),
+  videoId: z.string().min(1),
+  title: z.string().nullable(),
+  status: z.enum(['baseline', 'tracked']),
+  jobId: z.string().nullable(),
+  detectedAt: z.string().min(1),
+  retries: z.number().int().nonnegative(),
+  lastRetryAt: z.string().nullable(),
+});
+
+function parseAutopilotVideoPayload(payload: string): AutopilotVideoRecord {
+  return AutopilotVideoRecordSchema.parse(JSON.parse(payload));
 }
 
 export class ShortsStore {
@@ -120,6 +145,9 @@ export class ShortsStore {
       }
       if (userVersion >= 2 && userVersion <= 5) {
         db.exec(`UPDATE publications SET payload_json = json_set(payload_json, '$.scheduledFor', json('null'))`);
+      }
+      if (userVersion >= 2 && userVersion <= 6) {
+        db.exec(`UPDATE jobs SET payload_json = json_set(payload_json, '$.creatorProfileSnapshot.schedule', json('{"timeZone":"America/Sao_Paulo","slots":["12:00","19:00","21:00"]}'))`);
       }
       db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
       db.exec('COMMIT');
@@ -227,6 +255,20 @@ export class ShortsStore {
   listUpcomingScheduledPublications(): PublicationRecord[] {
     const rows = this.db.prepare("SELECT payload_json FROM publications WHERE status IN ('queued', 'deferred', 'publishing', 'scheduled') AND json_extract(payload_json, '$.scheduledFor') IS NOT NULL ORDER BY json_extract(payload_json, '$.scheduledFor') ASC").all();
     return rows.map((row) => payloadJsonColumn(row)).filter((payload): payload is string => payload !== null).map((payload) => parseJson<PublicationRecord>(payload));
+  }
+
+  listAutopilotVideos(creatorId: string): AutopilotVideoRecord[] {
+    const rows = this.db.prepare('SELECT payload_json FROM autopilot_videos WHERE creator_id = ? ORDER BY detected_at DESC').all(creatorId);
+    return rows.map((row) => payloadJsonColumn(row)).filter((payload): payload is string => payload !== null).map(parseAutopilotVideoPayload);
+  }
+
+  getAutopilotVideo(creatorId: string, videoId: string): AutopilotVideoRecord | null {
+    const payload = payloadJsonColumn(this.db.prepare('SELECT payload_json FROM autopilot_videos WHERE creator_id = ? AND video_id = ?').get(creatorId, videoId));
+    return payload ? parseAutopilotVideoPayload(payload) : null;
+  }
+
+  saveAutopilotVideo(record: AutopilotVideoRecord): void {
+    this.db.prepare('INSERT INTO autopilot_videos(creator_id, video_id, status, detected_at, payload_json) VALUES(?, ?, ?, ?, ?) ON CONFLICT(creator_id, video_id) DO UPDATE SET status = excluded.status, detected_at = excluded.detected_at, payload_json = excluded.payload_json').run(record.creatorId, record.videoId, record.status, record.detectedAt, JSON.stringify(record));
   }
 
   enqueueMissingPublicationChecks(): void {

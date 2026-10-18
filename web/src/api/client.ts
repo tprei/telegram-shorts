@@ -1,4 +1,5 @@
 import type {
+  AutopilotStatusDto,
   ChooseSpeakerRequest,
   CorrectWordRequest,
   CreateJobRequest,
@@ -12,6 +13,7 @@ import type {
   ReviseResultDto,
   SaveEditRequest,
   ScheduledPostDto,
+  SetAutopilotRequest,
   SetDefaultCreatorRequest,
   SetShortStatusRequest,
   ShortDetailDto,
@@ -191,4 +193,27 @@ export function cancelPublication(publicationId: string): Promise<ShortDetailDto
 
 export function listScheduledPosts(): Promise<ScheduledPostDto[]> {
   return request<ScheduledPostDto[]>('/api/schedule');
+}
+
+export function listAutopilotStatuses(): Promise<AutopilotStatusDto[]> {
+  return request<AutopilotStatusDto[]>('/api/autopilot');
+}
+
+export function setAutopilot(
+  creatorId: string,
+  request: SetAutopilotRequest,
+): Promise<AutopilotStatusDto> {
+  return jsonRequest<AutopilotStatusDto>(
+    'PUT',
+    `/api/autopilot/${encodeURIComponent(creatorId)}`,
+    request,
+  );
+}
+
+export function checkAutopilotNow(creatorId: string): Promise<AutopilotStatusDto> {
+  return jsonRequest<AutopilotStatusDto>(
+    'POST',
+    `/api/autopilot/${encodeURIComponent(creatorId)}/check`,
+    {},
+  );
 }

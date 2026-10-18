@@ -14,10 +14,12 @@ import {
   PublishRequestSchema,
   ReviseRequestSchema,
   SaveEditRequestSchema,
+  SetAutopilotRequestSchema,
   SetDefaultCreatorRequestSchema,
   SetShortStatusRequestSchema,
   UpdatePublishCopyRequestSchema,
   UpdateShortMetaRequestSchema,
+  type AutopilotApi,
   type StudioApi,
 } from './api-types.js';
 import { serveFile } from './media.js';
@@ -82,6 +84,7 @@ const WordIndexParamSchema = z
 
 export interface StudioAppInput {
   api: StudioApi;
+  autopilot: AutopilotApi;
   media: StudioMediaResolver;
   webDistDir: string;
   fontsDir: string;
@@ -90,6 +93,7 @@ export interface StudioAppInput {
 export function createStudioApp(input: StudioAppInput): Hono {
   const api = input.api;
   const media = input.media;
+  const autopilot = input.autopilot;
   const webRoot = path.resolve(input.webDistDir);
   const fontsRoot = path.resolve(input.fontsDir);
   const app = new Hono();
@@ -150,6 +154,11 @@ export function createStudioApp(input: StudioAppInput): Hono {
   app.post('/api/publications/:publicationId/cancel', async (c) =>
     c.json(await api.cancelPublication(c.req.param('publicationId'))),
   );
+  app.get('/api/autopilot', async (c) => c.json(await autopilot.list()));
+  app.put('/api/autopilot/:creatorId', async (c) =>
+    c.json(await autopilot.setEnabled(c.req.param('creatorId'), SetAutopilotRequestSchema.parse(await parseBody(c)))),
+  );
+  app.post('/api/autopilot/:creatorId/check', async (c) => c.json(await autopilot.checkNow(c.req.param('creatorId'))));
 
   app.all('/api/*', (c) => c.json({ error: 'Not found', code: 'not_found' }, 404));
 

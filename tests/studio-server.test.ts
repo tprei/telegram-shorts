@@ -9,6 +9,8 @@ import { StudioError } from '../src/application/errors.js';
 import type { StudioMediaResolver } from '../src/application/studio-media.js';
 import {
   MEDIA_ROUTES,
+  type AutopilotApi,
+  type AutopilotStatusDto,
   type ChooseSpeakerRequest,
   type CreateJobRequest,
   type CreateManualShortRequest,
@@ -24,6 +26,7 @@ import {
   type ReviseResultDto,
   type SaveEditRequest,
   type ScheduledPostDto,
+  type SetAutopilotRequest,
   type SetDefaultCreatorRequest,
   type SetShortStatusRequest,
   type ShortDetailDto,
@@ -224,13 +227,33 @@ class FakeStudioApi implements StudioApi {
   }
 }
 
-function buildApp(options?: { api?: FakeStudioApi; media?: FakeMediaResolver; webDistDir?: string }) {
+function buildApp(options?: { api?: FakeStudioApi; autopilot?: FakeAutopilotApi; media?: FakeMediaResolver; webDistDir?: string }) {
   return createStudioApp({
     api: options?.api ?? new FakeStudioApi(),
+    autopilot: options?.autopilot ?? new FakeAutopilotApi(),
     media: options?.media ?? new FakeMediaResolver(),
     webDistDir: options?.webDistDir ?? webDistDir,
     fontsDir,
   });
+}
+
+class FakeAutopilotApi implements AutopilotApi {
+  calls: Array<{ method: string; args: unknown[] }> = [];
+
+  async list(): Promise<AutopilotStatusDto[]> {
+    this.calls.push({ method: 'list', args: [] });
+    return [autopilotStatusDto()];
+  }
+
+  async setEnabled(creatorId: string, request: SetAutopilotRequest): Promise<AutopilotStatusDto> {
+    this.calls.push({ method: 'setEnabled', args: [creatorId, request] });
+    return autopilotStatusDto(creatorId);
+  }
+
+  async checkNow(creatorId: string): Promise<AutopilotStatusDto> {
+    this.calls.push({ method: 'checkNow', args: [creatorId] });
+    return autopilotStatusDto(creatorId);
+  }
 }
 
 function creatorDto(id: string, isDefault = false): CreatorDto {
@@ -320,6 +343,7 @@ function shortDetailDto(jobId: string, id: string): ShortDetailDto {
       layout: layoutProfile,
       hostFraming: null,
       fontUrl: '/fonts/Montserrat-ExtraBold.ttf',
+      schedule: { timeZone: 'America/Sao_Paulo', slots: ['12:00', '19:00', '21:00'] },
     },
     exports: [exportDto(id)],
     publications: [],
@@ -355,6 +379,38 @@ function scheduledPostDto(): ScheduledPostDto {
     status: 'scheduled',
     scheduledFor: '2026-10-25T19:00:00.000Z',
     provider: 'mallary',
+    timeZone: 'America/Sao_Paulo',
+  };
+}
+
+function autopilotStatusDto(creatorId = 'filipe_boni'): AutopilotStatusDto {
+  return {
+    creatorId,
+    displayName: `Creator ${creatorId}`,
+    enabled: true,
+    channelUrl: 'https://www.youtube.com/@filipe_boni/videos',
+    schedule: { timeZone: 'America/Sao_Paulo', slots: ['12:00', '19:00', '21:00'] },
+    shortsPerVideo: 2,
+    platforms: ['instagram', 'tiktok'],
+    reviewWindowHours: 3,
+    lastCheckedAt: '2026-10-18T09:00:00.000Z',
+    lastCheckError: null,
+    checkRequested: false,
+    videos: [{
+      videoId: 'vid_1',
+      title: 'Video title',
+      jobId: 'j1',
+      jobStatus: 'ready',
+      detectedAt: '2026-10-18T08:00:00.000Z',
+      shorts: [{
+        shortId: 's1',
+        rank: 1,
+        title: 'Short title',
+        state: 'ready',
+        scheduledFor: null,
+        reason: null,
+      }],
+    }],
   };
 }
 
@@ -764,6 +820,43 @@ test('GET /api/schedule returns the upcoming scheduled posts', async () => {
   assert.equal(res.status, 200);
   assert.deepEqual(await res.json(), [scheduledPostDto()]);
   assert.deepEqual(api.calls, [{ method: 'listScheduledPosts', args: [] }]);
+});
+
+test('GET /api/autopilot returns the configured creators', async () => {
+  const autopilot = new FakeAutopilotApi();
+  const app = buildApp({ autopilot });
+  const res = await app.request('/api/autopilot');
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), [autopilotStatusDto('filipe_boni')]);
+  assert.deepEqual(autopilot.calls, [{ method: 'list', args: [] }]);
+});
+
+test('PUT /api/autopilot/:creatorId parses the body and dispatches setEnabled', async () => {
+  const autopilot = new FakeAutopilotApi();
+  const app = buildApp({ autopilot });
+  const res = await app.request('/api/autopilot/filipe_boni', {
+    method: 'PUT',
+    body: JSON.stringify({ enabled: true }),
+  });
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), autopilotStatusDto('filipe_boni'));
+  assert.deepEqual(autopilot.calls, [{ method: 'setEnabled', args: ['filipe_boni', { enabled: true }] }]);
+
+  const invalid = await app.request('/api/autopilot/filipe_boni', {
+    method: 'PUT',
+    body: JSON.stringify({ enabled: 'yes' }),
+  });
+  assert.equal(invalid.status, 400);
+  assert.deepEqual(autopilot.calls, [{ method: 'setEnabled', args: ['filipe_boni', { enabled: true }] }]);
+});
+
+test('POST /api/autopilot/:creatorId/check dispatches checkNow', async () => {
+  const autopilot = new FakeAutopilotApi();
+  const app = buildApp({ autopilot });
+  const res = await app.request('/api/autopilot/filipe_boni/check', { method: 'POST' });
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), autopilotStatusDto('filipe_boni'));
+  assert.deepEqual(autopilot.calls, [{ method: 'checkNow', args: ['filipe_boni'] }]);
 });
 
 test('POST /api/publications/:publicationId/cancel returns the short detail', async () => {

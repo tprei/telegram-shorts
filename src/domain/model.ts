@@ -234,6 +234,21 @@ export interface CreatorRenderConfig {
   layoutId: string;
 }
 
+export interface PostingSchedule {
+  timeZone: string;
+  slots: string[];
+}
+
+export interface CreatorAutopilotConfig {
+  channelUrl: string;
+  shortsPerVideo: number;
+  platforms: ShortVideoPlatform[];
+  reviewWindowHours: number;
+  bookingHorizonHours: number;
+  maxShortAgeHours: number;
+  minVideoSeconds: number;
+}
+
 export interface CreatorProfile {
   id: string;
   displayName: string;
@@ -241,7 +256,24 @@ export interface CreatorProfile {
   description?: string;
   render: CreatorRenderConfig;
   publish?: CreatorPublishConfig;
+  schedule: PostingSchedule;
+  autopilot?: CreatorAutopilotConfig;
 }
+
+export type AutopilotVideoStatus = 'baseline' | 'tracked';
+
+export interface AutopilotVideoRecord {
+  creatorId: string;
+  videoId: string;
+  title: string | null;
+  status: AutopilotVideoStatus;
+  jobId: string | null;
+  detectedAt: string;
+  retries: number;
+  lastRetryAt: string | null;
+}
+
+export type AutopilotShortState = 'waiting' | 'exporting' | 'ready' | 'booked' | 'skipped' | 'expired';
 
 export interface CreatorProfileManifest {
   version: 2;

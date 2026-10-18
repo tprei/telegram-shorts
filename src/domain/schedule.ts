@@ -1,13 +1,53 @@
-export const SCHEDULE_LIMITS = { minLeadMinutes: 15, maxLeadDays: 60, slotSpacingMinutes: 120 } as const;
+import type { PostingSchedule } from './model.js';
 
-export const POSTING_SLOTS: ReadonlyArray<{ hour: number; minute: number }> = [
-  { hour: 12, minute: 0 },
-  { hour: 19, minute: 0 },
-  { hour: 21, minute: 0 },
-];
+export const SCHEDULE_LIMITS = { minLeadMinutes: 15, maxLeadDays: 60, slotSpacingMinutes: 120 } as const;
 
 const MINUTE_MS = 60_000;
 const DAY_MS = 24 * 60 * MINUTE_MS;
+
+interface ZonedDateTimeFields {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+}
+
+function zonedFields(date: Date, timeZone: string): Record<string, number> {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: 'numeric',
+    second: 'numeric',
+  }).formatToParts(date);
+  const fields: Record<string, number> = {};
+  for (const part of parts) {
+    if (part.type !== 'literal') {
+      fields[part.type] = Number(part.value);
+    }
+  }
+  return fields;
+}
+
+function zoneOffsetMs(instant: number, timeZone: string): number {
+  const fields = zonedFields(new Date(instant), timeZone);
+  return Date.UTC(fields.year, fields.month - 1, fields.day, fields.hour, fields.minute, fields.second) - instant;
+}
+
+export function zonedTimeToUtc(input: { year: number; month: number; day: number; hour: number; minute: number; timeZone: string }): Date {
+  const guess = Date.UTC(input.year, input.month - 1, input.day, input.hour, input.minute);
+  const firstPass = guess - zoneOffsetMs(guess, input.timeZone);
+  return new Date(guess - zoneOffsetMs(firstPass, input.timeZone));
+}
+
+export function zonedDateParts(date: Date, timeZone: string): ZonedDateTimeFields {
+  const fields = zonedFields(date, timeZone);
+  return { year: fields.year, month: fields.month, day: fields.day, hour: fields.hour, minute: fields.minute };
+}
 
 export function scheduledAtProblem(scheduledAt: Date, now: Date): string | null {
   if (Number.isNaN(scheduledAt.getTime())) {
@@ -22,23 +62,64 @@ export function scheduledAtProblem(scheduledAt: Date, now: Date): string | null 
   return null;
 }
 
-export function suggestPostingSlots(input: { now: Date; taken: readonly Date[]; count: number }): Date[] {
-  const slots: Date[] = [];
+export function freePostingSlots(input: { schedule: PostingSchedule; from: Date; to: Date; taken: readonly Date[] }): Date[] {
+  const slots = [...input.schedule.slots]
+    .sort((a, b) => a.localeCompare(b))
+    .filter((slot) => /^\d{2}:\d{2}$/.test(slot) && Number(slot.slice(0, 2)) <= 23 && Number(slot.slice(3, 5)) <= 59);
   const spacingMs = SCHEDULE_LIMITS.slotSpacingMinutes * MINUTE_MS;
-  for (let dayOffset = 0; dayOffset <= SCHEDULE_LIMITS.maxLeadDays && slots.length < input.count; dayOffset += 1) {
-    for (const slot of POSTING_SLOTS) {
-      const candidate = new Date(input.now.getFullYear(), input.now.getMonth(), input.now.getDate() + dayOffset, slot.hour, slot.minute, 0, 0);
-      if (scheduledAtProblem(candidate, input.now) !== null) {
-        continue;
-      }
-      if (input.taken.some((taken) => Math.abs(taken.getTime() - candidate.getTime()) < spacingMs)) {
-        continue;
-      }
-      slots.push(candidate);
-      if (slots.length === input.count) {
+  const dailyCap = input.schedule.slots.length;
+  const timeZone = input.schedule.timeZone;
+  const dayKey = (date: Date): string => {
+    const parts = zonedDateParts(date, timeZone);
+    return `${parts.year}-${parts.month}-${parts.day}`;
+  };
+  const takenDayKeys = input.taken.map((taken) => dayKey(taken));
+  const startDate = zonedDateParts(input.from, timeZone);
+  const free: Date[] = [];
+  const returnedDayKeys: string[] = [];
+  for (let dayOffset = 0; slots.length > 0; dayOffset += 1) {
+    let reachedEnd = false;
+    for (const slot of slots) {
+      const instant = zonedTimeToUtc({
+        year: startDate.year,
+        month: startDate.month,
+        day: startDate.day + dayOffset,
+        hour: Number(slot.slice(0, 2)),
+        minute: Number(slot.slice(3, 5)),
+        timeZone,
+      }).getTime();
+      if (instant > input.to.getTime()) {
+        reachedEnd = true;
         break;
       }
+      if (instant < input.from.getTime()) {
+        continue;
+      }
+      const tooCloseToTaken = input.taken.some((taken) => Math.abs(taken.getTime() - instant) < spacingMs);
+      const tooCloseToReturned = free.some((returned) => Math.abs(returned.getTime() - instant) < spacingMs);
+      if (tooCloseToTaken || tooCloseToReturned) {
+        continue;
+      }
+      const day = dayKey(new Date(instant));
+      const dayCount = takenDayKeys.filter((key) => key === day).length + returnedDayKeys.filter((key) => key === day).length;
+      if (dayCount >= dailyCap) {
+        continue;
+      }
+      free.push(new Date(instant));
+      returnedDayKeys.push(day);
+    }
+    if (reachedEnd) {
+      break;
     }
   }
-  return slots;
+  return free;
+}
+
+export function suggestPostingSlots(input: { now: Date; taken: readonly Date[]; count: number; schedule: PostingSchedule }): Date[] {
+  return freePostingSlots({
+    schedule: input.schedule,
+    from: new Date(input.now.getTime() + SCHEDULE_LIMITS.minLeadMinutes * MINUTE_MS),
+    to: new Date(input.now.getTime() + SCHEDULE_LIMITS.maxLeadDays * DAY_MS),
+    taken: input.taken,
+  }).slice(0, input.count);
 }

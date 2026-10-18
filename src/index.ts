@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
+import { resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { AUTOPILOT_TICK_MS } from './domain/autopilot.js';
+import { Autopilot } from './application/autopilot.js';
 import { ShortsPipeline } from './application/pipeline.js';
 import { StudioService } from './application/studio-service.js';
 import type { QueueLane } from './domain/model.js';
@@ -11,6 +14,7 @@ import { createShortVideoPublishProvider } from './infra/instagram-publisher-fac
 import { acquireStudioLock } from './infra/studio-lock.js';
 import { OpenRouterClient } from './infra/openrouter.js';
 import { describeError, logError } from './infra/util.js';
+import { listChannelUploads } from './infra/youtube.js';
 import { createStudioApp, startStudioServer } from './studio/server.js';
 
 process.on('unhandledRejection', (reason) => {
@@ -70,8 +74,20 @@ async function main(): Promise<void> {
   const publisher = createShortVideoPublishProvider(config);
   const studio = new StudioService({ config, store, openRouter, profiles, publisher });
   const pipeline = new ShortsPipeline({ config, store, openRouter, profiles, publisher });
+  const autopilot = new Autopilot({
+    store,
+    service: studio,
+    profiles,
+    listUploads: (channelUrl, limit) => listChannelUploads(channelUrl, limit, {
+      cookiesPath: config.SHORTS_YTDLP_COOKIES_PATH ? resolve(config.rootDir, config.SHORTS_YTDLP_COOKIES_PATH) : undefined,
+      cookiesFromBrowser: config.SHORTS_YTDLP_COOKIES_FROM_BROWSER,
+      jsRuntime: config.SHORTS_YTDLP_JS_RUNTIME,
+    }),
+    now: () => new Date(),
+  });
   const app = createStudioApp({
     api: studio,
+    autopilot,
     media: studio,
     webDistDir: config.webDistDir,
     fontsDir: config.fontsDir,
@@ -79,7 +95,7 @@ async function main(): Promise<void> {
   const startedServer = await startStudioServer(app, config.SHORTS_STUDIO_PORT);
   server = startedServer;
   process.stdout.write(`Studio running at ${startedServer.url}\n`);
-  await Promise.all([runLane(pipeline, 'ingest'), runLane(pipeline, 'output')]);
+  await Promise.all([runLane(pipeline, 'ingest'), runLane(pipeline, 'output'), runAutopilot(autopilot)]);
 }
 
 async function runLane(pipeline: ShortsPipeline, lane: QueueLane): Promise<never> {
@@ -93,6 +109,17 @@ async function runLane(pipeline: ShortsPipeline, lane: QueueLane): Promise<never
       logError(`Pipeline lane ${lane} crashed`, error);
       await sleep(500);
     }
+  }
+}
+
+async function runAutopilot(autopilot: Autopilot): Promise<never> {
+  while (true) {
+    try {
+      await autopilot.tick();
+    } catch (error) {
+      logError('Autopilot tick crashed', error);
+    }
+    await sleep(AUTOPILOT_TICK_MS);
   }
 }
 

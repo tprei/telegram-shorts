@@ -569,6 +569,7 @@ export function EditorInspector(props: EditorInspectorProps) {
               platforms={detail.platforms}
               selectedPlatforms={selectedPlatforms}
               upcomingPosts={upcomingPosts}
+              schedule={detail.job.schedule}
               cancellingPublicationIds={cancellingPublicationIds}
               cancelError={cancelError}
               onCancelPublication={onCancelPublication}

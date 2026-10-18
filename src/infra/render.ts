@@ -7,6 +7,8 @@ import { buildEndCardAss, buildExportAss } from './ass.js';
 import { runProcess } from './process.js';
 import { ensureParent } from './util.js';
 
+const RENDER_TIMEOUT_MS = 30 * 60_000;
+
 export interface ExportRenderInput {
   timeline: Timeline;
   layout: LayoutProfile;
@@ -114,7 +116,7 @@ async function renderChunk(input: {
     '-c:a', 'pcm_s16le',
     '-ar', String(AUDIO_SAMPLE_RATE),
     input.outputPath,
-  ]);
+  ], { timeoutMs: RENDER_TIMEOUT_MS });
 }
 
 function buildChunkFilterGraph(input: {
@@ -215,6 +217,7 @@ async function renderEndCardMkv(input: {
     : `;[${audioInputIndex}:a:0]asetpts=PTS-STARTPTS,aresample=${AUDIO_SAMPLE_RATE}${input.speed !== 1 ? `,atempo=${num(input.speed)}` : ''},volume='${endCardVolumeExpression(input.endCard)}':eval=frame,apad,atrim=end_sample=${audioSamples}[aout]`;
   const args: string[] = [
     '-y',
+    '-xerror',
     '-loop', '1', '-t', duration, '-framerate', String(input.fps), '-i', backgroundPath,
   ];
   if (hasThumbnail) {
@@ -239,7 +242,7 @@ async function renderEndCardMkv(input: {
     '-t', duration,
     outputPath,
   );
-  await runProcess('ffmpeg', args, { cwd: input.workDir });
+  await runProcess('ffmpeg', args, { cwd: input.workDir, timeoutMs: RENDER_TIMEOUT_MS });
   return outputPath;
 }
 
@@ -276,7 +279,7 @@ async function encodeFinal(input: {
     '-movflags', '+faststart',
     input.outputPath,
   );
-  await runProcess('ffmpeg', args, { cwd: input.workDir });
+  await runProcess('ffmpeg', args, { cwd: input.workDir, timeoutMs: RENDER_TIMEOUT_MS });
 }
 
 export async function extractFrame(input: { videoPath: string; seconds: number; width: number; outputPath: string }): Promise<void> {
@@ -289,7 +292,7 @@ export async function extractFrame(input: { videoPath: string; seconds: number; 
     '-vf', `scale=${input.width}:-2`,
     '-q:v', '3',
     input.outputPath,
-  ]);
+  ], { timeoutMs: RENDER_TIMEOUT_MS });
   try {
     await stat(input.outputPath);
   } catch {
@@ -311,7 +314,7 @@ export async function renderCoverImage(input: { imagePath: string; outputPath: s
     '-frames:v', '1',
     '-q:v', '2',
     input.outputPath,
-  ]);
+  ], { timeoutMs: RENDER_TIMEOUT_MS });
   try {
     await stat(input.outputPath);
   } catch {
@@ -396,7 +399,7 @@ async function probeVideoStreamDurationSeconds(path: string): Promise<number> {
     '-show_entries', 'stream=duration',
     '-of', 'default=noprint_wrappers=1:nokey=1',
     path,
-  ]);
+  ], { timeoutMs: RENDER_TIMEOUT_MS });
   const duration = Number(stdout.trim());
   if (!Number.isFinite(duration) || duration <= 0) {
     throw new Error(`No video stream duration found in ${path}`);
@@ -410,7 +413,7 @@ async function probeDurationSeconds(path: string): Promise<number> {
     '-show_entries', 'format=duration',
     '-of', 'default=noprint_wrappers=1:nokey=1',
     path,
-  ]);
+  ], { timeoutMs: RENDER_TIMEOUT_MS });
   return Number(stdout.trim());
 }
 

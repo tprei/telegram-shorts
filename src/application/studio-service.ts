@@ -2,10 +2,11 @@ import { existsSync } from 'node:fs';
 import { rename, rm } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { addRange, createInitialEdit, extendEndBySeconds, extendStartBySeconds, keptText, keptWordIndices, normalizeEdit, setWordsRemoved, trimEndBySeconds, trimStartBySeconds, type ShortEdit, type WordRange } from '../domain/edit.js';
+import { exportMatchesShort } from '../domain/autopilot.js';
 import { outputDurationSeconds } from '../domain/timeline.js';
 import { sentenceText } from '../domain/policies.js';
 import { IN_FLIGHT_PUBLICATION_STATUSES, POSTED_OR_UNKNOWN_PUBLICATION_STATUSES, type ExportRecord, type JobRecord, type JobSummaryRecord, type PublicationRecord, type ShortRecord, type ShortVideoPlatform, type SourceMedia } from '../domain/model.js';
-import { scheduledAtProblem } from '../domain/schedule.js';
+import { scheduledAtProblem, SCHEDULE_LIMITS } from '../domain/schedule.js';
 import type { RevisionIntent } from '../domain/model.js';
 import {
   MEDIA_ROUTES,
@@ -421,10 +422,20 @@ export class StudioService implements StudioApi, StudioMediaResolver {
   async setShortStatus(shortId: string, request: SetShortStatusRequest): Promise<ShortDetailDto> {
     const current = this.requireShort(shortId);
     const job = this.requireJob(current.jobId);
-    current.status = request.status;
-    current.updatedAt = nowIso();
-    this.deps.store.updateShort(current);
-    return this.shortDetailWithAvailability(job, current);
+    if (request.status === 'rejected') {
+      for (const publication of this.deps.store.listPublicationsForShort(shortId)) {
+        const cancellable = publication.scheduledFor !== null
+          && (publication.status === 'scheduled' || publication.status === 'queued' || publication.status === 'deferred');
+        if (cancellable) {
+          await this.cancelPublication(publication.id);
+        }
+      }
+    }
+    const latest = this.requireShort(shortId);
+    latest.status = request.status;
+    latest.updatedAt = nowIso();
+    this.deps.store.updateShort(latest);
+    return this.shortDetailWithAvailability(job, latest);
   }
 
   async analyzeCrops(shortId: string): Promise<ShortDetailDto> {
@@ -453,7 +464,7 @@ export class StudioService implements StudioApi, StudioMediaResolver {
     }
     const reusable = this.deps.store
       .listExportsForShort(short.id)
-      .find((record) => this.exportIsCurrent(record, short, job) && (record.status === 'queued' || record.status === 'rendering' || record.status === 'ready'));
+      .find((record) => exportMatchesShort(record, short, job) && (record.status === 'queued' || record.status === 'rendering' || record.status === 'ready'));
     if (reusable) {
       return this.shortDetailWithAvailability(job, short);
     }
@@ -521,6 +532,7 @@ export class StudioService implements StudioApi, StudioMediaResolver {
       if (problem !== null) {
         throw new StudioError('invalid', problem);
       }
+      this.assertManualSpacing(job, exportRecord.shortId, new Date(request.scheduledAt));
     }
     const scheduling = request.scheduledAt !== null;
     const availability = await platformAvailability(job, this.deps.publisher, this.deps.config, this.deps.profiles);
@@ -622,6 +634,7 @@ export class StudioService implements StudioApi, StudioMediaResolver {
   listScheduledPosts(): ScheduledPostDto[] {
     return this.deps.store.listUpcomingScheduledPublications().map((record) => {
       const short = this.requireShort(record.shortId);
+      const job = this.requireJob(record.jobId);
       const scheduledFor = record.scheduledFor;
       if (scheduledFor === null) {
         throw new StudioError('conflict', `Scheduled publication ${record.id} has no scheduled time.`);
@@ -635,6 +648,7 @@ export class StudioService implements StudioApi, StudioMediaResolver {
         status: record.status,
         scheduledFor,
         provider: record.provider,
+        timeZone: job.creatorProfileSnapshot.schedule.timeZone,
       };
     });
   }
@@ -684,6 +698,46 @@ export class StudioService implements StudioApi, StudioMediaResolver {
       throw new StudioError('not_found', `Publication not found: ${publicationId}`);
     }
     return publication;
+  }
+
+  private assertManualSpacing(job: JobRecord, shortId: string, scheduledAt: Date): void {
+    const spacingMs = SCHEDULE_LIMITS.slotSpacingMinutes * 60_000;
+    for (const publication of this.creatorPublications(job.creatorProfileId)) {
+      if (publication.shortId === shortId || !IN_FLIGHT_PUBLICATION_STATUSES.includes(publication.status)) {
+        continue;
+      }
+      const startedAt = publication.scheduledFor ?? publication.submittedAt;
+      if (startedAt === null) {
+        continue;
+      }
+      const started = Date.parse(startedAt);
+      if (Number.isNaN(started) || Math.abs(started - scheduledAt.getTime()) >= spacingMs) {
+        continue;
+      }
+      const timeZone = job.creatorProfileSnapshot.schedule.timeZone;
+      const city = timeZone.split('/').pop()?.replace(/_/g, ' ') ?? timeZone;
+      throw new StudioError('conflict', `Another post is scheduled for ${this.zoneClock(new Date(started), timeZone)} (${city} time). Pick a time at least 2 h away.`);
+    }
+  }
+
+  private zoneClock(date: Date, timeZone: string): string {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone, hourCycle: 'h23', hour: '2-digit', minute: '2-digit' }).formatToParts(date);
+    const hour = parts.find((part) => part.type === 'hour')?.value ?? '00';
+    const minute = parts.find((part) => part.type === 'minute')?.value ?? '00';
+    return `${hour}:${minute}`;
+  }
+
+  private creatorPublications(creatorId: string): PublicationRecord[] {
+    const publications: PublicationRecord[] = [];
+    for (const job of this.deps.store.listJobSummaries()) {
+      if (job.creatorProfileId !== creatorId) {
+        continue;
+      }
+      for (const short of this.deps.store.listShortsForJob(job.id)) {
+        publications.push(...this.deps.store.listPublicationsForShort(short.id));
+      }
+    }
+    return publications;
   }
 
   private requirePublisher(): ShortVideoPublishProvider {
@@ -882,19 +936,12 @@ export class StudioService implements StudioApi, StudioMediaResolver {
     };
   }
 
-  private exportIsCurrent(record: ExportRecord, short: ShortRecord, job: JobRecord): boolean {
-    return record.editRevision === short.editRevision
-      && record.title === short.title
-      && record.transcriptRevision === job.transcriptRevision
-      && JSON.stringify(record.hostFraming) === JSON.stringify(job.hostFraming);
-  }
-
   private exportDto(record: ExportRecord, short: ShortRecord, job: JobRecord): ExportDto {
     return {
       id: record.id,
       shortId: record.shortId,
       editRevision: record.editRevision,
-      current: this.exportIsCurrent(record, short, job),
+      current: exportMatchesShort(record, short, job),
       status: record.status,
       error: record.error,
       videoUrl: record.status === 'ready' && record.artifactPath ? MEDIA_ROUTES.export(record.id) : null,
@@ -955,6 +1002,7 @@ export class StudioService implements StudioApi, StudioMediaResolver {
         layout: job.layoutProfileSnapshot,
         hostFraming: job.hostFraming,
         fontUrl: MEDIA_ROUTES.font(basename(job.layoutProfileSnapshot.font.file)),
+        schedule: job.creatorProfileSnapshot.schedule,
       },
       exports: this.deps.store.listExportsForShort(short.id).map((record) => this.exportDto(record, short, job)),
       publications: this.deps.store.listPublicationsForShort(short.id).map((record) => this.publicationDto(record)),

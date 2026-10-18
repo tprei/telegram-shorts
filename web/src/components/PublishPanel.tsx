@@ -1,11 +1,9 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { ExportDto, PlatformAvailabilityDto, PublicationDto, ScheduledPostDto } from '@api';
-import type { PublicationStatus, ShortVideoPlatform } from '@domain/model';
-import { scheduledAtProblem, SCHEDULE_LIMITS, suggestPostingSlots } from '@domain/schedule';
-import {
-  ApiError, Button, EmptyState, Icon, ScheduleCancelButton, localDateTimeValue,
-  scheduleButtonTime, scheduleDateTime, scheduleDay, scheduleTime,
-} from './StudioPrimitives';
+import type { PostingSchedule, PublicationStatus, ShortVideoPlatform } from '@domain/model';
+import { scheduledAtProblem, SCHEDULE_LIMITS, suggestPostingSlots, zonedTimeToUtc } from '@domain/schedule';
+import { ApiError, Button, EmptyState, Icon, ScheduleCancelButton } from './StudioPrimitives';
+import { operatorTimeZone, postingDateFormatters, postingTimeZoneLabel, zonedDateTimeValue } from './PostingTime';
 
 export interface PublishPanelProps {
   latestReadyExport: ExportDto | null;
@@ -14,6 +12,7 @@ export interface PublishPanelProps {
   platforms: readonly PlatformAvailabilityDto[];
   selectedPlatforms: readonly ShortVideoPlatform[];
   upcomingPosts: readonly ScheduledPostDto[];
+  schedule: PostingSchedule;
   cancellingPublicationIds?: readonly string[];
   cancelError?: string | null;
   onCancelPublication: (publicationId: string) => void;
@@ -52,6 +51,19 @@ const attemptDate = new Intl.DateTimeFormat(undefined, {
 });
 const destinationList = new Intl.ListFormat(undefined, { style: 'long', type: 'conjunction' });
 
+function postingDateFromInput(value: string, timeZone: string): Date | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(value);
+  if (!match) return null;
+  try {
+    return zonedTimeToUtc({
+      year: Number(match[1]), month: Number(match[2]), day: Number(match[3]),
+      hour: Number(match[4]), minute: Number(match[5]), timeZone,
+    });
+  } catch {
+    return null;
+  }
+}
+
 function firstErrorLine(error: string | null): string {
   if (!error?.trim()) return 'The post could not be published.';
   const firstLine = error.split(/\r?\n/).find((line) => line.trim()) ?? error;
@@ -65,7 +77,7 @@ function firstErrorLine(error: string | null): string {
     .trim() || 'The post could not be published.';
 }
 
-function statusLabel(publication: PublicationDto): string {
+function statusLabel(publication: PublicationDto, timeZone: string): string {
   const platform = platformNames[publication.platform];
   switch (publication.status) {
     case 'queued':
@@ -84,7 +96,7 @@ function statusLabel(publication: PublicationDto): string {
       return firstErrorLine(publication.error);
     case 'scheduled':
       return publication.scheduledFor
-        ? `Scheduled for ${scheduleDateTime.format(new Date(publication.scheduledFor))}`
+        ? `Scheduled for ${postingDateFormatters(timeZone).dateTime.format(new Date(publication.scheduledFor))} · ${postingTimeZoneLabel(timeZone)}`
         : 'Scheduled';
     case 'cancelled':
       return 'Schedule cancelled';
@@ -131,6 +143,7 @@ interface PublishBatch {
 
 interface PublicationOutcomeProps {
   publication: PublicationDto;
+  timeZone: string;
   exportItem: ExportDto | undefined;
   historical?: boolean;
   cancellingPublicationIds: readonly string[];
@@ -138,7 +151,7 @@ interface PublicationOutcomeProps {
 }
 
 function PublicationOutcome({
-  publication, exportItem, historical = false, cancellingPublicationIds, onCancelPublication,
+  publication, timeZone, exportItem, historical = false, cancellingPublicationIds, onCancelPublication,
 }: PublicationOutcomeProps) {
   const timestamp = publication.status === 'submitted'
     ? publication.submittedAt ?? publication.updatedAt
@@ -153,8 +166,11 @@ function PublicationOutcome({
                 : publication.status === 'failed' || publication.status === 'unconfirmed' ? <Icon name="alert" size={15} />
                   : <span className="spinner" />}
         </span>
-        <p>{statusLabel(publication)}</p>
+        <p>{statusLabel(publication, timeZone)}</p>
       </div>
+      {publication.scheduledFor && publication.status === 'scheduled' && timeZone !== operatorTimeZone && (
+        <p className="publish-scheduled-local">{postingDateFormatters(operatorTimeZone).dateTime.format(new Date(publication.scheduledFor))} · {postingTimeZoneLabel(operatorTimeZone)}</p>
+      )}
       {publication.status === 'published' && publication.url && (
         <a className="publish-post-link" href={publication.url} target="_blank" rel="noopener noreferrer">
           View post on {platformNames[publication.platform]} <Icon name="external" size={13} />
@@ -167,7 +183,7 @@ function PublicationOutcome({
       </div>
       {publication.scheduledFor && ['scheduled', 'queued', 'deferred'].includes(publication.status) && (
         <ScheduleCancelButton
-          description={`${platformNames[publication.platform]} post for ${scheduleDateTime.format(new Date(publication.scheduledFor))}`}
+          description={`${platformNames[publication.platform]} post for ${postingDateFormatters(timeZone).dateTime.format(new Date(publication.scheduledFor))} · ${postingTimeZoneLabel(timeZone)}`}
           pending={cancellingPublicationIds.includes(publication.id)}
           onConfirm={() => onCancelPublication(publication.id)}
         />
@@ -189,6 +205,7 @@ export function PublishPanel({
   platforms,
   selectedPlatforms,
   upcomingPosts,
+  schedule,
   cancellingPublicationIds = [],
   cancelError,
   onCancelPublication,
@@ -211,11 +228,16 @@ export function PublishPanel({
     now: scheduleNow,
     taken: upcomingPosts.map((post) => new Date(post.scheduledFor)),
     count: 4,
-  }), [upcomingPosts, scheduleNow]);
-  const chosenTime = timeChoice === 'custom' ? customTime : timeChoice ?? (
-    suggestedSlots[0] ? localDateTimeValue(suggestedSlots[0]) : ''
-  );
-  const scheduledDate = chosenTime ? new Date(chosenTime) : null;
+    schedule,
+  }), [upcomingPosts, scheduleNow, schedule]);
+  const chosenTime = timeChoice === 'custom' ? customTime : timeChoice ?? suggestedSlots[0]?.toISOString() ?? '';
+  const scheduledDate = timeChoice === 'custom'
+    ? postingDateFromInput(customTime, schedule.timeZone)
+    : chosenTime ? new Date(chosenTime) : null;
+  const scheduleFormats = postingDateFormatters(schedule.timeZone);
+  const zoneLabel = postingTimeZoneLabel(schedule.timeZone);
+  const localFormats = postingDateFormatters(operatorTimeZone);
+  const localZoneLabel = postingTimeZoneLabel(operatorTimeZone);
   const timeProblem = !scheduledDate || !Number.isFinite(scheduledDate.getTime())
     ? 'Choose a date and time.'
     : scheduledAtProblem(scheduledDate, new Date());
@@ -276,7 +298,7 @@ export function PublishPanel({
     ? `${feedbackScheduling || (publishPending && when === 'schedule') ? 'Scheduling on' : 'Publishing to'} ${formatPlatforms(feedbackTargets)}…`
     : [
       ...[...scheduledGroups].map(([date, targets]) =>
-        `Scheduled on ${formatPlatforms(targets)} for ${scheduleDateTime.format(new Date(date))}`),
+        `Scheduled on ${formatPlatforms(targets)} for ${scheduleFormats.dateTime.format(new Date(date))} · ${zoneLabel}`),
       liveTargets.length > 0 ? `Live on ${formatPlatforms(liveTargets)}` : '',
       cancelledTargets.length > 0 ? `Schedule cancelled on ${formatPlatforms(cancelledTargets)}` : '',
       failedTargets.length > 0 ? `Failed on ${formatPlatforms(failedTargets)}` : '',
@@ -425,10 +447,10 @@ export function PublishPanel({
         </div>
         {when === 'schedule' && (
           <div className="publish-schedule">
-            <p className="publish-schedule-label">Suggested times</p>
+            <p className="publish-schedule-label">Suggested times · <strong>{zoneLabel}</strong></p>
             <div className="publish-slot-options" role="group" aria-label="Suggested posting times">
               {suggestedSlots.map((slot) => {
-                const value = localDateTimeValue(slot);
+                const value = slot.toISOString();
                 return (
                   <button
                     key={value}
@@ -440,20 +462,22 @@ export function PublishPanel({
                       setCustomTouched(false);
                     }}
                   >
-                    <span>{scheduleDay.format(slot)}</span>
-                    <strong>{scheduleTime.format(slot)}</strong>
+                    <span>{scheduleFormats.day.format(slot)}</span>
+                    <strong>{scheduleFormats.time.format(slot)}</strong>
+                    {operatorTimeZone !== schedule.timeZone && <small>{localFormats.dateTime.format(slot)} · {localZoneLabel}</small>}
                   </button>
                 );
               })}
             </div>
-            <label className="publish-custom-time" htmlFor={`${id}-custom-time`}>Or choose a date and time</label>
+            {suggestedSlots.length === 0 && <p className="publish-timezone">No free suggested times. Choose a custom time below.</p>}
+            <label className="publish-custom-time" htmlFor={`${id}-custom-time`}>Or choose a date and time · {zoneLabel}</label>
             <input
               id={`${id}-custom-time`}
               type="datetime-local"
               step={60}
               value={customTime}
-              min={localDateTimeValue(new Date(scheduleNow.getTime() + SCHEDULE_LIMITS.minLeadMinutes * 60_000))}
-              max={localDateTimeValue(new Date(scheduleNow.getTime() + SCHEDULE_LIMITS.maxLeadDays * 86_400_000))}
+              min={zonedDateTimeValue(new Date(scheduleNow.getTime() + SCHEDULE_LIMITS.minLeadMinutes * 60_000), schedule.timeZone)}
+              max={zonedDateTimeValue(new Date(scheduleNow.getTime() + SCHEDULE_LIMITS.maxLeadDays * 86_400_000), schedule.timeZone)}
               aria-invalid={Boolean(showTimeProblem)}
               aria-describedby={`${id}-timezone${showTimeProblem ? ` ${id}-time-error` : ''}`}
               onChange={(event) => {
@@ -467,8 +491,11 @@ export function PublishPanel({
               }}
             />
             {showTimeProblem && <p className="publish-time-error" id={`${id}-time-error`} role="alert">{timeProblem}</p>}
+            {scheduledDate && !timeProblem && operatorTimeZone !== schedule.timeZone && (
+              <p className="publish-local-equivalent" aria-live="polite">{localFormats.dateTime.format(scheduledDate)} · {localZoneLabel} <span>(your time)</span></p>
+            )}
             <p className="publish-timezone" id={`${id}-timezone`}>
-              Times in {Intl.DateTimeFormat().resolvedOptions().timeZone.replaceAll('_', ' ')}.
+              Choose times in {zoneLabel} ({schedule.timeZone}).
               {' '}Mallary publishes even with your computer off.
             </p>
           </div>
@@ -503,6 +530,7 @@ export function PublishPanel({
                     <PublicationOutcome
                       key={latest.id}
                       publication={latest}
+                      timeZone={schedule.timeZone}
                       exportItem={exports.find((item) => item.id === latest.exportId)}
                       cancellingPublicationIds={cancellingPublicationIds}
                       onCancelPublication={onCancelPublication}
@@ -525,6 +553,7 @@ export function PublishPanel({
                         <PublicationOutcome
                           key={publication.id}
                           publication={publication}
+                          timeZone={schedule.timeZone}
                           exportItem={exports.find((item) => item.id === publication.exportId)}
                           cancellingPublicationIds={cancellingPublicationIds}
                           onCancelPublication={onCancelPublication}
@@ -567,7 +596,7 @@ export function PublishPanel({
                           <a href={publication.url} target="_blank" rel="noopener noreferrer">
                             Live · View post <Icon name="external" size={12} />
                           </a>
-                        ) : publication ? statusLabel(publication) : pending
+                        ) : publication ? statusLabel(publication, schedule.timeZone) : pending
                           ? 'Starting publish request…'
                           : 'Request did not complete. Check the error below before trying again.'}
                       </span>
@@ -591,7 +620,7 @@ export function PublishPanel({
           onClick={() => startPublish(false, selected)}
         >
           {feedbackPending ? (feedbackScheduling || when === 'schedule' ? 'Scheduling in progress…' : 'Publishing in progress…')
-            : when === 'schedule' ? (scheduledDate && !timeProblem ? `Schedule for ${scheduleButtonTime(scheduledDate)}` : 'Schedule selected platforms')
+            : when === 'schedule' ? (scheduledDate && !timeProblem ? `Schedule for ${scheduleFormats.button.format(scheduledDate)} · ${zoneLabel}` : 'Schedule selected platforms')
               : selected.length > 0 ? `Publish to ${selected.length} ${selected.length === 1 ? 'platform' : 'platforms'}`
                 : 'Publish selected platforms'}
         </Button>

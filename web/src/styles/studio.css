@@ -578,7 +578,7 @@
   }
   .upcoming-post {
     display: grid;
-    grid-template-columns: 116px minmax(0, 1fr) auto;
+    grid-template-columns: 190px minmax(0, 1fr) auto;
     align-items: center;
     gap: 12px 22px;
     padding: 18px 22px;
@@ -601,6 +601,11 @@
   .upcoming-time span {
     color: var(--muted);
     font-size: 12px;
+  }
+  .upcoming-time small {
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.5;
   }
   .upcoming-post-main {
     display: grid;
@@ -2396,6 +2401,31 @@
     font-size: 11px;
     line-height: 1.4;
   }
+  .publish-slot small {
+    color: var(--muted);
+    font-size: 10px;
+    line-height: 1.5;
+    font-variant-numeric: tabular-nums;
+  }
+  .publish-schedule-label strong {
+    color: var(--text);
+    font-weight: 500;
+  }
+  .publish-local-equivalent,
+  .publish-scheduled-local {
+    margin-top: 8px;
+    color: var(--text);
+    font-size: 12px;
+    line-height: 1.6;
+    font-variant-numeric: tabular-nums;
+  }
+  .publish-local-equivalent span,
+  .publish-scheduled-local {
+    color: var(--muted);
+  }
+  .publish-actions > .button--primary {
+    white-space: normal;
+  }
   .publish-slot strong {
     font-size: 17px;
     font-weight: 550;
@@ -2858,7 +2888,7 @@
       line-height: 1.5;
     }
     .upcoming-post {
-      grid-template-columns: 86px minmax(0, 1fr);
+      grid-template-columns: 108px minmax(0, 1fr);
       gap: 12px 14px;
       padding: 17px 15px;
     }
@@ -2876,6 +2906,12 @@
     .upcoming-platform,
     .upcoming-post-note,
     .upcoming-time span {
+      font-size: 12px;
+    }
+    .upcoming-time small,
+    .publish-slot small,
+    .publish-local-equivalent,
+    .publish-scheduled-local {
       font-size: 12px;
     }
     .upcoming-short-link,

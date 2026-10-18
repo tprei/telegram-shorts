@@ -4,11 +4,66 @@ import { z } from 'zod';
 import { StudioError } from '../application/errors.js';
 import type { LayoutProfile } from '../domain/layout.js';
 import type { CreatorProfile, CreatorProfileManifest, CreatorPlatformPublishConfig, ShortVideoPlatform } from '../domain/model.js';
+import { SCHEDULE_LIMITS } from '../domain/schedule.js';
 import { loadLayoutProfile } from './layout.js';
+import { assertPublicYouTubeUrl } from './youtube.js';
 
 const PublishTargetSchema = z.strictObject({
   mode: z.enum(['global', 'disabled']),
 });
+
+const SLOT_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+function isValidTimeZone(timeZone: string): boolean {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone });
+    return true;
+  } catch (error) {
+    if (error instanceof RangeError) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+const PostingScheduleSchema = z.strictObject({
+  timeZone: z.string().min(1).refine(isValidTimeZone, { message: 'timeZone must be a valid IANA time zone' }),
+  slots: z
+    .array(z.string().regex(SLOT_PATTERN, 'slots must be HH:MM (00-23:00-59)'))
+    .min(1)
+    .max(6)
+    .refine((slots) => slots.every((slot, index) => {
+      if (index === 0) {
+        return true;
+      }
+      const previousMinutes = Number(slots[index - 1].slice(0, 2)) * 60 + Number(slots[index - 1].slice(3));
+      const minutes = Number(slot.slice(0, 2)) * 60 + Number(slot.slice(3));
+      return minutes - previousMinutes >= SCHEDULE_LIMITS.slotSpacingMinutes;
+    }), { message: 'slots must be unique, sorted ascending, and at least 120 minutes apart' }),
+});
+
+const CreatorAutopilotConfigSchema = z
+  .strictObject({
+    channelUrl: z.string().min(1).refine((url) => {
+      try {
+        assertPublicYouTubeUrl(url);
+        return true;
+      } catch {
+        return false;
+      }
+    }, { message: 'channelUrl must be a public YouTube URL' }),
+    shortsPerVideo: z.number().int().min(1).max(5),
+    platforms: z
+      .array(z.enum(['instagram', 'tiktok', 'youtube_shorts']))
+      .min(1)
+      .max(3)
+      .refine((platforms) => new Set(platforms).size === platforms.length, { message: 'platforms must not contain duplicates' }),
+    reviewWindowHours: z.number().min(1).max(24),
+    bookingHorizonHours: z.number().max(72),
+    maxShortAgeHours: z.number().min(6).max(168),
+    minVideoSeconds: z.number().min(60),
+  })
+  .refine((config) => config.bookingHorizonHours > config.reviewWindowHours, { message: 'bookingHorizonHours must be greater than reviewWindowHours' });
 
 const CreatorProfileSchema = z.strictObject({
   id: z.string().min(1),
@@ -24,6 +79,8 @@ const CreatorProfileSchema = z.strictObject({
     tiktok: PublishTargetSchema.optional(),
     youtube_shorts: PublishTargetSchema.optional(),
   }).optional(),
+  schedule: PostingScheduleSchema,
+  autopilot: CreatorAutopilotConfigSchema.optional(),
 });
 
 const CreatorProfileManifestSchema = z.strictObject({

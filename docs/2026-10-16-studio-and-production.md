@@ -710,6 +710,259 @@ Rule: if Mallary may still hold a scheduled post, the studio must never let the 
 8. Cancel 409: use Mallary's error message when the body has one; fall back to the "already publishing" text.
 9. `scheduledAtProblem` returns 'Pick a valid date and time.' for an invalid date.
 
+## Planner taste from published shorts (follow-up, 2026-10-18)
+
+Evidence: the operator published 8 planner shorts and edited every one before posting.
+- They extended 6 of 8 at the end, and none at the start; they dropped planner content in only 1. Published on-screen durations were 57, 72, 88, 92, 97, 99, 128, and 176 s (median about 95 s), against the planner's 35–60 s target.
+- They let passages run: 6 of 8 use 1–2 ranges. Two shorts kept the author's own closing question ("O que que você acha?") and his pointer to sources.
+- They rewrote all 8 hook bands. The final hooks are short, direct statements that name the actor or speak to the viewer: "Quem aposta na sexta não compra no sábado", "Seu voto vale por 2 netos: Quem tem 70+ decide a eleição", "Flávio não disse quanto o mínimo vai valer em 2027", "O mínimo é assinado por decreto", "Querem seu contrato individual, e isso tá nas entrelinhas". The rejected planner hooks were topic labels or questions ("Agro vs. MEI: quem sobrevive ao corte?", "Pronampe: reforço de R$ 750 mi dura 2 meses").
+- Filipe's official Instagram (@filipeboni, 25 cuts of the same long videos, 2026-10-11 to 16) gets 4–50k views per cut. The 80–111 s cuts do best. Top topics are effects on the viewer's money or rights, set as a Lula vs Flávio/Bolsonaro comparison ("Lula aprovou a regra da sua aposentadoria até 2030; Flávio só promete" 49.9k; "Bolsonaro mandou cortar 60% da Farmácia Popular; você só não perdeu porque ele perdeu" 37.9k). The weakest are campaign tactics and electoral arithmetic ("a tática da gamificação" 8.2k, "Prefeito não decide voto: a prova em 711 cidades" 4.2k) and niche business credit ("Pronampe... validade de iogurte" 4.5k).
+
+### Changes
+
+`src/domain/semantic.ts`
+- `SHORT_DURATION = { minSeconds: 30, idealMinSeconds: 60, idealMaxSeconds: 120, stretchMaxSeconds: 150, maxSeconds: 180 }`. `MAX_SHORT_SPANS` stays 4.
+
+`src/infra/openrouter.ts`: prompt constants (PT-BR, replace the existing text)
+- `HOOK_TEXT_RULE`: "hook_text: manchete da faixa no topo (ideal até 50 caracteres, máx. 70), em PT-BR. É uma afirmação direta, não um rótulo de assunto nem pergunta genérica: nomeie quem fez (Flávio, Lula, Bolsonaro, o governo) ou fale com o espectador (você, seu, sua) e traga um número concreto ou um contraste. Promete exatamente o que o short entrega. Exemplos do tom certo: \"Quem aposta na sexta não compra no sábado\"; \"Flávio não disse quanto o mínimo vai valer em 2027\"; \"O mínimo é assinado por decreto\"; \"Seu voto vale por 2 netos\". Exemplos do tom errado: \"Agro vs. MEI: quem sobrevive ao corte?\"; \"Pronampe: reforço de R$ 750 mi dura 2 meses\"."
+- `SHORT_BRIEF`: keep the first two sentences, then append: "Os shorts que mais circulam mostram o efeito no bolso ou nos direitos de quem assiste (salário, aposentadoria, remédio, emprego, imposto), de preferência comparando o que cada lado fez ou promete, com números; ou expõem uma contradição de um político com as próprias palavras ou números dele. Táticas de campanha, aritmética eleitoral, bastidor e crédito para nicho de empresas rendem menos: só entram se a consequência para o espectador estiver no próprio short."
+- `STORY_RULE` step (3) becomes: "(3) aterrissagem: a conclusão do próprio autor, que cumpre a promessa do gancho. Deixe o autor terminar o raciocínio: o erro mais comum é cortar antes da conclusão dele. Se o bloco seguinte ainda fecha o argumento (consequência, número final, comparação final), ele entra. A pergunta final do autor ao público (\"o que você acha?\") pode fechar o short quando vem logo depois da conclusão." Keep the final sentence about never ending on a transition, open list, "e aí", or a jump to another subject.
+- `CONCISION_RULE`: replace "e pedidos de engajamento" with "e pedidos de like, inscrição, membros ou link"; replace "o ideal é de 1 a 3" with "o ideal é 1 ou 2: prefira deixar um trecho correr a montar pedaços". Everything else stays.
+- `durationRule(speed)`: same structure with the new numbers. Replace the last sentence with: "Como a fala é acelerada, cabe mais argumento por segundo: use o espaço para o raciocínio completo e para a conclusão do autor, nunca para aquecimento."
+- Opportunity planner priority line (the "Priorize ..." sentence in `findOpportunities`): "Priorize, nesta ordem: efeito concreto no bolso ou nos direitos do espectador; comparação entre o que cada lado fez ou promete; contradição entre discurso e números do próprio político; mecanismo que explica um efeito; caso concreto que revela a tese maior."
+- Arc planner objective (`planCandidates`): "Objetivo: transformar as oportunidades em no máximo 5 shorts finais, prontos para publicar. Para cada um, escolha os blocos que entregam a promessa com o raciocínio completo e a conclusão do autor; corte só aquecimento, digressão e repetição."
+- Title line in `planCandidates`: "O título é uma manchete com sujeito e verbo que diz o argumento, no tom de \"Lula aprovou a regra da sua aposentadoria até 2030; Flávio só promete\"; não é só o assunto."
+- `suggestHooks`: replace its length/style sentence with the same style requirements as `HOOK_TEXT_RULE` (reuse the constant's examples; options ideally up to 50 characters, max 70). Keep the banned-words and "don't repeat the current hook" sentences.
+
+Schemas: `hook_text` JSON-schema `maxLength` stays 90 (the edit limit); the prompt asks for 70.
+
+### Tests
+- Update tests that pin the old duration bounds (20/90 s) to the new ones (30/180 s) as boundary cases: a 29 s candidate gets the below-minimum reason; a 181 s candidate gets the exceeds-maximum reason; a 175 s one passes the duration check.
+- No tests on prompt wording.
+
+### Verification
+- Replan `job_194579714e3c4fab` (MEMUaGN-Jn4) and compare it with the plan made before this change: on-screen durations, range counts, hook style, and whether each short ends on the author's conclusion.
+
+## Autopilot for Filipe Boni (follow-up, 2026-10-18)
+
+Goal: every new long video on Filipe's YouTube channel turns into scheduled posts without the operator, this week (the runoff is 2026-10-25). Operator decisions:
+- Review window: autopilot books each short at least 3 h ahead. It shows up in **Upcoming posts**, where the operator can watch, edit, or cancel it. If they do nothing, it posts.
+- Up to 3 posts per day, at 12:00, 19:00, and 21:00 São Paulo time. Each post goes to Instagram and TikTok at the same slot.
+- The best 2 shorts per video. Newer videos go first, and shorts that aren't booked within 48 h of the video being detected are dropped.
+- Both platforms go through Mallary scheduling.
+
+The operator is in Europe/London. The audience is in Brazil, so posting times are São Paulo time everywhere, including the manual **Schedule** suggestions. Today those use the browser's local time, which is a bug.
+
+Autopilot is its own bounded context. It drives the existing `StudioService` use cases (`createJob`, `retryJob`, `generatePublishCopy`, `exportShort`, `publish`) and reads records from the store. It never writes jobs, shorts, exports, or publications directly.
+
+### Contracts (written by the integration owner before the slices start)
+
+`src/domain/model.ts`:
+```ts
+export interface PostingSchedule { timeZone: string; slots: string[] }
+export interface CreatorAutopilotConfig {
+  channelUrl: string;
+  shortsPerVideo: number;
+  platforms: ShortVideoPlatform[];
+  reviewWindowHours: number;
+  bookingHorizonHours: number;
+  maxShortAgeHours: number;
+  minVideoSeconds: number;
+}
+export interface CreatorProfile { /* existing fields */ schedule: PostingSchedule; autopilot?: CreatorAutopilotConfig }
+export type AutopilotVideoStatus = 'baseline' | 'tracked';
+export interface AutopilotVideoRecord {
+  creatorId: string;
+  videoId: string;
+  title: string | null;
+  status: AutopilotVideoStatus;
+  jobId: string | null;
+  detectedAt: string;
+  retries: number;
+  lastRetryAt: string | null;
+}
+export type AutopilotShortState = 'waiting' | 'exporting' | 'ready' | 'booked' | 'skipped' | 'expired';
+```
+`src/studio/api-types.ts`:
+- `ShortDetailDto.job.schedule: PostingSchedule`.
+- `ScheduledPostDto.timeZone: string`, taken from the job's creator snapshot.
+- `AutopilotShortDto`, `AutopilotVideoDto`, `AutopilotStatusDto`, `SetAutopilotRequestSchema`, `AutopilotApi`, and `MEDIA`-style routes. See the file for exact shapes.
+
+### Creator profiles (`profiles/creator-profiles.json`, `src/infra/creator-profile-loader.ts`)
+- Every creator requires `schedule`. `timeZone` must be a valid IANA zone (refine with `new Intl.DateTimeFormat('en-US', { timeZone })`, where a `RangeError` means invalid). `slots` holds 1–6 unique `HH:MM` strings (00–23:00–59), sorted ascending.
+- `autopilot` is optional; its zod schema matches `CreatorAutopilotConfig`:
+  - `channelUrl` must pass `assertPublicYouTubeUrl`;
+  - `shortsPerVideo` is an int from 1 to 5;
+  - `platforms` holds 1–3 unique values;
+  - `reviewWindowHours` is 1–24;
+  - `bookingHorizonHours` is greater than `reviewWindowHours` and at most 72;
+  - `maxShortAgeHours` is 6–168;
+  - `minVideoSeconds` is at least 60.
+- Both creators get `"schedule": { "timeZone": "America/Sao_Paulo", "slots": ["12:00", "19:00", "21:00"] }`.
+- `filipe_boni` gets `"autopilot": { "channelUrl": "https://www.youtube.com/@filipe_boni/videos", "shortsPerVideo": 2, "platforms": ["instagram", "tiktok"], "reviewWindowHours": 3, "bookingHorizonHours": 24, "maxShortAgeHours": 48, "minVideoSeconds": 480 }`.
+- Store schema v7 (`SCHEMA_VERSION = 7`):
+  - For `userVersion >= 2 && userVersion <= 6`: `UPDATE jobs SET payload_json = json_set(payload_json, '$.creatorProfileSnapshot.schedule', json('{"timeZone":"America/Sao_Paulo","slots":["12:00","19:00","21:00"]}'))`. Both existing creators are Brazilian.
+  - Add a table: `CREATE TABLE IF NOT EXISTS autopilot_videos (creator_id TEXT NOT NULL, video_id TEXT NOT NULL, status TEXT NOT NULL, detected_at TEXT NOT NULL, payload_json TEXT NOT NULL, PRIMARY KEY (creator_id, video_id))`.
+  - Store methods: `listAutopilotVideos(creatorId: string): AutopilotVideoRecord[]` (newest `detectedAt` first), `getAutopilotVideo(creatorId, videoId): AutopilotVideoRecord | null`, `saveAutopilotVideo(record): void` (upsert).
+  - The payload is parsed with a zod schema at read time, matching the other tables.
+
+### Posting times (`src/domain/schedule.ts`)
+- Remove `POSTING_SLOTS`.
+- `zonedTimeToUtc(input: { year: number; month: number; day: number; hour: number; minute: number; timeZone: string }): Date` (month is 1–12). Use `Intl.DateTimeFormat(..., { timeZone, hourCycle: 'h23', year/month/day/hour/minute/second: numeric }).formatToParts` to read the zone's offset at the guessed instant, then correct once. It must be right across DST changes (test with `Europe/London`).
+- `zonedDateParts(date: Date, timeZone: string): { year; month; day; hour; minute }`.
+- `freePostingSlots(input: { schedule: PostingSchedule; from: Date; to: Date; taken: readonly Date[] }): Date[]` returns every slot instant `t` with `from <= t <= to`, ascending. It walks calendar days in the schedule's zone starting from `from`'s zone date and skips any `t` within `SCHEDULE_LIMITS.slotSpacingMinutes` of a taken instant.
+- `suggestPostingSlots(input: { now: Date; taken: readonly Date[]; count: number; schedule: PostingSchedule }): Date[]` returns the first `count` of `freePostingSlots({ from: now + minLeadMinutes, to: now + maxLeadDays, ... })`.
+- `formatSlotTime` helpers stay in the web; no change there beyond the UI work below.
+
+### Domain rules (`src/domain/autopilot.ts`, pure, no Node imports)
+- `AUTOPILOT_POLL_INTERVAL_MS = 15 * 60_000`, `AUTOPILOT_TICK_MS = 60_000`, `AUTOPILOT_MAX_JOB_RETRIES = 2`, `AUTOPILOT_RETRY_DELAY_MS = 30 * 60_000`, `AUTOPILOT_LIVE_STATUSES_TO_SKIP = { is_upcoming: true, is_live: true }` (`Record<string, true>`).
+- `isAutopilotEligibleUpload(upload: { durationSeconds: number | null; liveStatus: string | null }, config): boolean` is true when the duration is a number `>= minVideoSeconds` and the live status is not in the skip table.
+- `autopilotShortPlan(input: { video: AutopilotVideoRecord; job: JobRecord; shorts: ShortRecord[]; exports: ExportRecord[]; publications: PublicationRecord[]; config: CreatorAutopilotConfig; now: Date; hasHostPanel: boolean }): AutopilotShortPlan[]` with `interface AutopilotShortPlan { short: ShortRecord; state: AutopilotShortState; reason: string | null; readyExportId: string | null; needsCopy: boolean; needsExport: boolean }`. The rules, in order:
+  1. Candidates are the shorts with `origin === 'planner'` and `status === 'active'`, ordered by `rank` ascending. If `job.status !== 'ready'`, return `[]`.
+  2. A candidate is used if any publication exists for it, whatever its status. A used short whose publications are all `cancelled` gets state `skipped`, reason "Cancelled in the studio". Any other used short gets `booked` with `scheduledFor`: the earliest non-cancelled `publicationStartedAt`.
+  3. A non-used candidate is ineligible in these cases, with these reasons:
+     - `risk === 'high'`: "High risk: review it yourself".
+     - `cropAnalysis === 'failed'`: "Crop analysis failed".
+     - Its newest export that matches the current edit (same `editRevision`, `title`, `job.transcriptRevision`, and JSON-equal `hostFraming`) has status `failed`: "Export failed".
+  4. Selection is all used candidates plus the first `max(0, shortsPerVideo - used.length)` eligible non-used candidates, in rank order. Ineligible candidates that ranked above the last selected one are returned too, with state `skipped`. Unselected eligible candidates are not returned.
+  5. For each selected non-used candidate:
+     - `expired` when `now > video.detectedAt + maxShortAgeHours`.
+     - Otherwise `waiting` when `cropAnalysis` is `queued` or `running`, or when `hasHostPanel && job.hostFramingAnalyzedAt === null`.
+     - Otherwise, when `publishCopy === null` or there's no current export with status `ready`, `exporting`. Set `needsCopy = publishCopy === null` and `needsExport` = no current export in `queued | rendering | ready`.
+     - Otherwise `ready`, with `readyExportId` set.
+- Export currency must match `StudioService`'s `exportIsCurrent`. Move that predicate into the domain as `exportMatchesShort(record: ExportRecord, short: ShortRecord, job: JobRecord): boolean` in `src/domain/autopilot.ts` and use it from `studio-service.ts`, so there's one definition.
+- `orderReadyShorts(entries: Array<{ video: AutopilotVideoRecord; plan: AutopilotShortPlan }>)`: newest `video.detectedAt` first, then `rank` ascending.
+
+### YouTube listing (`src/infra/youtube.ts`)
+- `listChannelUploads(channelUrl: string, limit: number, options: YtDlpAuthOptions): Promise<ChannelUpload[]>`:
+  - Runs `runProcess('yt-dlp', ['--flat-playlist', '--playlist-end', String(limit), '-J', ...auth args, channelUrl], { capture: true })`, where the auth args are the same cookie and JS-runtime args `buildYtDlpArgs` uses (extract a shared helper).
+  - Parse stdout with zod: `{ entries: Array<{ id: string; title?: string | null; duration?: number | null; live_status?: string | null }> }`.
+  - Return `interface ChannelUpload { videoId: string; title: string | null; durationSeconds: number | null; liveStatus: string | null }` in listing order (newest first).
+- `youTubeVideoId(url: string): string | null` handles `watch?v=`, `youtu.be/<id>`, `/shorts/<id>`, `/live/<id>`, and `/embed/<id>`. Ids are 11 chars of `[A-Za-z0-9_-]`.
+
+### Application (`src/application/autopilot.ts`)
+`class Autopilot implements AutopilotApi`, with deps `{ store: ShortsStore; service: StudioService; profiles: CreatorProfileRepository; listUploads: (channelUrl: string, limit: number) => Promise<ChannelUpload[]>; now: () => Date }`.
+- State per creator lives in setting `autopilot:<creatorId>`: JSON `{ enabled: boolean; lastCheckedAt: string | null; lastCheckError: string | null; checkRequested: boolean }`, parsed with zod. A missing setting means `{ enabled: false, lastCheckedAt: null, lastCheckError: null, checkRequested: false }`.
+- In-memory `Map<shortId, string>` keeps the last action error per short (copy, export, or publish). Clear it when that action next succeeds.
+- `tick()`: for each enabled creator profile with `autopilot` and the enabled setting, run these steps. Catch errors per step and per item, `logError` them, and record them; one failure never stops the rest.
+  1. **Check:** run when `checkRequested`, when `lastCheckedAt` is null, or when it's older than `AUTOPILOT_POLL_INTERVAL_MS`. Call `listUploads(channelUrl, 15)`. On error, set `lastCheckError` and `lastCheckedAt`. On success:
+     - Clear the error.
+     - If the creator has no `autopilot_videos` rows yet, save every listed upload as `baseline` (title set, `jobId: null`) and stop step 1.
+     - Otherwise, for each eligible upload not in the table:
+       - If a job already exists for that video id (`store.listJobs()` plus `youTubeVideoId(job.sourceUrl)`), link it.
+       - Otherwise call `service.createJob({ url: \`https://www.youtube.com/watch?v=${id}\`, creatorId })`.
+       - Save it as `tracked` with `detectedAt = now`.
+     - Ineligible uploads are not saved, so a premiere is reconsidered once it becomes a normal video.
+     - Set `checkRequested = false`.
+  2. **Retry:** for each tracked video whose job is `failed`: if `retries < AUTOPILOT_MAX_JOB_RETRIES` and `now - (lastRetryAt ?? detectedAt) >= AUTOPILOT_RETRY_DELAY_MS`, call `service.retryJob(jobId)` and save `retries + 1` and `lastRetryAt`.
+  3. **Prepare:** for tracked videos with `detectedAt` within the last `maxShortAgeHours`, compute `autopilotShortPlan`.
+     - For `exporting` entries, `await service.generatePublishCopy(shortId)` if `needsCopy`, then `await service.exportShort(shortId)` if `needsExport`.
+     - Copy comes first so a copy failure doesn't block the export: run both and record each error separately.
+  4. **Book:**
+     - `taken` holds `publicationStartedAt` for this creator's publications (by job `creatorProfileId`) with a status other than `failed` or `cancelled` and a start time `>= now - slotSpacingMinutes`.
+     - `free = freePostingSlots({ schedule: profile.schedule, from: now + reviewWindowHours, to: now + bookingHorizonHours, taken })`.
+     - Pair `orderReadyShorts(ready entries)` with `free` one to one.
+     - For each pair, the platforms are `config.platforms` filtered to entries of `platformAvailability(...)` with `available && canSchedule`. With none, record "No schedulable platform" and skip.
+     - Call `service.publish(readyExportId, { platforms, force: false, scheduledAt: slot.toISOString() })`.
+     - On a `StudioError`, record the message and continue.
+- `list(): Promise<AutopilotStatusDto[]>` covers creators whose profile has `autopilot`. `videos` holds the newest 8 tracked videos, each with its plan entries mapped to `AutopilotShortDto` (`reason` = plan reason ?? in-memory error).
+- `setEnabled(creatorId, { enabled })` returns the DTO. A creator without `autopilot` config is `StudioError('invalid')`. Enabling never processes old uploads, because the first check baselines them. Disabling stops checks and bookings; posts already booked stay in Upcoming posts.
+- `checkNow(creatorId)` sets `checkRequested` and returns the DTO; the next tick does the check.
+
+### Wiring
+- `src/index.ts`:
+  - Construct `Autopilot` after the service.
+  - Pass `autopilot` to `createStudioApp`.
+  - Run `runAutopilot(autopilot)` alongside the lanes: `while (true) { try { await autopilot.tick() } catch (error) { logError('Autopilot tick crashed', error) } await sleep(AUTOPILOT_TICK_MS) }`. The first tick runs immediately.
+- `src/studio/server.ts`:
+  - `GET /api/autopilot` → `autopilot.list()`.
+  - `PUT /api/autopilot/:creatorId` → `SetAutopilotRequestSchema` → `setEnabled`.
+  - `POST /api/autopilot/:creatorId/check` → `checkNow`.
+  - `createStudioApp` takes `autopilot: AutopilotApi`.
+- `StudioService`: `ShortDetailDto.job.schedule` comes from `job.creatorProfileSnapshot.schedule`, and `ScheduledPostDto.timeZone` likewise.
+- `createInitialEdit` turns the end card on (`endCard: { enabled: true }`). The operator turned it on for all 8 published shorts.
+
+### Web
+- Inbox gets an **Autopilot** card per configured creator:
+  - an On/Off switch, with a confirmation when turning it on that explains the 3 h review window;
+  - the last check time or error, and a **Check now** button;
+  - the slots and time zone, and the latest tracked videos with each selected short's state, booked time, and reason;
+  - links to the editor.
+- Times are shown in São Paulo time and labelled as such, with the operator's local time secondary where it helps.
+- **Upcoming posts** formats each post in its `timeZone`.
+- **Schedule** in the publish panel:
+  - Suggestions come from `suggestPostingSlots({ ..., schedule: detail.job.schedule })`.
+  - The custom date/time input is São Paulo wall time, converted with `zonedTimeToUtc`.
+  - The labels name the zone.
+
+- The Autopilot switch uses an inline confirmation before enabling. It explains planning, export, automatic booking, and cancellation in Upcoming posts; disabling takes effect without a second confirmation. Pending creator mutations disable controls, while a requested channel check has its own “Checking…” state.
+- Selected shorts show Waiting, Exporting, Ready to schedule, Scheduled, Skipped, or Expired, with the supplied reason and an editor link. Scheduled shorts and Upcoming posts show the audience-zone date/time first, then the operator’s local date/time. Both dates are included when a posting crosses midnight.
+- Autopilot’s recurring-slot London equivalents are labelled “today”; dated suggestions, custom-time previews, and upcoming bookings convert the exact instant, including London’s daylight-saving change. The custom field and its min/max bounds use the creator’s schedule zone, never the browser’s zone.
+
+### Tests
+- `schedule`:
+  - 12:00 São Paulo is 15:00Z.
+  - London slots are correct on both sides of the 2026-10-25 DST change.
+  - `freePostingSlots` respects the bounds and the spacing.
+  - Suggestions skip taken slots.
+- `autopilot` domain:
+  - rejected, high-risk, crop-failed, and export-failed shorts are skipped, and the next rank replaces them;
+  - any publication counts toward the 2;
+  - all-cancelled shows as skipped and isn't replaced;
+  - expiry;
+  - `waiting` while crops or host framing are pending;
+  - `needsCopy`/`needsExport` flags;
+  - newest-first ordering.
+- `Autopilot.tick`, using the real `StudioService` test context with a fake `listUploads` and a stub publisher:
+  - The first check baselines without creating jobs.
+  - A new long upload creates exactly one job; a second tick doesn't create another.
+  - An upload whose video already has a job links it.
+  - Short and upcoming uploads are ignored.
+  - A disabled creator never calls `listUploads`.
+  - Two ready shorts with free slots book 2 publications per platform at the first two free slots at or after now + 3 h, with `scheduledAt` set. A second tick books nothing new.
+  - With one free slot and two videos, the newer video's rank-1 short gets it.
+  - A failed job is retried after 30 min, at most twice.
+- `youtube`: parse a flat-playlist JSON fixture; `youTubeVideoId` cases.
+- Store: a v6 database migrates to v7 with `schedule` on job snapshots.
+
+### Verification
+- Turn autopilot on for `filipe_boni`. The first check baselines the channel.
+- Delete one unprocessed upload's baseline row, then press **Check now**. A job is created, planned, two shorts are exported, and both are booked in São Paulo slots at least 3 h ahead. Both appear in Mallary as `delayed`.
+- Leave them booked for the operator to review, or cancel them if the operator prefers.
+
+### Hardening (after adversarial review)
+
+The proofs are in `/tmp/apx/scratch.test.ts` (RACE, REJECT, WINDOW, CAP, COST, HAMMER, TZ). Turn the consumer-visible ones into permanent tests.
+
+Rules that replace earlier text:
+1. **State race.** `Autopilot` never writes a state object it read before an `await`. Use `updateState(creatorId, patch)`: it re-reads the setting synchronously, merges only the patch fields, and writes. A check writes only `lastCheckedAt`, `lastCheckError`, and `checkRequested`. `tickCreator` re-reads `enabled` before the prepare step and again before each booking, and stops when it's off.
+2. **Rejecting stops posts.**
+   - `StudioService.setShortStatus(shortId, 'rejected')` first cancels every publication of that short whose status is `scheduled`, `queued`, or `deferred` and whose `scheduledFor` is non-null, through the existing cancel path. If any cancel throws, the reject fails with that error and the status is unchanged.
+   - Immediate posts already sent aren't touched.
+   - In `autopilotShortPlan`, candidates are planner shorts of any status. A short with any publication counts as used toward `shortsPerVideo`, whether it's active or rejected. Only non-used candidates must be `active` to be eligible.
+3. **Booking outcome.** For a used short:
+   - `booked` when any publication is in-flight (`queued`, `publishing`, `submitted`, `scheduled`, `deferred`), `published`, or `unconfirmed`. `scheduledFor` is the earliest start among those.
+   - Otherwise `skipped`. The reason is "Cancelled in the studio" if any publication is `cancelled`, else "Posting failed: {first error}".
+   - It is never rebooked.
+4. **Only new uploads.** A check walks the listing from the top and stops at the first id already in `autopilot_videos`; only uploads above it can become tracked. If none of the listed ids is known (and the table isn't empty), record `lastCheckError` "Couldn't find known videos in the channel listing" and track nothing. The first check (empty table) saves only eligible uploads as `baseline`; ineligible ones (premieres, lives, short videos) are left out, so they're reconsidered later under this same rule.
+5. **Daily cap.** `freePostingSlots` takes `taken` as post start instants, one per short (the caller dedupes IG and TikTok of the same short). A slot is free only if:
+   - it passes the 120-minute spacing against taken instants and against slots already returned, and
+   - the count of taken instants plus returned slots on that slot's calendar day in `schedule.timeZone` is below `schedule.slots.length`.
+6. **Manual spacing on the server.** `StudioService.publish` with `scheduledAt` rejects with `StudioError('conflict')` "Another post is scheduled for {HH:MM} ({city} time). Pick a time at least 2 h away." when an in-flight publication of a different short of the same creator starts within `slotSpacingMinutes`. `{HH:MM}` is in the job's schedule zone, and `{city}` is the zone's last path segment with `_` replaced by a space (e.g. `America/Sao_Paulo` → "Sao Paulo"). Immediate posts are unchanged.
+7. **Backoff on failed actions.** Autopilot keeps in memory, per short and per action (`copy`, `export`, `publish`), a failure count and a `nextAttemptAt`. After a failure, it waits 10 min; after 3 failures, it stops. The plan entry then shows `skipped` with reason "Gave up after 3 failures: {last error}". A success clears it. A `retryJob` that throws still counts as a retry (`retries + 1`, `lastRetryAt`).
+8. **Failed checks.** A check error clears `checkRequested`. The next check waits for the normal interval.
+9. **Timeouts.**
+   - `runProcess` gains an optional `timeoutMs`. On timeout it kills the child (`SIGKILL`) and rejects with `Error("{command} timed out after {s}s")`.
+   - Use it in `listChannelUploads` (120 s), every ffmpeg/ffprobe call in `src/infra/render.ts` (30 min), and `downloadSource` (60 min).
+   - OpenRouter requests get `signal: AbortSignal.timeout(20 * 60_000)`. A timeout is not a transient network error, so it isn't retried.
+10. **Taken times.** Use `scheduledFor ?? submittedAt ?? availableAt ?? createdAt` for every non-`failed`/`cancelled` publication of the creator whose start is `>= now - slotSpacingMinutes`.
+11. **Linking respects the creator.** Only jobs with `creatorProfileId === creatorId` are linked.
+12. **Time zones.** `zonedTimeToUtc` runs a second correction pass, so New York 2026-11-01 03:00 → 08:00Z and Sydney 2026-10-03 21:00 → 11:00Z.
+13. **Profile validation.** The loader rejects schedules whose consecutive slots are less than 120 minutes apart.
+14. **Edits after booking.** The posted render is the export that was booked. To post an edit, the operator cancels the booked post and schedules the new export from the editor. The Autopilot card says this under booked shorts.
+
+Deliberately left out: deduping manual `createJob` by video id. The operator re-adds videos on purpose to compare plans, and rule 6 stops same-time collisions.
+
 ## Verification
 
 1. `pnpm typecheck` and `pnpm test` pass with zero errors.
@@ -721,7 +974,6 @@ Rule: if Mallary may still hold a scheduled post, the studio must never let the 
 
 ## Non-goals
 
-- Channel ingestion (auto-processing every new Filipe video) comes after this lands.
 - Auth, remote access, multi-user.
 - Background music, B-roll, face tracking.
 - Migrating old Telegram-era databases (none exist locally); old DBs fail loudly via `user_version`.
