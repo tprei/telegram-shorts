@@ -3,7 +3,7 @@ import { logError, describeError } from './util.js';
 import { BufferClient } from './buffer.js';
 import { MallaryClient, MallaryUploadClient } from './mallary.js';
 import { createPublicAssetHost } from './public-asset-host.js';
-import type { ShortVideoPlatform } from '../domain/model.js';
+import type { PublishingAccount, ShortVideoPlatform } from '../domain/model.js';
 import type { ShortVideoCheckPublicationInput, ShortVideoPublishInput, ShortVideoPublishProvider, ShortVideoPublishResult, RemotePublicationState } from './instagram-publisher.js';
 import { ShortVideoPublishError } from './instagram-publisher.js';
 
@@ -15,7 +15,7 @@ export function createShortVideoPublishProvider(config: AppConfig): ShortVideoPu
 
   for (const providerName of order) {
     if (providerName === 'mallary' && config.MALLARY_AI_API_TOKEN && mallaryUploads) {
-      providers.push(new MallaryClient(config.MALLARY_AI_API_TOKEN, config.MALLARY_PROFILE_ID, mallaryUploads));
+      providers.push(new MallaryClient(config.MALLARY_AI_API_TOKEN, mallaryUploads));
       continue;
     }
     if (providerName === 'buffer' && config.BUFFER_API_KEY && publicAssetHost) {
@@ -60,9 +60,35 @@ export class FallbackShortVideoPublishProvider implements ShortVideoPublishProvi
   supports(platform: ShortVideoPlatform): boolean {
     return this.providers.some((provider) => provider.supports(platform));
   }
+  canPublish(input: { account: PublishingAccount; platform: ShortVideoPlatform; scheduled: boolean }): boolean {
+    if (input.account.mallaryProfileId === null || !input.account.platforms.includes(input.platform)) {
+      return false;
+    }
+    const eligibleProviders = this.orderedProvidersForPlatform(input.platform, input.account);
+    if (input.scheduled) {
+      return eligibleProviders.some((provider) => provider.supportsScheduling && provider.canPublish(input));
+    }
+    return eligibleProviders.some((provider) => provider.canPublish(input));
+  }
 
   async publishShortVideo(input: ShortVideoPublishInput): Promise<ShortVideoPublishResult> {
-    let eligibleProviders = this.orderedProvidersForPlatform(input.platform);
+    if (input.account.mallaryProfileId === null) {
+      throw new ShortVideoPublishError({
+        provider: this.name,
+        stage: 'configuration',
+        message: 'Account not connected in Mallary',
+        safeToFailover: false,
+      });
+    }
+    if (!input.account.platforms.includes(input.platform)) {
+      throw new ShortVideoPublishError({
+        provider: this.name,
+        stage: 'configuration',
+        message: `Publishing to ${input.platform} is disabled for ${input.account.displayName}.`,
+        safeToFailover: false,
+      });
+    }
+    let eligibleProviders = this.orderedProvidersForPlatform(input.platform, input.account);
     if (input.scheduledAt !== null) {
       eligibleProviders = eligibleProviders.filter((provider) => provider.supportsScheduling);
       if (eligibleProviders.length === 0) {
@@ -77,7 +103,7 @@ export class FallbackShortVideoPublishProvider implements ShortVideoPublishProvi
       try {
         return await provider.publishShortVideo(input);
       } catch (error) {
-        failures.push(`${provider.name}: ${describeError(error)}`);
+        failures.push(`${provider.name}: ${error instanceof ShortVideoPublishError ? error.message : describeError(error)}`);
         const safeToFailover = error instanceof ShortVideoPublishError && error.safeToFailover;
         if (!safeToFailover) {
           throw error;
@@ -114,10 +140,21 @@ export class FallbackShortVideoPublishProvider implements ShortVideoPublishProvi
     await provider.cancelScheduled(input);
   }
 
-  private orderedProvidersForPlatform(platform: ShortVideoPlatform): ShortVideoPublishProvider[] {
+  private orderedProvidersForPlatform(platform: ShortVideoPlatform, account: PublishingAccount): ShortVideoPublishProvider[] {
     const preferred = this.providerOrderByPlatform[platform] ?? ['mallary', 'buffer'];
     return this.providers
-      .filter((provider) => provider.supports(platform))
+      .filter((provider) => {
+        if (!provider.supports(platform)) {
+          return false;
+        }
+        if (provider.name === 'buffer' && !account.buffer) {
+          return false;
+        }
+        if (provider.name === 'mallary' && account.mallaryProfileId === null) {
+          return false;
+        }
+        return provider.canPublish({ account, platform, scheduled: false });
+      })
       .sort((left, right) => preferred.indexOf(left.name as 'mallary' | 'buffer') - preferred.indexOf(right.name as 'mallary' | 'buffer'));
   }
 }

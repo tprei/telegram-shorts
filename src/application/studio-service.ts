@@ -1,12 +1,49 @@
 import { existsSync } from 'node:fs';
 import { rename, rm } from 'node:fs/promises';
 import { basename, join } from 'node:path';
-import { addRange, createInitialEdit, extendEndBySeconds, extendStartBySeconds, keptText, keptWordIndices, normalizeEdit, setWordsRemoved, trimEndBySeconds, trimStartBySeconds, type ShortEdit, type WordRange } from '../domain/edit.js';
+import {
+  addRange,
+  createInitialEdit,
+  extendEndBySeconds,
+  extendStartBySeconds,
+  keptText,
+  keptWordIndices,
+  normalizeEdit,
+  normalizeSceneEdit,
+  setWordsRemoved,
+  trimEndBySeconds,
+  trimStartBySeconds,
+  type ShortEdit,
+  type WordRange,
+} from '../domain/edit.js';
 import { exportMatchesShort } from '../domain/autopilot.js';
-import { outputDurationSeconds } from '../domain/timeline.js';
+import { computeSourceClips, outputDurationSeconds } from '../domain/timeline.js';
 import { sentenceText } from '../domain/policies.js';
-import { IN_FLIGHT_PUBLICATION_STATUSES, POSTED_OR_UNKNOWN_PUBLICATION_STATUSES, type ExportRecord, type JobRecord, type JobSummaryRecord, type PublicationRecord, type ShortRecord, type ShortVideoPlatform, type SourceMedia } from '../domain/model.js';
-import { scheduledAtProblem, SCHEDULE_LIMITS } from '../domain/schedule.js';
+import {
+  IN_FLIGHT_PUBLICATION_STATUSES,
+  POSTED_OR_UNKNOWN_PUBLICATION_STATUSES,
+  type CreatorProfileManifest,
+  type ExportRecord,
+  type JobRecord,
+  type JobSummaryRecord,
+  type PublicationRecord,
+  type PublishingAccount,
+  type SceneAnalysisStatus,
+  type SceneTrack,
+  type ShortRecord,
+  type ShortVideoPlatform,
+  type SourceMedia,
+} from '../domain/model.js';
+import { contentPanelOf, hostPanelOf } from '../domain/layout.js';
+import { documentCropSpans, freezeSceneTrack } from '../domain/scene.js';
+import {
+  accountSlotProblem,
+  accountTakenSlots,
+  SCHEDULE_LIMITS,
+  scheduledAtProblem,
+  zonedDateParts,
+  zonedTimeToUtc,
+} from '../domain/schedule.js';
 import type { RevisionIntent } from '../domain/model.js';
 import {
   MEDIA_ROUTES,
@@ -22,10 +59,12 @@ import {
   type JobSummaryDto,
   type PlatformAvailabilityDto,
   type PublicationDto,
+  type PublishingAccountDto,
   type PublishRequest,
   type ReviseRequest,
   type ReviseResultDto,
   type SaveEditRequest,
+  type SceneAnalysisDto,
   type SetDefaultCreatorRequest,
   type SetShortStatusRequest,
   type ShortDetailDto,
@@ -39,8 +78,12 @@ import {
 } from '../studio/api-types.js';
 import { StudioError } from './errors.js';
 import type { StudioMediaResolver } from './studio-media.js';
-import { activeMallaryCooldownUntil, platformAvailability, platformAvailabilityFromSnapshot, platformLabel } from './platforms.js';
-import type { CreatorProfileRepository } from '../infra/creator-profile-loader.js';
+import {
+  activeMallaryCooldownUntil,
+  availabilityForPublishingProfile,
+  platformLabel,
+} from './platforms.js';
+import { pickPublishingProfile, type CreatorProfileRepository } from '../infra/creator-profile-loader.js';
 import type { AppConfig } from '../infra/env.js';
 import { ShortsStore } from '../infra/db.js';
 import { extractFrame } from '../infra/render.js';
@@ -69,7 +112,12 @@ export class StudioService implements StudioApi, StudioMediaResolver {
       this.deps.profiles.getEnabledCreatorProfiles(),
       this.deps.profiles.resolveCreatorProfile({ studioDefaultId: this.studioDefaultCreatorId() }),
     ]);
-    return creators.map((creator) => ({ id: creator.id, displayName: creator.displayName, isDefault: creator.id === resolved.profile.id }));
+    return creators.map((creator) => ({
+      id: creator.id,
+      displayName: creator.displayName,
+      isDefault: creator.id === resolved.profile.id,
+      accountId: creator.accountId,
+    }));
   }
 
   async setDefaultCreator(request: SetDefaultCreatorRequest): Promise<CreatorDto[]> {
@@ -114,6 +162,9 @@ export class StudioService implements StudioApi, StudioMediaResolver {
       chosenSpeakerId: null,
       hostFraming: null,
       hostFramingAnalyzedAt: null,
+      sceneTrack: null,
+      sceneAnalysis: 'none',
+      sceneAnalysisError: null,
       failedTaskKind: null,
       error: null,
       createdAt: nowIso(),
@@ -236,7 +287,11 @@ export class StudioService implements StudioApi, StudioMediaResolver {
     if (job.status !== 'ready') {
       throw new StudioError('conflict', 'Job must be ready to analyze host framing.');
     }
-    if (!job.layoutProfileSnapshot.panels.some((panel) => panel.role === 'host')) {
+    if (job.layoutProfileSnapshot.strategy === 'scenes') {
+      throw new StudioError('invalid', 'Scenes layouts do not use host panel framing.');
+    }
+    const hostPanel = hostPanelOf(job.layoutProfileSnapshot);
+    if (!hostPanel) {
       throw new StudioError('invalid', 'This layout has no host panel to analyze.');
     }
     job.hostFramingAnalyzedAt = null;
@@ -246,7 +301,29 @@ export class StudioService implements StudioApi, StudioMediaResolver {
     return this.getJob(job.id);
   }
 
-  createManualShort(jobId: string, request: CreateManualShortRequest): ShortDetailDto {
+  analyzeScenes(jobId: string): JobDetailDto {
+    const job = this.requireJob(jobId);
+    if (job.status !== 'ready') {
+      throw new StudioError('conflict', 'Job must be ready to analyze scenes.');
+    }
+    if (!job.media) {
+      throw new StudioError('conflict', 'Job has no media to analyze.');
+    }
+    if (job.layoutProfileSnapshot.strategy !== 'scenes') {
+      throw new StudioError('invalid', 'This layout does not use scene analysis.');
+    }
+    if (job.sceneAnalysis === 'queued' || job.sceneAnalysis === 'running') {
+      return this.getJob(job.id);
+    }
+    job.sceneAnalysis = 'queued';
+    job.sceneAnalysisError = null;
+    job.updatedAt = nowIso();
+    this.deps.store.updateJob(job);
+    this.deps.store.enqueueTask(job.id, 'analyze_scenes', {});
+    return this.getJob(job.id);
+  }
+
+  async createManualShort(jobId: string, request: CreateManualShortRequest): Promise<ShortDetailDto> {
     const job = this.requireJob(jobId);
     if (job.status !== 'ready') {
       throw new StudioError('conflict', 'Job must be ready before adding shorts.');
@@ -255,8 +332,11 @@ export class StudioService implements StudioApi, StudioMediaResolver {
     if (words.length === 0 || request.range.endWord >= words.length) {
       throw new StudioError('invalid', 'Range is outside the transcript.');
     }
+    const media = this.requireMedia(job);
     const layout = job.layoutProfileSnapshot;
-    const edit = createInitialEdit({ ranges: [request.range], words, speed: layout.defaultSpeed, hookText: '' });
+    const speed = job.creatorProfileSnapshot.render.defaultSpeed;
+    let edit = createInitialEdit({ ranges: [request.range], words, speed, hookText: '' });
+    edit = normalizeSceneEdit(edit, layout, job.sceneTrack);
     const kept = keptWordIndices(edit, words.length);
     const titleIndices = kept.length > 0
       ? kept
@@ -264,7 +344,24 @@ export class StudioService implements StudioApi, StudioMediaResolver {
     const title = request.title ?? `${titleIndices.slice(0, 8).map((index) => words[index].text).join(' ')}…`;
     const existing = this.deps.store.listShortsForJob(job.id);
     const rank = existing.reduce((max, short) => Math.max(max, short.rank), 0) + 1;
-    const hasContentPanel = layout.panels.some((panel) => panel.role === 'content');
+    let shouldEnqueueCrops = false;
+    let initialCropStatus: 'none' | 'queued' = 'none';
+    if (layout.strategy === 'scenes') {
+      if (job.sceneAnalysis === 'done' && job.sceneTrack) {
+        const clips = computeSourceClips(edit, words, media.durationSeconds);
+        const spans = documentCropSpans({ clips, words, segments: job.sceneTrack.segments });
+        if (spans.length > 0) {
+          shouldEnqueueCrops = true;
+          initialCropStatus = 'queued';
+        }
+      }
+    } else {
+      const contentPanel = contentPanelOf(layout);
+      if (contentPanel) {
+        shouldEnqueueCrops = true;
+        initialCropStatus = 'queued';
+      }
+    }
     const short: ShortRecord = {
       id: createId('short'),
       jobId: job.id,
@@ -280,17 +377,17 @@ export class StudioService implements StudioApi, StudioMediaResolver {
       status: 'active',
       edit,
       editRevision: 1,
-      cropAnalysis: hasContentPanel ? 'queued' : 'none',
+      cropAnalysis: initialCropStatus,
       cropAnalysisError: null,
       publishCopy: null,
       createdAt: nowIso(),
       updatedAt: nowIso(),
     };
     this.deps.store.createShort(short);
-    if (hasContentPanel) {
+    if (shouldEnqueueCrops) {
       this.deps.store.enqueueTask(job.id, 'analyze_crops', { shortId: short.id });
     }
-    return this.shortDetail(job, short, platformAvailabilityFromSnapshot(job, this.deps.publisher, this.deps.config));
+    return this.shortDetailWithAvailability(job, short);
   }
 
   async getShort(shortId: string): Promise<ShortDetailDto> {
@@ -306,6 +403,7 @@ export class StudioService implements StudioApi, StudioMediaResolver {
     let edit: ShortEdit;
     try {
       edit = normalizeEdit(request.edit, job.transcriptWords.length);
+      edit = normalizeSceneEdit(edit, job.layoutProfileSnapshot, job.sceneTrack);
     } catch (error) {
       throw new StudioError('invalid', error instanceof Error ? error.message : String(error));
     }
@@ -380,7 +478,12 @@ export class StudioService implements StudioApi, StudioMediaResolver {
     if (applied === 0) {
       throw new StudioError('invalid', `No revision actions could be applied. ${warnings.join(' ')}`);
     }
-    edit = normalizeEdit(edit, words.length);
+    try {
+      edit = normalizeEdit(edit, words.length);
+      edit = normalizeSceneEdit(edit, job.layoutProfileSnapshot, job.sceneTrack);
+    } catch (error) {
+      throw new StudioError('invalid', error instanceof Error ? error.message : String(error));
+    }
     const revised: ShortRecord = { ...current, edit, title, editRevision: current.editRevision + 1, updatedAt: nowIso() };
     if (!this.deps.store.updateShortIfRevision(revised, request.baseRevision)) {
       throw this.conflictError(shortId);
@@ -441,9 +544,27 @@ export class StudioService implements StudioApi, StudioMediaResolver {
   async analyzeCrops(shortId: string): Promise<ShortDetailDto> {
     const short = this.requireShort(shortId);
     const job = this.requireJob(short.jobId);
-    const hasContentPanel = job.layoutProfileSnapshot.panels.some((panel) => panel.role === 'content');
-    if (!hasContentPanel) {
-      throw new StudioError('invalid', 'This layout has no screen-share panel to analyze.');
+    if (job.layoutProfileSnapshot.strategy === 'scenes') {
+      if (job.sceneAnalysis === 'queued' || job.sceneAnalysis === 'running') {
+        throw new StudioError('conflict', 'Scene analysis is still running.');
+      }
+      if (job.sceneAnalysis === 'failed') {
+        throw new StudioError('conflict', job.sceneAnalysisError ?? 'Scene analysis failed.');
+      }
+      if (job.sceneAnalysis !== 'done' || !job.sceneTrack) {
+        throw new StudioError('conflict', 'Scene analysis must be complete before analyzing crops.');
+      }
+      const media = this.requireMedia(job);
+      const clips = computeSourceClips(short.edit, job.transcriptWords, media.durationSeconds);
+      const spans = documentCropSpans({ clips, words: job.transcriptWords, segments: job.sceneTrack.segments });
+      if (spans.length === 0) {
+        throw new StudioError('invalid', 'This short has no document scenes to analyze crops for.');
+      }
+    } else {
+      const contentPanel = contentPanelOf(job.layoutProfileSnapshot);
+      if (!contentPanel) {
+        throw new StudioError('invalid', 'This layout has no screen-share panel to analyze.');
+      }
     }
     if (short.cropAnalysis === 'queued' || short.cropAnalysis === 'running') {
       return this.shortDetailWithAvailability(job, short);
@@ -462,12 +583,31 @@ export class StudioService implements StudioApi, StudioMediaResolver {
     if (keptWordIndices(short.edit, job.transcriptWords.length).length === 0) {
       throw new StudioError('invalid', 'Nothing to export: every word is cut');
     }
+    if (job.layoutProfileSnapshot.strategy === 'scenes') {
+      if (job.sceneAnalysis === 'queued' || job.sceneAnalysis === 'running') {
+        throw new StudioError('conflict', 'Scene analysis is still running.');
+      }
+      if (job.sceneAnalysis === 'failed') {
+        throw new StudioError('conflict', job.sceneAnalysisError ?? 'Scene analysis failed.');
+      }
+      if (job.sceneAnalysis !== 'done' || !job.sceneTrack) {
+        throw new StudioError('conflict', 'Scene analysis must be complete before exporting.');
+      }
+    }
+    if (short.cropAnalysis === 'queued' || short.cropAnalysis === 'running') {
+      throw new StudioError('conflict', 'Crop analysis is still running for this short.');
+    }
     const reusable = this.deps.store
       .listExportsForShort(short.id)
       .find((record) => exportMatchesShort(record, short, job) && (record.status === 'queued' || record.status === 'rendering' || record.status === 'ready'));
     if (reusable) {
       return this.shortDetailWithAvailability(job, short);
     }
+    const media = this.requireMedia(job);
+    const clips = computeSourceClips(short.edit, job.transcriptWords, media.durationSeconds);
+    const frozenSceneTrack = job.layoutProfileSnapshot.strategy === 'scenes' && job.sceneTrack
+      ? freezeSceneTrack(job.sceneTrack, clips)
+      : null;
     const record: ExportRecord = {
       id: createId('export'),
       jobId: job.id,
@@ -477,6 +617,8 @@ export class StudioService implements StudioApi, StudioMediaResolver {
       edit: short.edit,
       title: short.title,
       hostFraming: job.hostFraming,
+      layoutProfileSnapshot: job.layoutProfileSnapshot,
+      sceneTrack: frozenSceneTrack,
       status: 'queued',
       artifactPath: null,
       coverPath: null,
@@ -527,22 +669,38 @@ export class StudioService implements StudioApi, StudioMediaResolver {
       throw new StudioError('conflict', `Export is ${exportRecord.status}; publishing needs a ready render.`);
     }
     const job = this.requireJob(exportRecord.jobId);
+    const manifest = await this.deps.profiles.getManifest();
+    const resolved = pickPublishingProfile(manifest, job.creatorProfileId);
+    if (!resolved.profile) {
+      throw new StudioError('invalid', `Unknown creator: ${job.creatorProfileId}`);
+    }
+    const account = resolved.account;
+    if (!account) {
+      throw new StudioError('invalid', 'No publishing account is assigned to this creator.');
+    }
+    if (account.mallaryProfileId === null) {
+      throw new StudioError('invalid', 'Account not connected in Mallary');
+    }
     if (request.scheduledAt !== null) {
       const problem = scheduledAtProblem(new Date(request.scheduledAt), new Date());
       if (problem !== null) {
         throw new StudioError('invalid', problem);
       }
-      this.assertManualSpacing(job, exportRecord.shortId, new Date(request.scheduledAt));
     }
-    const scheduling = request.scheduledAt !== null;
-    const availability = await platformAvailability(job, this.deps.publisher, this.deps.config, this.deps.profiles);
+    const availability = availabilityForPublishingProfile({
+      profile: resolved.profile,
+      account,
+      missingReason: 'No publishing account is assigned to this creator.',
+      publisher: this.deps.publisher,
+      config: this.deps.config,
+    });
     const unavailable = request.platforms
       .map((platform) => availability.find((entry) => entry.platform === platform))
       .filter((entry): entry is PlatformAvailabilityDto => entry !== undefined && !entry.available);
     if (unavailable.length > 0) {
       throw new StudioError('invalid', unavailable.map((entry) => entry.reason).join(' '));
     }
-    if (scheduling) {
+    if (request.scheduledAt !== null) {
       const unschedulable = request.platforms
         .map((platform) => availability.find((entry) => entry.platform === platform))
         .filter((entry): entry is PlatformAvailabilityDto => entry !== undefined && entry.available && !entry.canSchedule)
@@ -550,6 +708,11 @@ export class StudioService implements StudioApi, StudioMediaResolver {
       if (unschedulable.length > 0) {
         throw new StudioError('invalid', unschedulable.join(' '));
       }
+    }
+    if (request.scheduledAt !== null) {
+      const scheduledDate = new Date(request.scheduledAt);
+      const taken = this.takenSlots(account, manifest, scheduledDate, exportRecord.shortId);
+      this.assertManualSpacing(account, taken, scheduledDate);
     }
     const attemptsByShort = this.deps.store.listPublicationsForShort(exportRecord.shortId);
     const planned: Array<{ platform: ShortVideoPlatform; existing: PublicationRecord | null }> = [];
@@ -631,13 +794,24 @@ export class StudioService implements StudioApi, StudioMediaResolver {
     return results;
   }
 
-  listScheduledPosts(): ScheduledPostDto[] {
+  async listScheduledPosts(): Promise<ScheduledPostDto[]> {
+    const manifest = await this.deps.profiles.getManifest();
+    const creatorToAccount = new Map(manifest.creators.map((c) => [c.id, c.accountId]));
+    const accountMap = new Map(manifest.accounts.map((a) => [a.id, a]));
     return this.deps.store.listUpcomingScheduledPublications().map((record) => {
       const short = this.requireShort(record.shortId);
       const job = this.requireJob(record.jobId);
       const scheduledFor = record.scheduledFor;
       if (scheduledFor === null) {
         throw new StudioError('conflict', `Scheduled publication ${record.id} has no scheduled time.`);
+      }
+      const accountId = creatorToAccount.get(job.creatorProfileId);
+      if (!accountId) {
+        throw new StudioError('conflict', `Creator ${job.creatorProfileId} has no assigned account for scheduled publication.`);
+      }
+      const account = accountMap.get(accountId);
+      if (!account) {
+        throw new StudioError('conflict', `Account ${accountId} not found in manifest.`);
       }
       return {
         publicationId: record.id,
@@ -648,7 +822,8 @@ export class StudioService implements StudioApi, StudioMediaResolver {
         status: record.status,
         scheduledFor,
         provider: record.provider,
-        timeZone: job.creatorProfileSnapshot.schedule.timeZone,
+        accountId: account.id,
+        timeZone: account.schedule.timeZone,
       };
     });
   }
@@ -700,23 +875,17 @@ export class StudioService implements StudioApi, StudioMediaResolver {
     return publication;
   }
 
-  private assertManualSpacing(job: JobRecord, shortId: string, scheduledAt: Date): void {
-    const spacingMs = SCHEDULE_LIMITS.slotSpacingMinutes * 60_000;
-    for (const publication of this.creatorPublications(job.creatorProfileId)) {
-      if (publication.shortId === shortId || !IN_FLIGHT_PUBLICATION_STATUSES.includes(publication.status)) {
-        continue;
-      }
-      const startedAt = publication.scheduledFor ?? publication.submittedAt;
-      if (startedAt === null) {
-        continue;
-      }
-      const started = Date.parse(startedAt);
-      if (Number.isNaN(started) || Math.abs(started - scheduledAt.getTime()) >= spacingMs) {
-        continue;
-      }
-      const timeZone = job.creatorProfileSnapshot.schedule.timeZone;
+  private assertManualSpacing(account: PublishingAccount, taken: readonly Date[], scheduledAt: Date): void {
+    const problem = accountSlotProblem({ account, at: scheduledAt, taken });
+    if (problem === 'daily_cap') {
+      throw new StudioError('conflict', 'This account already has its daily posting limit scheduled for that day.');
+    }
+    if (problem === 'spacing') {
+      const spacingMs = SCHEDULE_LIMITS.slotSpacingMinutes * 60_000;
+      const conflicting = taken.find((slot) => Math.abs(slot.getTime() - scheduledAt.getTime()) < spacingMs) ?? scheduledAt;
+      const timeZone = account.schedule.timeZone;
       const city = timeZone.split('/').pop()?.replace(/_/g, ' ') ?? timeZone;
-      throw new StudioError('conflict', `Another post is scheduled for ${this.zoneClock(new Date(started), timeZone)} (${city} time). Pick a time at least 2 h away.`);
+      throw new StudioError('conflict', `Another post is scheduled for ${this.zoneClock(conflicting, timeZone)} (${city} time). Pick a time at least 2 h away.`);
     }
   }
 
@@ -727,10 +896,11 @@ export class StudioService implements StudioApi, StudioMediaResolver {
     return `${hour}:${minute}`;
   }
 
-  private creatorPublications(creatorId: string): PublicationRecord[] {
+  private accountPublications(accountId: string, manifest: CreatorProfileManifest): PublicationRecord[] {
+    const creatorIds = new Set(manifest.creators.filter((creator) => creator.accountId === accountId).map((creator) => creator.id));
     const publications: PublicationRecord[] = [];
     for (const job of this.deps.store.listJobSummaries()) {
-      if (job.creatorProfileId !== creatorId) {
+      if (!creatorIds.has(job.creatorProfileId)) {
         continue;
       }
       for (const short of this.deps.store.listShortsForJob(job.id)) {
@@ -738,6 +908,31 @@ export class StudioService implements StudioApi, StudioMediaResolver {
       }
     }
     return publications;
+  }
+
+  private takenSlots(account: PublishingAccount, manifest: CreatorProfileManifest, from: Date, excludeShortId: string | null): Date[] {
+    const creatorToAccount = new Map(manifest.creators.map((creator) => [creator.id, creator.accountId]));
+    const jobs = this.deps.store.listJobSummaries().map((job) => ({
+      id: job.id,
+      accountId: creatorToAccount.get(job.creatorProfileId) ?? null,
+    }));
+    const parts = zonedDateParts(from, account.schedule.timeZone);
+    const dayStart = zonedTimeToUtc({
+      year: parts.year,
+      month: parts.month,
+      day: parts.day,
+      hour: 0,
+      minute: 0,
+      timeZone: account.schedule.timeZone,
+    });
+    const fromWithLead = new Date(dayStart.getTime() - SCHEDULE_LIMITS.slotSpacingMinutes * 60_000);
+    return accountTakenSlots({
+      accountId: account.id,
+      jobs,
+      publications: this.accountPublications(account.id, manifest),
+      from: fromWithLead,
+      excludeShortId,
+    });
   }
 
   private requirePublisher(): ShortVideoPublishProvider {
@@ -888,6 +1083,10 @@ export class StudioService implements StudioApi, StudioMediaResolver {
         rejected: shorts.filter((short) => short.status === 'rejected').length,
         exported,
       },
+      sceneAnalysis: {
+        status: job.sceneAnalysis,
+        error: job.sceneAnalysisError,
+      },
       createdAt: job.createdAt,
       updatedAt: job.updatedAt,
     };
@@ -971,11 +1170,32 @@ export class StudioService implements StudioApi, StudioMediaResolver {
     };
   }
 
-  private shortDetailWithAvailability(job: JobRecord, short: ShortRecord): Promise<ShortDetailDto> {
-    return platformAvailability(job, this.deps.publisher, this.deps.config, this.deps.profiles).then((platforms) => this.shortDetail(job, short, platforms));
+  private async shortDetailWithAvailability(job: JobRecord, short: ShortRecord): Promise<ShortDetailDto> {
+    const manifest = await this.deps.profiles.getManifest();
+    const profile = manifest.creators.find((creator) => creator.id === job.creatorProfileId) ?? null;
+    const account = profile?.accountId
+      ? manifest.accounts.find((acc) => acc.id === profile.accountId) ?? null
+      : null;
+    const platforms = availabilityForPublishingProfile({
+      profile,
+      account,
+      missingReason: 'No publishing account is assigned to this creator.',
+      publisher: this.deps.publisher,
+      config: this.deps.config,
+    });
+    const taken = account
+      ? this.takenSlots(account, manifest, new Date(), short.id)
+      : [];
+    return this.shortDetail(job, short, platforms, account, taken);
   }
 
-  private shortDetail(job: JobRecord, short: ShortRecord, platforms: PlatformAvailabilityDto[]): ShortDetailDto {
+  private shortDetail(
+    job: JobRecord,
+    short: ShortRecord,
+    platforms: PlatformAvailabilityDto[],
+    account: PublishingAccount | null,
+    takenSlots: readonly Date[],
+  ): ShortDetailDto {
     const media = this.jobMedia(job);
     if (!media) {
       throw new StudioError('not_found', `Job has no source media yet: ${job.id}`);
@@ -1001,12 +1221,28 @@ export class StudioService implements StudioApi, StudioMediaResolver {
         media,
         layout: job.layoutProfileSnapshot,
         hostFraming: job.hostFraming,
+        sceneTrack: job.sceneTrack,
+        sceneAnalysis: {
+          status: job.sceneAnalysis,
+          error: job.sceneAnalysisError,
+        },
         fontUrl: MEDIA_ROUTES.font(basename(job.layoutProfileSnapshot.font.file)),
-        schedule: job.creatorProfileSnapshot.schedule,
+        account: account ? this.accountDto(account) : null,
+        takenSlots: takenSlots.map((d) => d.toISOString()),
       },
       exports: this.deps.store.listExportsForShort(short.id).map((record) => this.exportDto(record, short, job)),
       publications: this.deps.store.listPublicationsForShort(short.id).map((record) => this.publicationDto(record)),
       platforms,
+    };
+  }
+
+  private accountDto(account: PublishingAccount): PublishingAccountDto {
+    return {
+      id: account.id,
+      displayName: account.displayName,
+      schedule: account.schedule,
+      platforms: account.platforms,
+      connected: account.mallaryProfileId !== null,
     };
   }
 }

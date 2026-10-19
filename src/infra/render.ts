@@ -1,6 +1,7 @@
 import { stat, writeFile } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import type { LayoutProfile } from '../domain/layout.js';
+import { containForeground } from '../domain/composition.js';
 import type { Timeline, TimelineClip, TimelineEndCard, TimelinePanelPlacement } from '../domain/timeline.js';
 import { HOST_BLUR_DARKEN, HOST_BLUR_SIGMA_PX } from '../domain/timeline.js';
 import { buildEndCardAss, buildExportAss } from './ass.js';
@@ -137,12 +138,26 @@ function buildChunkFilterGraph(input: {
   input.clips.forEach((clip, index) => {
     const trimStart = clip.sourceStart - chunkStart;
     const trimEnd = clip.sourceEnd - chunkStart;
-    const outputDuration = (clip.sourceEnd - clip.sourceStart) / input.speed;
-    const audioSamples = Math.round(outputDuration * AUDIO_SAMPLE_RATE);
+    const sceneClip = clip.composition !== null;
+    const outputDuration = sceneClip
+      ? clip.outputEnd - clip.outputStart
+      : (clip.sourceEnd - clip.sourceStart) / input.speed;
+    const audioSamples = sceneClip
+      ? Math.round(clip.outputEnd * AUDIO_SAMPLE_RATE) - Math.round(clip.outputStart * AUDIO_SAMPLE_RATE)
+      : Math.round(outputDuration * AUDIO_SAMPLE_RATE);
     const fadeLength = Math.min(FADE_SECONDS, outputDuration / 2);
-    parts.push(
-      `[vsrc${index}]trim=start=${num(trimStart)}:end=${num(trimEnd)},setpts=(PTS-STARTPTS)/${num(input.speed)},fps=${input.fps},split=${clip.panels.length}${splitLabels(`vcrop${index}`, clip.panels.length, '_')}`,
-    );
+    const videoChain = [
+      `[vsrc${index}]trim=start=${num(trimStart)}:end=${num(trimEnd)},setpts=(PTS-STARTPTS)/${num(input.speed)},fps=${input.fps}`,
+    ];
+    if (sceneClip) {
+      videoChain.push(
+        `tpad=stop_mode=clone:stop_duration=${num(1 / input.fps)}`,
+        `trim=end_frame=${Math.round(clip.outputEnd * input.fps) - Math.round(clip.outputStart * input.fps)}`,
+        'setpts=PTS-STARTPTS',
+      );
+    }
+    videoChain.push(`split=${clip.panels.length}${splitLabels(`vcrop${index}`, clip.panels.length, '_')}`);
+    parts.push(videoChain.join(','));
     const overlayInputs = clip.panels.flatMap((panel, panelIndex) =>
       panelScaleChains(parts, index, panelIndex, panel),
     );
@@ -378,17 +393,17 @@ function panelScaleChains(
   const panelAspect = panel.canvas.w / panel.canvas.h;
   const coverWidth = cropAspect > panelAspect ? Math.ceil((panel.canvas.h * cropAspect) / 2) * 2 : panel.canvas.w;
   const coverHeight = cropAspect > panelAspect ? panel.canvas.h : Math.ceil((panel.canvas.w / cropAspect) / 2) * 2;
-  const foregroundWidth = Math.max(2, Math.floor((panel.canvas.h * cropAspect) / 2) * 2);
+  const foreground = containForeground(panel.source, panel.canvas);
   parts.push(`${cropStream}${cropArgs},split=2${splitLabels(`hblur${clipIndex}_${panelIndex}`, 2, '')}`);
   parts.push(
     `[hblur${clipIndex}_${panelIndex}0]scale=${coverWidth}:${coverHeight}:flags=lanczos,gblur=sigma=${num(HOST_BLUR_SIGMA_PX)},colorchannelmixer=rr=${num(HOST_BLUR_DARKEN)}:gg=${num(HOST_BLUR_DARKEN)}:bb=${num(HOST_BLUR_DARKEN)},crop=${panel.canvas.w}:${panel.canvas.h},setsar=1[hblurbg${clipIndex}_${panelIndex}]`,
   );
   parts.push(
-    `[hblur${clipIndex}_${panelIndex}1]scale=${foregroundWidth}:${panel.canvas.h}:flags=lanczos,setsar=1[hblurfg${clipIndex}_${panelIndex}]`,
+    `[hblur${clipIndex}_${panelIndex}1]scale=${foreground.w}:${foreground.h}:flags=lanczos,setsar=1[hblurfg${clipIndex}_${panelIndex}]`,
   );
   return [
     { label: `[hblurbg${clipIndex}_${panelIndex}]`, x: panel.canvas.x, y: panel.canvas.y },
-    { label: `[hblurfg${clipIndex}_${panelIndex}]`, x: panel.canvas.x + Math.round((panel.canvas.w - foregroundWidth) / 2), y: panel.canvas.y },
+    { label: `[hblurfg${clipIndex}_${panelIndex}]`, x: foreground.x, y: foreground.y },
   ];
 }
 

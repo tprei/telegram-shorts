@@ -1,24 +1,26 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { z } from 'zod';
-import { createInitialEdit, keptWordIndices, replaceAutoCrops, type ShortEdit } from '../domain/edit.js';
-import { publicationStartedAt, QUEUE_LANES, type ExportRecord, type HostFraming, type JobRecord, type PublicationRecord, type PublicationStatus, type QueueLane, type QueueTask, type ShortRecord, type SourceMedia, type TranscriptWord } from '../domain/model.js';
+import { createInitialEdit, keptWordIndices, normalizeSceneEdit, replaceAutoCrops, type CropKeyframe, type ShortEdit } from '../domain/edit.js';
+import { publicationStartedAt, QUEUE_LANES, type ExportRecord, type HostFraming, type JobRecord, type PublicationRecord, type PublicationStatus, type PublishingAccount, type QueueLane, type QueueTask, type SceneSegment, type SceneTrack, type ShortRecord, type SourceMedia, type TranscriptWord } from '../domain/model.js';
 import { computeSourceClips, buildTimeline, type SourceClip } from '../domain/timeline.js';
 import { buildSentences, detectStrongSpeakers } from '../domain/policies.js';
-import type { ContentPanel, HostPanel, LayoutProfile } from '../domain/layout.js';
+import { contentPanelOf, hostPanelOf, type ContentPanel } from '../domain/layout.js';
 import { blockContinuesPrevious, blockOnScreenSeconds, buildPlannedShorts, diagnoseCandidatePlan, fallbackSemanticBlocks, materializeSemanticBlocks, semanticBlocksAreUsable, type PlanningPace } from '../domain/semantic.js';
-import type { CreatorProfileRepository } from '../infra/creator-profile-loader.js';
+import { pickPublishingProfile, type CreatorProfileRepository } from '../infra/creator-profile-loader.js';
 import { buildPublishMessage } from '../infra/mallary.js';
 import { extractFrame, renderCoverImage, renderShortExport } from '../infra/render.js';
 import { transcribeSource } from '../infra/transcript.js';
-import { analyzeContentCrops, detectHostHead } from '../infra/vision.js';
+import { analyzeContentCrops, detectHostHead, type AnalyzeContentCropsFunction } from '../infra/vision.js';
+import { documentCropSpans } from '../domain/scene.js';
+import { analyzeScenes, type AnalyzeScenesFunction } from '../infra/scenes.js';
 import { downloadSource } from '../infra/youtube.js';
 import type { AppConfig } from '../infra/env.js';
 import { CHECK_PUBLISH_DELAY_MS, CHECK_WINDOW_MS, ShortsStore } from '../infra/db.js';
 import { ShortVideoPublishError, isTransientCheckError, isTransientNetworkError, type RemotePublicationState, type ShortVideoPublishProvider, type ShortVideoPublishResult } from '../infra/instagram-publisher.js';
 import { createId, describeError, logError, nowIso } from '../infra/util.js';
 import type { OpenRouterClient } from '../infra/openrouter.js';
-import { mallaryCooldownKey, platformAvailability, platformLabel } from './platforms.js';
+import { mallaryCooldownKey, availabilityForPublishingProfile, platformLabel } from './platforms.js';
 
 const EmptyPayloadSchema = z.strictObject({});
 const AnalyzeCropsPayloadSchema = z.strictObject({ shortId: z.string().min(1) });
@@ -29,6 +31,7 @@ const CheckPublicationPayloadSchema = z.strictObject({ publicationId: z.string()
 const CHECK_RETRY_DELAY_MS = 20_000;
 const CHECK_UNCONFIRMED_DELAY_MS = 10 * 60 * 1000;
 const CHECK_DEADLINE_MS = 60 * 60 * 1000;
+const MAX_STORED_ERROR_LENGTH = 2000;
 
 const PRESERVED_PUBLICATION_STATUSES: readonly PublicationStatus[] = ['submitted', 'published', 'unconfirmed', 'scheduled', 'cancelled'];
 
@@ -45,6 +48,8 @@ export interface ShortsPipelineDeps {
   openRouter: OpenRouterClient;
   profiles: CreatorProfileRepository;
   publisher: ShortVideoPublishProvider | null;
+  analyzeScenes: AnalyzeScenesFunction;
+  analyzeContentCrops: AnalyzeContentCropsFunction;
 }
 
 export class ShortsPipeline {
@@ -73,6 +78,11 @@ export class ShortsPipeline {
     if (task.kind === 'analyze_host') {
       EmptyPayloadSchema.parse(task.payload);
       await this.analyzeHost(task);
+      return;
+    }
+    if (task.kind === 'analyze_scenes') {
+      EmptyPayloadSchema.parse(task.payload);
+      await this.analyzeScenesTask(task);
       return;
     }
     if (task.kind === 'plan_shorts') {
@@ -121,22 +131,43 @@ export class ShortsPipeline {
     job.transcriptWords = words;
     await writeFile(join(jobDir, 'transcript.words.json'), `${JSON.stringify(words, null, 2)}\n`, 'utf-8');
     job.strongSpeakers = detectStrongSpeakers(words);
-    if (hostPanelOf(job.layoutProfileSnapshot)) {
-      this.deps.store.enqueueTask(job.id, 'analyze_host', {});
-    }
-    if (job.strongSpeakers.length > 1 && !job.chosenSpeakerId) {
-      job.status = 'awaiting_speaker';
+    if (job.layoutProfileSnapshot.strategy === 'fixed') {
+      if (hostPanelOf(job.layoutProfileSnapshot)) {
+        this.deps.store.enqueueTask(job.id, 'analyze_host', {});
+      }
+      if (job.strongSpeakers.length > 1 && !job.chosenSpeakerId) {
+        job.status = 'awaiting_speaker';
+        job.updatedAt = nowIso();
+        this.deps.store.updateJob(job);
+        return;
+      }
+      job.chosenSpeakerId ??= job.strongSpeakers[0]?.speakerId ?? words[0]?.speakerId ?? null;
+      job.status = 'planning';
       job.updatedAt = nowIso();
       this.deps.store.updateJob(job);
-      return;
+      this.deps.store.enqueueTask(job.id, 'plan_shorts', {});
+    } else {
+      job.sceneAnalysis = 'queued';
+      job.sceneAnalysisError = null;
+      if (job.strongSpeakers.length > 1 && !job.chosenSpeakerId) {
+        job.status = 'awaiting_speaker';
+        job.updatedAt = nowIso();
+        this.deps.store.updateJob(job);
+        if (!this.deps.store.hasActiveTask(job.id, 'analyze_scenes')) {
+          this.deps.store.enqueueTask(job.id, 'analyze_scenes', {});
+        }
+        return;
+      }
+      job.chosenSpeakerId ??= job.strongSpeakers[0]?.speakerId ?? words[0]?.speakerId ?? null;
+      job.status = 'planning';
+      job.updatedAt = nowIso();
+      this.deps.store.updateJob(job);
+      this.deps.store.enqueueTask(job.id, 'plan_shorts', {});
+      if (!this.deps.store.hasActiveTask(job.id, 'analyze_scenes')) {
+        this.deps.store.enqueueTask(job.id, 'analyze_scenes', {});
+      }
     }
-    job.chosenSpeakerId ??= job.strongSpeakers[0]?.speakerId ?? words[0]?.speakerId ?? null;
-    job.status = 'planning';
-    job.updatedAt = nowIso();
-    this.deps.store.updateJob(job);
-    this.deps.store.enqueueTask(job.id, 'plan_shorts', {});
   }
-
   private async analyzeHost(task: QueueTask): Promise<void> {
     const job = this.requireJob(task.jobId);
     const panel = hostPanelOf(job.layoutProfileSnapshot);
@@ -169,6 +200,94 @@ export class ShortsPipeline {
     }
     this.deps.store.updateJob(current);
   }
+  private async analyzeScenesTask(task: QueueTask): Promise<void> {
+    const initialJob = this.requireJob(task.jobId);
+    if (initialJob.layoutProfileSnapshot.strategy !== 'scenes') {
+      throw new Error(`Job ${initialJob.id} does not have a scenes layout profile.`);
+    }
+    const sceneConfig = initialJob.creatorProfileSnapshot.render.scene;
+    if (!sceneConfig) {
+      throw new Error(`Job ${initialJob.id} has no scene configuration.`);
+    }
+    const media = this.requireMedia(initialJob);
+
+    const runningJob = this.requireJob(task.jobId);
+    runningJob.sceneAnalysis = 'running';
+    runningJob.sceneAnalysisError = null;
+    runningJob.updatedAt = nowIso();
+    this.deps.store.updateJob(runningJob);
+
+    let newTrack: SceneTrack;
+    try {
+      newTrack = await this.deps.analyzeScenes({
+        config: this.deps.config,
+        media,
+        scene: sceneConfig,
+        workDir: await this.ensureJobDir(initialJob.id),
+      });
+    } catch (error) {
+      logError('Scene analysis failed', error, { jobId: initialJob.id });
+      throw error;
+    }
+
+    const existingShorts = this.deps.store.listShortsForJob(initialJob.id);
+    const normalizedShortEdits: Array<{ original: ShortRecord; nextEdit: ShortEdit }> = [];
+    try {
+      for (const short of existingShorts) {
+        const withoutAutoCrops = replaceAutoCrops(short.edit, []);
+        const nextEdit = normalizeSceneEdit(withoutAutoCrops, initialJob.layoutProfileSnapshot, newTrack);
+        normalizedShortEdits.push({ original: short, nextEdit });
+      }
+    } catch (error) {
+      logError('Scene re-analysis edit conflict', error, { jobId: initialJob.id });
+      throw new Error(`Scene re-analysis caused edit conflict: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    for (const { original, nextEdit } of normalizedShortEdits) {
+      if (JSON.stringify(original.edit) !== JSON.stringify(nextEdit)) {
+        this.deps.store.updateShort({
+          ...original,
+          edit: nextEdit,
+          editRevision: original.editRevision + 1,
+          updatedAt: nowIso(),
+        });
+      }
+    }
+
+    const successJob = this.requireJob(task.jobId);
+    successJob.sceneTrack = newTrack;
+    successJob.sceneAnalysis = 'done';
+    successJob.sceneAnalysisError = null;
+    successJob.updatedAt = nowIso();
+    this.deps.store.updateJob(successJob);
+
+    for (const { original } of normalizedShortEdits) {
+      const current = this.deps.store.getShort(original.id);
+      if (!current) {
+        throw new Error(`Short ${original.id} disappeared while completing scene analysis.`);
+      }
+      const clips = computeSourceClips(current.edit, successJob.transcriptWords, media.durationSeconds);
+      const docSpans = documentCropSpans({
+        clips,
+        words: successJob.transcriptWords,
+        segments: newTrack.segments,
+      });
+      if (docSpans.length > 0) {
+        if (!this.deps.store.hasActiveTask(successJob.id, 'analyze_crops', original.id)) {
+          current.cropAnalysis = 'queued';
+          current.cropAnalysisError = null;
+          current.updatedAt = nowIso();
+          this.deps.store.updateShort(current);
+          this.deps.store.enqueueTask(successJob.id, 'analyze_crops', { shortId: original.id });
+        }
+      } else {
+        current.cropAnalysis = 'none';
+        current.cropAnalysisError = null;
+        current.updatedAt = nowIso();
+        this.deps.store.updateShort(current);
+      }
+    }
+  }
 
   private async planShorts(task: QueueTask): Promise<void> {
     const job = this.requireJob(task.jobId);
@@ -181,7 +300,7 @@ export class ShortsPipeline {
     }
     job.transcriptSentences = sentences;
     const layout = job.layoutProfileSnapshot;
-    const pace: PlanningPace = { speed: layout.defaultSpeed, words, sourceDurationSeconds: this.requireMedia(job).durationSeconds };
+    const pace: PlanningPace = { speed: job.creatorProfileSnapshot.render.defaultSpeed, words, sourceDurationSeconds: this.requireMedia(job).durationSeconds };
     let blocks = fallbackSemanticBlocks(sentences);
     try {
       const response = await this.deps.openRouter.buildSemanticBlocks({ title: job.sourceTitle, sentences });
@@ -223,6 +342,7 @@ export class ShortsPipeline {
       const summary = diagnostics.map((entry) => `#${entry.index + 1} ${entry.title}: ${entry.reasons.join('; ') || 'no diagnostic reason'}`).join(' | ');
       throw new Error(`No valid short candidates were produced. ${summary}`);
     }
+    const isScenes = layout.strategy === 'scenes';
     const contentPanel = contentPanelOf(layout);
     const existing = this.deps.store.listShortsForJob(job.id);
     let nextRank = existing.reduce((max, short) => Math.max(max, short.rank), 0);
@@ -233,6 +353,32 @@ export class ShortsPipeline {
         continue;
       }
       nextRank += 1;
+      let shouldEnqueueCrops = false;
+      let initialCropStatus: 'none' | 'queued' = 'none';
+
+      if (isScenes) {
+        if (job.sceneAnalysis === 'done' && job.sceneTrack) {
+          const clips = computeSourceClips(edit, words, this.requireMedia(job).durationSeconds);
+          const docSpans = documentCropSpans({ clips, words, segments: job.sceneTrack.segments });
+          if (docSpans.length > 0) {
+            initialCropStatus = 'queued';
+            shouldEnqueueCrops = true;
+          } else {
+            initialCropStatus = 'none';
+          }
+        } else {
+          initialCropStatus = 'queued';
+          shouldEnqueueCrops = false;
+        }
+      } else {
+        if (contentPanel) {
+          initialCropStatus = 'queued';
+          shouldEnqueueCrops = true;
+        } else {
+          initialCropStatus = 'none';
+        }
+      }
+
       const short: ShortRecord = {
         id: createId('short'),
         jobId: job.id,
@@ -248,7 +394,7 @@ export class ShortsPipeline {
         status: 'active',
         edit,
         editRevision: 1,
-        cropAnalysis: contentPanel ? 'queued' : 'none',
+        cropAnalysis: initialCropStatus,
         cropAnalysisError: null,
         publishCopy: null,
         createdAt: nowIso(),
@@ -256,7 +402,7 @@ export class ShortsPipeline {
       };
       this.deps.store.createShort(short);
       existing.push(short);
-      if (contentPanel) {
+      if (shouldEnqueueCrops) {
         this.deps.store.enqueueTask(job.id, 'analyze_crops', { shortId: short.id });
       }
     }
@@ -271,25 +417,104 @@ export class ShortsPipeline {
   private async analyzeCrops(shortId: string): Promise<void> {
     const short = this.requireShort(shortId);
     const job = this.requireJob(short.jobId);
-    const panel = contentPanelOf(job.layoutProfileSnapshot);
-    if (!panel) {
-      throw new Error(`Layout for job ${job.id} has no content panel for crop analysis.`);
-    }
+    const layout = job.layoutProfileSnapshot;
     const media = this.requireMedia(job);
     short.cropAnalysis = 'running';
     short.updatedAt = nowIso();
     this.deps.store.updateShort(short);
     const clips = computeSourceClips(short.edit, job.transcriptWords, media.durationSeconds);
-    const spans = buildCropAnalysisSpans(short.edit, clips, job.transcriptWords);
-    const keyframes = await analyzeContentCrops({
-      config: this.deps.config,
-      videoPath: media.videoPath,
-      source: { width: media.width, height: media.height },
-      panel,
-      spans,
-      words: job.transcriptWords,
-      workDir: join(await this.ensureJobDir(job.id), 'crops'),
-    });
+    let keyframes: CropKeyframe[];
+
+    if (layout.strategy === 'fixed') {
+      const panel = contentPanelOf(layout);
+      if (!panel) {
+        throw new Error(`Layout for job ${job.id} has no content panel for crop analysis.`);
+      }
+      const spans = buildCropAnalysisSpans(short.edit, clips, job.transcriptWords);
+      keyframes = await this.deps.analyzeContentCrops({
+        config: this.deps.config,
+        videoPath: media.videoPath,
+        source: { width: media.width, height: media.height },
+        panel,
+        spans,
+        words: job.transcriptWords,
+        workDir: join(await this.ensureJobDir(job.id), 'crops'),
+        maxSamples: 16,
+      });
+    } else {
+      if (!job.sceneTrack) {
+        throw new Error(`Job ${job.id} has no scene track for crop analysis.`);
+      }
+      const docSpans = documentCropSpans({
+        clips,
+        words: job.transcriptWords,
+        segments: job.sceneTrack.segments,
+      });
+      if (docSpans.length === 0) {
+        const settled = this.requireShort(shortId);
+        settled.cropAnalysis = 'none';
+        settled.cropAnalysisError = null;
+        settled.updatedAt = nowIso();
+        this.deps.store.updateShort(settled);
+        return;
+      }
+      const segmentGroups = new Map<SceneSegment, Array<{ startSeconds: number; endSeconds: number; text: string }>>();
+      for (const span of docSpans) {
+        let group = segmentGroups.get(span.segment);
+        if (!group) {
+          group = [];
+          segmentGroups.set(span.segment, group);
+        }
+        group.push({ startSeconds: span.startSeconds, endSeconds: span.endSeconds, text: span.text });
+      }
+      const groups = Array.from(segmentGroups.entries());
+      const budgets = new Array<number>(groups.length).fill(0);
+      for (let i = 0; i < 16; i++) {
+        budgets[i % groups.length] += 1;
+      }
+      const cropsWorkDir = join(await this.ensureJobDir(job.id), 'crops');
+      const allKeyframes: CropKeyframe[] = [];
+      for (let i = 0; i < groups.length; i++) {
+        const budget = budgets[i];
+        if (budget === 0) {
+          continue;
+        }
+        const [segment, groupSpans] = groups[i];
+        if (!segment.content) {
+          continue;
+        }
+        const transientPanel: ContentPanel = {
+          id: 'content',
+          role: 'content',
+          sourceRect: segment.content.box,
+          canvasRect: { x: 0, y: 0, w: 1, h: 1 },
+        };
+        const groupKeyframes = await this.deps.analyzeContentCrops({
+          config: this.deps.config,
+          videoPath: media.videoPath,
+          source: { width: media.width, height: media.height },
+          panel: transientPanel,
+          spans: groupSpans,
+          words: job.transcriptWords,
+          workDir: cropsWorkDir,
+          maxSamples: budget,
+        });
+        for (const kf of groupKeyframes) {
+          allKeyframes.push({
+            sourceSeconds: kf.sourceSeconds,
+            origin: kf.origin,
+            focus: {
+              x: Math.max(0, Math.min(1, (kf.focus.x - segment.content.box.x) / segment.content.box.w)),
+              y: Math.max(0, Math.min(1, (kf.focus.y - segment.content.box.y) / segment.content.box.h)),
+              w: Math.max(0.001, Math.min(1, kf.focus.w / segment.content.box.w)),
+              h: Math.max(0.001, Math.min(1, kf.focus.h / segment.content.box.h)),
+            },
+          });
+        }
+      }
+      allKeyframes.sort((a, b) => a.sourceSeconds - b.sourceSeconds);
+      keyframes = allKeyframes;
+    }
     const current = this.requireShort(shortId);
     const next: ShortRecord = {
       ...current,
@@ -339,14 +564,15 @@ export class ShortsPipeline {
       edit: record.edit,
       title: record.title,
       words: job.transcriptWords,
-      layout: job.layoutProfileSnapshot,
+      layout: record.layoutProfileSnapshot,
       source: { width: media.width, height: media.height, durationSeconds: media.durationSeconds },
       hostFraming: record.hostFraming,
+      sceneTrack: record.sceneTrack,
     });
     const workDir = join(await this.ensureJobDir(job.id), 'exports', record.id);
     const result = await renderShortExport({
       timeline,
-      layout: job.layoutProfileSnapshot,
+      layout: record.layoutProfileSnapshot,
       sourceVideoPath: media.videoPath,
       workDir,
       fontsDir: this.deps.config.fontsDir,
@@ -389,7 +615,7 @@ export class ShortsPipeline {
       });
     }
     const coverPath = join(workDir, 'cover.jpg');
-    await renderCoverImage({ imagePath, outputPath: coverPath, width: job.layoutProfileSnapshot.canvas.width, height: job.layoutProfileSnapshot.canvas.height });
+    await renderCoverImage({ imagePath, outputPath: coverPath, width: record.layoutProfileSnapshot.canvas.width, height: record.layoutProfileSnapshot.canvas.height });
     return coverPath;
   }
 
@@ -404,10 +630,28 @@ export class ShortsPipeline {
     }
     const short = this.requireShort(publication.shortId);
     const job = this.requireJob(publication.jobId);
-    if (!this.deps.publisher || !this.deps.publisher.supports(publication.platform)) {
+    const manifest = await this.deps.profiles.getManifest();
+    const resolved = pickPublishingProfile(manifest, job.creatorProfileId);
+    if (!resolved?.profile || !resolved.profile.enabled) {
+      throw new Error(`Creator profile ${job.creatorProfileId} is disabled or missing.`);
+    }
+    if (!resolved.account) {
+      throw new Error('No publishing account is assigned to this creator.');
+    }
+    if (!resolved.account.mallaryProfileId) {
+      throw new Error('Account not connected in Mallary');
+    }
+    const account = resolved.account;
+    if (!this.deps.publisher || !this.deps.publisher.canPublish({ account, platform: publication.platform, scheduled: publication.scheduledFor !== null })) {
       throw new Error(`No provider configured for ${publication.platform}.`);
     }
-    const availability = await platformAvailability(job, this.deps.publisher, this.deps.config, this.deps.profiles);
+    const availability = availabilityForPublishingProfile({
+      profile: resolved.profile,
+      account,
+      missingReason: `Creator profile ${job.creatorProfileId} no longer exists.`,
+      publisher: this.deps.publisher,
+      config: this.deps.config,
+    });
     const reloaded = this.deps.store.getPublication(publicationId);
     if (reloaded === null) {
       throw new Error(`Publication not found: ${publicationId}`);
@@ -464,6 +708,7 @@ export class ShortsPipeline {
     let result: ShortVideoPublishResult;
     try {
       result = await this.deps.publisher.publishShortVideo({
+        account,
         platform: publication.platform,
         filePath: exportRecord.artifactPath,
         message: buildPublishMessage(copy),
@@ -697,12 +942,13 @@ export class ShortsPipeline {
 
   private handleTaskFailure(task: QueueTask, error: unknown): boolean {
     const message = error instanceof Error ? error.message : String(error);
+    const storedError = message.slice(0, MAX_STORED_ERROR_LENGTH);
     if (task.kind === 'check_publication') {
       if (error instanceof PublicationCheckRetry) {
         this.deps.store.rescheduleTask(task, error.availableAt, error.reason);
         return true;
       }
-      this.deps.store.failTask(task, message);
+      this.deps.store.failTask(task, storedError);
       return true;
     }
     if (task.kind === 'publish_short_video') {
@@ -735,11 +981,11 @@ export class ShortsPipeline {
         publication.updatedAt = nowIso();
         this.deps.store.updatePublication(publication);
       }
-      this.deps.store.failTask(task, message);
+      this.deps.store.failTask(task, storedError);
       this.deps.store.appendAction(task.jobId, 'short_video_publish_failed', { publicationId, error: message });
       return true;
     }
-    this.deps.store.failTask(task, message);
+    this.deps.store.failTask(task, storedError);
     if (task.kind === 'process_source' || task.kind === 'plan_shorts') {
       const job = this.deps.store.getJob(task.jobId);
       if (job) {
@@ -765,7 +1011,16 @@ export class ShortsPipeline {
       return true;
     }
     if (task.kind === 'analyze_host') {
-      this.deps.store.failTask(task, message);
+      return true;
+    }
+    if (task.kind === 'analyze_scenes') {
+      const job = this.deps.store.getJob(task.jobId);
+      if (job) {
+        job.sceneAnalysis = 'failed';
+        job.sceneAnalysisError = storedError;
+        job.updatedAt = nowIso();
+        this.deps.store.updateJob(job);
+      }
       return true;
     }
     const { exportId } = ExportShortPayloadSchema.parse(task.payload);
@@ -815,16 +1070,6 @@ export class ShortsPipeline {
     await mkdir(path, { recursive: true });
     return path;
   }
-}
-
-function contentPanelOf(layout: LayoutProfile): ContentPanel | null {
-  const panel = layout.panels.find((entry): entry is ContentPanel => entry.role === 'content');
-  return panel ?? null;
-}
-
-function hostPanelOf(layout: LayoutProfile): HostPanel | null {
-  const panel = layout.panels.find((entry): entry is HostPanel => entry.role === 'host');
-  return panel ?? null;
 }
 
 function overlapsExistingShort(kept: number[], existing: ShortRecord[], wordCount: number): boolean {

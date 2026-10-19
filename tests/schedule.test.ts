@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { SCHEDULE_LIMITS, freePostingSlots, scheduledAtProblem, suggestPostingSlots, zonedDateParts, zonedTimeToUtc } from '../src/domain/schedule.js';
-import type { PostingSchedule } from '../src/domain/model.js';
+import { SCHEDULE_LIMITS, accountSlotProblem, accountTakenSlots, freePostingSlots, scheduledAtProblem, suggestPostingSlots, zonedDateParts, zonedTimeToUtc } from '../src/domain/schedule.js';
+import type { PostingSchedule, PublicationRecord, PublishingAccount } from '../src/domain/model.js';
 
 const MINUTE_MS = 60_000;
 const SAO_PAULO = 'America/Sao_Paulo';
@@ -117,4 +117,99 @@ test('scheduledAtProblem rejects invalid dates', () => {
   const now = new Date('2026-10-18T12:00:00.000Z');
   assert.equal(scheduledAtProblem(new Date('not a date'), now), 'Pick a valid date and time.');
   assert.equal(scheduledAtProblem(new Date(Number.NaN), now), 'Pick a valid date and time.');
+});
+
+const MIX_ACCOUNT: PublishingAccount = {
+  id: 'mix',
+  displayName: 'Mix',
+  schedule: { timeZone: SAO_PAULO, slots: ['12:00', '19:00', '21:00'] },
+  platforms: ['instagram', 'tiktok'],
+  mallaryProfileId: null,
+  buffer: false,
+};
+
+let accountPublicationCounter = 0;
+
+function accountPublication(overrides: Partial<PublicationRecord>): PublicationRecord {
+  accountPublicationCounter += 1;
+  return {
+    id: `acct_pub_${accountPublicationCounter}`,
+    jobId: 'job_mix_a',
+    shortId: 'short_1',
+    exportId: 'export_1',
+    platform: 'instagram',
+    status: 'scheduled',
+    forced: false,
+    provider: 'mallary',
+    batchId: null,
+    remoteJobs: [],
+    remoteUrl: null,
+    submittedAt: null,
+    scheduledFor: null,
+    error: null,
+    availableAt: null,
+    createdAt: '2026-10-18T12:00:00.000Z',
+    updatedAt: '2026-10-18T12:00:00.000Z',
+    ...overrides,
+  };
+}
+
+const CAPACITY_JOBS = [
+  { id: 'job_boni', accountId: 'cortes_do_boni' },
+  { id: 'job_mix_a', accountId: 'mix' },
+  { id: 'job_mix_b', accountId: 'mix' },
+];
+
+test('account capacity dedupes platforms and includes early same-day posts', () => {
+  const publications = [
+    accountPublication({ jobId: 'job_mix_a', shortId: 'short_1', platform: 'instagram', scheduledFor: '2026-10-18T15:00:00.000Z' }),
+    accountPublication({ jobId: 'job_mix_b', shortId: 'short_1', platform: 'tiktok', scheduledFor: '2026-10-18T15:00:00.000Z' }),
+    accountPublication({ jobId: 'job_boni', shortId: 'short_2', platform: 'instagram', scheduledFor: '2026-10-18T15:30:00.000Z' }),
+    accountPublication({ jobId: 'job_mix_a', shortId: 'short_3', platform: 'instagram', status: 'failed', scheduledFor: '2026-10-18T16:00:00.000Z' }),
+  ];
+  const from = new Date(zonedTimeToUtc({ year: 2026, month: 10, day: 18, hour: 0, minute: 0, timeZone: SAO_PAULO }).getTime() - 120 * MINUTE_MS);
+  assert.equal(from.toISOString(), '2026-10-18T01:00:00.000Z');
+  const taken = accountTakenSlots({ accountId: 'mix', jobs: CAPACITY_JOBS, publications, from, excludeShortId: null });
+  assert.deepEqual(isoList(taken), ['2026-10-18T15:00:00.000Z']);
+  const withoutCurrentShort = accountTakenSlots({ accountId: 'mix', jobs: CAPACITY_JOBS, publications, from, excludeShortId: 'short_1' });
+  assert.deepEqual(isoList(withoutCurrentShort), []);
+  const boniTaken = accountTakenSlots({ accountId: 'cortes_do_boni', jobs: CAPACITY_JOBS, publications, from, excludeShortId: null });
+  assert.deepEqual(isoList(boniTaken), ['2026-10-18T15:30:00.000Z']);
+  const submittedFallback = accountTakenSlots({
+    accountId: 'mix',
+    jobs: CAPACITY_JOBS,
+    publications: [
+      accountPublication({ shortId: 'short_9', status: 'published', scheduledFor: null, submittedAt: null, availableAt: '2026-10-18T14:00:00.000Z', createdAt: '2026-10-18T13:30:00.000Z' }),
+    ],
+    from,
+    excludeShortId: null,
+  });
+  assert.deepEqual(isoList(submittedFallback), ['2026-10-18T14:00:00.000Z']);
+
+  const morning = [saoPauloInstant(18, 12)];
+  assert.equal(accountSlotProblem({ account: MIX_ACCOUNT, at: saoPauloInstant(18, 19), taken: morning }), null);
+  assert.equal(accountSlotProblem({ account: MIX_ACCOUNT, at: saoPauloInstant(18, 14), taken: morning }), null);
+  const fullDay = [saoPauloInstant(18, 12), saoPauloInstant(18, 19), saoPauloInstant(18, 21)];
+  assert.equal(accountSlotProblem({ account: MIX_ACCOUNT, at: saoPauloInstant(18, 15), taken: fullDay }), 'daily_cap');
+  assert.equal(accountSlotProblem({ account: MIX_ACCOUNT, at: saoPauloInstant(19, 12), taken: fullDay }), null);
+  assert.equal(accountSlotProblem({ account: MIX_ACCOUNT, at: saoPauloInstant(18, 13), taken: morning }), 'spacing');
+});
+
+test('different accounts may share an instant but creators of one account cannot', () => {
+  const publications = [
+    accountPublication({ jobId: 'job_mix_a', shortId: 'short_a', platform: 'instagram', scheduledFor: '2026-10-18T15:00:00.000Z' }),
+    accountPublication({ jobId: 'job_boni', shortId: 'short_b', platform: 'instagram', scheduledFor: '2026-10-18T15:00:00.000Z' }),
+    accountPublication({ jobId: 'job_mix_b', shortId: 'short_c', platform: 'tiktok', scheduledFor: '2026-10-18T16:00:00.000Z' }),
+  ];
+  const from = new Date(zonedTimeToUtc({ year: 2026, month: 10, day: 18, hour: 0, minute: 0, timeZone: SAO_PAULO }).getTime() - 120 * MINUTE_MS);
+  const mixTaken = accountTakenSlots({ accountId: 'mix', jobs: CAPACITY_JOBS, publications, from, excludeShortId: null });
+  assert.deepEqual(isoList(mixTaken), ['2026-10-18T15:00:00.000Z', '2026-10-18T16:00:00.000Z']);
+  const boniTaken = accountTakenSlots({ accountId: 'cortes_do_boni', jobs: CAPACITY_JOBS, publications, from, excludeShortId: null });
+  assert.deepEqual(isoList(boniTaken), ['2026-10-18T15:00:00.000Z']);
+  assert.equal(accountSlotProblem({ account: MIX_ACCOUNT, at: saoPauloInstant(18, 12), taken: mixTaken }), 'spacing');
+
+  const beforeMidnight = saoPauloInstant(18, 23);
+  const afterMidnight = new Date(zonedTimeToUtc({ year: 2026, month: 10, day: 19, hour: 0, minute: 30, timeZone: SAO_PAULO }).getTime());
+  assert.equal(accountSlotProblem({ account: MIX_ACCOUNT, at: afterMidnight, taken: [beforeMidnight] }), 'spacing');
+  assert.equal(accountSlotProblem({ account: MIX_ACCOUNT, at: afterMidnight, taken: [saoPauloInstant(18, 12), saoPauloInstant(18, 19), saoPauloInstant(18, 21)] }), null);
 });

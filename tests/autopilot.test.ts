@@ -10,7 +10,7 @@ import { createInitialEdit, type ShortEdit, type WordRange } from '../src/domain
 import { buildSentences } from '../src/domain/policies.js';
 import type { LayoutProfile } from '../src/domain/layout.js';
 import { zonedDateParts, zonedTimeToUtc, type PostingSchedule } from '../src/domain/schedule.js';
-import type { AutopilotVideoRecord, CreatorProfile, ExportRecord, JobRecord, PublicationRecord, ShortRecord, TranscriptWord } from '../src/domain/model.js';
+import type { AutopilotVideoRecord, CreatorProfile, ExportRecord, JobRecord, PublicationRecord, PublishingAccount, ShortRecord, TranscriptWord } from '../src/domain/model.js';
 import { ShortsStore } from '../src/infra/db.js';
 import type { AppConfig } from '../src/infra/env.js';
 import { CreatorProfileRepository } from '../src/infra/creator-profile-loader.js';
@@ -22,6 +22,15 @@ import { nowIso } from '../src/infra/util.js';
 const HOUR_MS = 3_600_000;
 
 const SCHEDULE: PostingSchedule = { timeZone: 'America/Sao_Paulo', slots: ['12:00', '19:00', '21:00'] };
+
+const ACCOUNT_A: PublishingAccount = {
+  id: 'account_a',
+  displayName: 'Account A',
+  schedule: SCHEDULE,
+  platforms: ['instagram', 'tiktok', 'youtube_shorts'],
+  mallaryProfileId: 'mallary_a',
+  buffer: true,
+};
 
 const AUTOPILOT_CONFIG = {
   channelUrl: 'https://www.youtube.com/@filipe_boni/videos',
@@ -37,13 +46,13 @@ const CREATOR: CreatorProfile = {
   id: 'creator_a',
   displayName: 'Creator A',
   enabled: true,
-  render: { layoutPath: 'layouts/creator_a.json', layoutId: 'center-speaker-vertical-v2' },
-  publish: {
-    instagram: { mode: 'global' },
-    tiktok: { mode: 'global' },
-    youtube_shorts: { mode: 'global' },
+  accountId: 'account_a',
+  render: {
+    layoutPath: 'layouts/creator_a.json',
+    layoutId: 'center-speaker-vertical-v2',
+    defaultSpeed: 1,
+    scene: null,
   },
-  schedule: SCHEDULE,
   autopilot: AUTOPILOT_CONFIG,
 };
 
@@ -61,12 +70,11 @@ function transcriptWords(): TranscriptWord[] {
 
 function layoutJson(creatorId: string) {
   return {
-    version: 2,
-    creatorId,
+    version: 3,
+    strategy: 'fixed',
     layoutId: 'center-speaker-vertical-v2',
     canvas: { width: 1080, height: 1920, fps: 30 },
     background: '#101010',
-    defaultSpeed: 1,
     font: { family: 'Montserrat ExtraBold', file: 'assets/fonts/Montserrat-ExtraBold.ttf', assSizeScale: 1.562 },
     panels: [{
       id: 'speaker',
@@ -89,6 +97,7 @@ function layoutJson(creatorId: string) {
       maxLines: 2,
       centerY: 0.72,
     },
+    safeArea: { top: 0.135, bottom: 0.17, side: 0.055 },
   };
 }
 
@@ -138,6 +147,9 @@ function jobRecord(creator: CreatorProfile, rootDir: string, videoId: string, ov
     chosenSpeakerId: 'speaker_0',
     hostFraming: null,
     hostFramingAnalyzedAt: nowIso(),
+    sceneTrack: null,
+    sceneAnalysis: 'none',
+    sceneAnalysisError: null,
     failedTaskKind: null,
     error: null,
     createdAt: nowIso(),
@@ -152,9 +164,11 @@ function fakePublisher(): ShortVideoPublishProvider {
     supportedPlatforms: ['instagram', 'tiktok', 'youtube_shorts'],
     supportsScheduling: true,
     supports: () => true,
+    canPublish: () => true,
     publishShortVideo: async () => {
       throw new Error('publisher must not be called from the autopilot tests');
     },
+    checkPublication: async () => ({ status: 'pending', url: null, error: null }),
     cancelScheduled: async () => {
       throw new Error('publisher cancel must not be called from the autopilot tests');
     },
@@ -175,14 +189,20 @@ interface TestContext {
   enteredCheck: () => Promise<void>;
 }
 
-async function makeContext(): Promise<TestContext> {
+async function makeContext(options: { accounts?: PublishingAccount[]; creators?: CreatorProfile[] } = {}): Promise<TestContext> {
   const rootDir = await mkdtemp(join(tmpdir(), 'autopilot-'));
   await mkdir(join(rootDir, 'layouts'), { recursive: true });
-  await writeFile(join(rootDir, 'layouts', 'creator_a.json'), JSON.stringify(layoutJson('creator_a')));
+  const accounts = options.accounts ?? [ACCOUNT_A];
+  const creators = options.creators ?? [CREATOR];
+  for (const creator of creators) {
+    await mkdir(join(rootDir, 'layouts'), { recursive: true });
+    await writeFile(join(rootDir, creator.render.layoutPath), JSON.stringify(layoutJson(creator.id)));
+  }
   await writeFile(join(rootDir, 'creator-profiles.json'), JSON.stringify({
-    version: 2,
-    defaultCreatorId: 'creator_a',
-    creators: [CREATOR],
+    version: 3,
+    defaultCreatorId: creators[0]?.id ?? 'creator_a',
+    accounts,
+    creators,
   }));
   const store = await ShortsStore.open(join(rootDir, 'shorts.sqlite'));
   const profiles = new CreatorProfileRepository({ rootDir, manifestPath: join(rootDir, 'creator-profiles.json') });
@@ -288,6 +308,8 @@ function seedReadyShort(store: ShortsStore, creator: CreatorProfile, rootDir: st
     edit,
     title,
     hostFraming: null,
+    layoutProfileSnapshot: job.layoutProfileSnapshot,
+    sceneTrack: null,
     status: 'ready',
     artifactPath: join(rootDir, `export_${videoId}_${rank}.mp4`),
     coverPath: null,
@@ -301,9 +323,9 @@ function seedReadyShort(store: ShortsStore, creator: CreatorProfile, rootDir: st
   return { jobId: job.id, shortId: short.id, exportId: exportRecord.id };
 }
 
-function seedTrackedVideo(store: ShortsStore, videoId: string, jobId: string, detectedAt: Date): AutopilotVideoRecord {
+function seedTrackedVideo(store: ShortsStore, videoId: string, jobId: string, detectedAt: Date, creatorId: string = CREATOR.id): AutopilotVideoRecord {
   const record: AutopilotVideoRecord = {
-    creatorId: CREATOR.id,
+    creatorId,
     videoId,
     title: `Video ${videoId}`,
     status: 'tracked',
@@ -761,6 +783,201 @@ test('a scheduled publish conflicts with a nearby scheduled post of another shor
     const immediate = await context.service.publish(third.exportId, { platforms: ['instagram'], force: false, scheduledAt: null });
     assert.equal(immediate.length, 1);
     assert.equal(immediate[0]?.scheduledFor, null);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('two creators on Mix share slots and Boni books independently', async () => {
+  const mixAccount: PublishingAccount = {
+    id: 'mix',
+    displayName: 'Mix',
+    schedule: SCHEDULE,
+    platforms: ['instagram', 'tiktok'],
+    mallaryProfileId: 'mix_mallary_id',
+    buffer: false,
+  };
+  const boniAccount: PublishingAccount = {
+    id: 'cortes_do_boni',
+    displayName: 'Cortes do Boni',
+    schedule: SCHEDULE,
+    platforms: ['instagram', 'tiktok', 'youtube_shorts'],
+    mallaryProfileId: 'boni_mallary_id',
+    buffer: true,
+  };
+  const creatorMix1: CreatorProfile = {
+    id: 'creator_mix_1',
+    displayName: 'Creator Mix 1',
+    enabled: true,
+    accountId: 'mix',
+    render: { layoutPath: 'layouts/mix_1.json', layoutId: 'center-speaker-vertical-v2', defaultSpeed: 1, scene: null },
+    autopilot: { ...AUTOPILOT_CONFIG, channelUrl: 'https://www.youtube.com/@mix1/videos' },
+  };
+  const creatorMix2: CreatorProfile = {
+    id: 'creator_mix_2',
+    displayName: 'Creator Mix 2',
+    enabled: true,
+    accountId: 'mix',
+    render: { layoutPath: 'layouts/mix_2.json', layoutId: 'center-speaker-vertical-v2', defaultSpeed: 1, scene: null },
+    autopilot: { ...AUTOPILOT_CONFIG, channelUrl: 'https://www.youtube.com/@mix2/videos' },
+  };
+  const creatorBoni: CreatorProfile = {
+    id: 'creator_boni',
+    displayName: 'Creator Boni',
+    enabled: true,
+    accountId: 'cortes_do_boni',
+    render: { layoutPath: 'layouts/boni.json', layoutId: 'center-speaker-vertical-v2', defaultSpeed: 1, scene: null },
+    autopilot: { ...AUTOPILOT_CONFIG, channelUrl: 'https://www.youtube.com/@boni/videos' },
+  };
+
+  const context = await makeContext({
+    accounts: [mixAccount, boniAccount],
+    creators: [creatorMix1, creatorMix2, creatorBoni],
+  });
+
+  try {
+    const mix1Short1 = seedReadyShort(context.store, creatorMix1, context.rootDir, 'm1_vid1', 1);
+    const mix1Short2 = seedReadyShort(context.store, creatorMix1, context.rootDir, 'm1_vid2', 1);
+    const mix2Short1 = seedReadyShort(context.store, creatorMix2, context.rootDir, 'm2_vid1', 1);
+    const mix2Short2 = seedReadyShort(context.store, creatorMix2, context.rootDir, 'm2_vid2', 1);
+    const boniShort1 = seedReadyShort(context.store, creatorBoni, context.rootDir, 'b_vid1', 1);
+    const boniShort2 = seedReadyShort(context.store, creatorBoni, context.rootDir, 'b_vid2', 1);
+
+    seedTrackedVideo(context.store, 'm1_vid1', mix1Short1.jobId, new Date(context.clock().getTime() - 2 * HOUR_MS), creatorMix1.id);
+    seedTrackedVideo(context.store, 'm1_vid2', mix1Short2.jobId, new Date(context.clock().getTime() - HOUR_MS), creatorMix1.id);
+    seedTrackedVideo(context.store, 'm2_vid1', mix2Short1.jobId, new Date(context.clock().getTime() - 2 * HOUR_MS), creatorMix2.id);
+    seedTrackedVideo(context.store, 'm2_vid2', mix2Short2.jobId, new Date(context.clock().getTime() - HOUR_MS), creatorMix2.id);
+    seedTrackedVideo(context.store, 'b_vid1', boniShort1.jobId, new Date(context.clock().getTime() - 2 * HOUR_MS), creatorBoni.id);
+    seedTrackedVideo(context.store, 'b_vid2', boniShort2.jobId, new Date(context.clock().getTime() - HOUR_MS), creatorBoni.id);
+
+    await context.autopilot.setEnabled(creatorMix1.id, { enabled: true });
+    await context.autopilot.setEnabled(creatorMix2.id, { enabled: true });
+    await context.autopilot.setEnabled(creatorBoni.id, { enabled: true });
+
+    await context.autopilot.tick();
+
+    const expected = upcomingSlots(
+      SCHEDULE,
+      new Date(context.clock().getTime() + AUTOPILOT_CONFIG.reviewWindowHours * HOUR_MS),
+      new Date(context.clock().getTime() + AUTOPILOT_CONFIG.bookingHorizonHours * HOUR_MS),
+      4,
+    );
+
+    const boniPubs1 = publicationsFor(context.store, boniShort1.shortId);
+    const boniPubs2 = publicationsFor(context.store, boniShort2.shortId);
+    assert.ok(boniPubs1.length > 0);
+    assert.ok(boniPubs2.length > 0);
+    const boniSlots = [...boniPubs1, ...boniPubs2].map((p) => p.scheduledFor);
+    assert.ok(boniSlots.includes(expected[0]?.toISOString()));
+    assert.ok(boniSlots.includes(expected[1]?.toISOString()));
+
+    const m1Pubs1 = publicationsFor(context.store, mix1Short1.shortId);
+    const m1Pubs2 = publicationsFor(context.store, mix1Short2.shortId);
+    const m2Pubs1 = publicationsFor(context.store, mix2Short1.shortId);
+    const m2Pubs2 = publicationsFor(context.store, mix2Short2.shortId);
+
+    const mixBookedSlots = [
+      ...m1Pubs1.map((p) => p.scheduledFor),
+      ...m1Pubs2.map((p) => p.scheduledFor),
+      ...m2Pubs1.map((p) => p.scheduledFor),
+      ...m2Pubs2.map((p) => p.scheduledFor),
+    ].filter((s): s is string => s !== null);
+
+    assert.ok(new Set(mixBookedSlots).size >= 2);
+    const m1Slots = new Set([...m1Pubs1, ...m1Pubs2].map((p) => p.scheduledFor));
+    const m2Slots = new Set([...m2Pubs1, ...m2Pubs2].map((p) => p.scheduledFor));
+    for (const slot of m1Slots) {
+      assert.equal(m2Slots.has(slot), false);
+    }
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('unconnected account keeps new autopilots off and reports connection reason', async () => {
+  const unconnectedAccount: PublishingAccount = {
+    id: 'mix_unconnected',
+    displayName: 'Mix Unconnected',
+    schedule: SCHEDULE,
+    platforms: ['instagram', 'tiktok'],
+    mallaryProfileId: null,
+    buffer: false,
+  };
+  const mixCreator: CreatorProfile = {
+    id: 'creator_mix_unconn',
+    displayName: 'Mix Creator',
+    enabled: true,
+    accountId: 'mix_unconnected',
+    render: { layoutPath: 'layouts/mix_unconn.json', layoutId: 'center-speaker-vertical-v2', defaultSpeed: 1, scene: null },
+    autopilot: AUTOPILOT_CONFIG,
+  };
+
+  const context = await makeContext({
+    accounts: [unconnectedAccount],
+    creators: [mixCreator],
+  });
+
+  try {
+    const statuses = await context.autopilot.list();
+    const mixStatus = statuses.find((s) => s.creatorId === mixCreator.id);
+    assert.ok(mixStatus);
+    assert.equal(mixStatus.accountConnected, false);
+    assert.equal(mixStatus.reason, 'Account not connected in Mallary');
+    assert.equal(mixStatus.enabled, false);
+
+    await assert.rejects(
+      context.autopilot.setEnabled(mixCreator.id, { enabled: true }),
+      (error: unknown) => error instanceof StudioError
+        && error.code === 'invalid'
+        && error.message === 'Account not connected in Mallary',
+    );
+
+    context.uploads.push(upload('mixvid0001'));
+    await context.autopilot.tick();
+
+    assert.equal(context.uploadCalls.length, 0);
+    assert.equal(context.store.listJobSummaries().length, 0);
+    assert.equal(context.store.listAutopilotVideos(mixCreator.id).length, 0);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('capacity is rechecked after manual bookings during autopilot awaits', async () => {
+  const context = await makeContext({ creators: [{ ...CREATOR, autopilot: { ...AUTOPILOT_CONFIG, bookingHorizonHours: 72 } }] });
+  try {
+    const raceCreator: CreatorProfile = { ...CREATOR, autopilot: { ...AUTOPILOT_CONFIG, bookingHorizonHours: 72 } };
+    const first = seedReadyShort(context.store, raceCreator, context.rootDir, 'racevid0001', 1);
+    const second = seedReadyShort(context.store, raceCreator, context.rootDir, 'racevid0002', 1);
+    const manual = seedReadyShort(context.store, raceCreator, context.rootDir, 'racevid0003', 1);
+    seedTrackedVideo(context.store, 'racevid0001', first.jobId, new Date(context.clock().getTime() - 2 * HOUR_MS));
+    seedTrackedVideo(context.store, 'racevid0002', second.jobId, new Date(context.clock().getTime() - HOUR_MS));
+
+    const from = new Date(context.clock().getTime() + AUTOPILOT_CONFIG.reviewWindowHours * HOUR_MS);
+    const to = new Date(context.clock().getTime() + 72 * HOUR_MS);
+    const slots = upcomingSlots(SCHEDULE, from, to, 3);
+    assert.ok(slots.length >= 3);
+
+    const originalPublish = context.service.publish.bind(context.service);
+    let publishCount = 0;
+    context.service.publish = async (exportId, input) => {
+      publishCount += 1;
+      if (publishCount === 1) {
+        seedBlockPublication(context.store, manual.jobId, manual.shortId, 'pub_manual_intervene', slots[1]);
+      }
+      return originalPublish(exportId, input);
+    };
+
+    await enableAutopilot(context);
+    await context.autopilot.tick();
+
+    const firstPubs = publicationsFor(context.store, first.shortId);
+    const secondPubs = publicationsFor(context.store, second.shortId);
+    assert.ok(firstPubs.length > 0);
+    assert.ok(secondPubs.length > 0);
+
+    assert.equal(secondPubs[0]?.scheduledFor, slots[0].toISOString());
+    assert.equal(firstPubs[0]?.scheduledFor, slots[2].toISOString());
   } finally {
     await cleanup(context);
   }

@@ -1,26 +1,64 @@
 {
-  "version": 2,
+  "version": 3,
   "defaultCreatorId": "filipe_boni",
+  "accounts": [
+    {
+      "id": "cortes_do_boni",
+      "displayName": "Cortes do Boni",
+      "schedule": {
+        "timeZone": "America/Sao_Paulo",
+        "slots": [
+          "12:00",
+          "19:00",
+          "21:00"
+        ]
+      },
+      "platforms": [
+        "instagram",
+        "tiktok"
+      ],
+      "mallaryProfileId": "S83DPA58Wwx",
+      "buffer": true
+    },
+    {
+      "id": "mix",
+      "displayName": "Mix",
+      "schedule": {
+        "timeZone": "America/Sao_Paulo",
+        "slots": [
+          "12:00",
+          "19:00",
+          "21:00"
+        ]
+      },
+      "platforms": [
+        "instagram",
+        "tiktok"
+      ],
+      "mallaryProfileId": null,
+      "buffer": false
+    }
+  ],
   "creators": [
     {
       "id": "filipe_boni",
       "displayName": "Filipe Boni",
       "enabled": true,
-      "description": "Default Filipe Boni render/publish profile.",
+      "description": "Perfil de produção do Cortes do Boni.",
+      "accountId": "cortes_do_boni",
       "render": {
         "layoutPath": "profiles/filipe_boni_layout.json",
-        "layoutId": "screen-top-host-bottom-v2"
+        "layoutId": "screen-top-host-bottom-v2",
+        "defaultSpeed": 1.5,
+        "scene": null
       },
-      "publish": {
-        "instagram": { "mode": "global" },
-        "tiktok": { "mode": "global" },
-        "youtube_shorts": { "mode": "global" }
-      },
-      "schedule": { "timeZone": "America/Sao_Paulo", "slots": ["12:00", "19:00", "21:00"] },
       "autopilot": {
         "channelUrl": "https://www.youtube.com/@filipe_boni/videos",
         "shortsPerVideo": 2,
-        "platforms": ["instagram", "tiktok"],
+        "platforms": [
+          "instagram",
+          "tiktok"
+        ],
         "reviewWindowHours": 3,
         "bookingHorizonHours": 24,
         "maxShortAgeHours": 48,
@@ -31,17 +69,137 @@
       "id": "jones_manoel",
       "displayName": "Jones Manoel",
       "enabled": true,
-      "description": "Safe render-only experimentation profile for Jones Manoel.",
+      "description": "Perfil de experimentação, sem conta de publicação.",
+      "accountId": null,
       "render": {
         "layoutPath": "profiles/jones_manoel_layout.json",
-        "layoutId": "center-speaker-vertical-v2"
+        "layoutId": "center-speaker-vertical-v2",
+        "defaultSpeed": 1.0,
+        "scene": null
+      }
+    },
+    {
+      "id": "samuel_borelli",
+      "displayName": "Samuel Borelli",
+      "enabled": true,
+      "accountId": "mix",
+      "render": {
+        "layoutPath": "profiles/mix_layout.json",
+        "layoutId": "mix-scenes-v3",
+        "defaultSpeed": 1.25,
+        "scene": {
+          "hostDescription": "Samuel Borelli: homem de cabelo curto escuro e barba escura, camiseta escura, falando ao microfone em uma webcam no quarto. A câmera costuma ser um pequeno inset à direita e pode desaparecer.",
+          "hints": "O apresentador é o homem da webcam, não as pessoas das reportagens ou vídeos. A webcam pode estar no canto superior ou inferior direito. Separe intérpretes de Libras, logotipos e rodapés como overlays; exclua o fundo desfocado de vídeos verticais."
+        }
       },
-      "publish": {
-        "instagram": { "mode": "disabled" },
-        "tiktok": { "mode": "disabled" },
-        "youtube_shorts": { "mode": "disabled" }
+      "autopilot": {
+        "channelUrl": "https://www.youtube.com/channel/UC3gQ9lIiPQj7frT5CE5QyRA/videos",
+        "shortsPerVideo": 2,
+        "platforms": [
+          "instagram",
+          "tiktok"
+        ],
+        "reviewWindowHours": 3,
+        "bookingHorizonHours": 24,
+        "maxShortAgeHours": 48,
+        "minVideoSeconds": 480
+      }
+    },
+    {
+      "id": "jose_kobori",
+      "displayName": "José Kobori",
+      "enabled": true,
+      "accountId": "mix",
+      "render": {
+        "layoutPath": "profiles/mix_layout.json",
+        "layoutId": "mix-scenes-v3",
+        "defaultSpeed": 1.25,
+        "scene": {
+          "hostDescription": "José Kobori: homem mais velho de cabelo grisalho, óculos retangulares, fones de ouvido e camisa branca, sentado diante de um microfone de podcast, com estantes e mapa ao fundo.",
+          "hints": "Geralmente a câmera ocupa o quadro inteiro. QR code no alto à esquerda é overlay. Uma pergunta escrita pode cobrir o rosto; marque o texto como conteúdo. Em alguns trechos o apresentador fica à esquerda e um vídeo à direita."
+        }
       },
-      "schedule": { "timeZone": "America/Sao_Paulo", "slots": ["12:00", "19:00", "21:00"] }
+      "autopilot": {
+        "channelUrl": "https://www.youtube.com/channel/UCOKSOW5uJHdW7Edz37mvAFw/videos",
+        "shortsPerVideo": 2,
+        "platforms": [
+          "instagram",
+          "tiktok"
+        ],
+        "reviewWindowHours": 3,
+        "bookingHorizonHours": 24,
+        "maxShortAgeHours": 48,
+        "minVideoSeconds": 480
+      }
+    },
+    {
+      "id": "gustavo_gaiofato",
+      "displayName": "Gustavo Gaiofato",
+      "enabled": true,
+      "accountId": "mix",
+      "render": {
+        "layoutPath": "profiles/mix_layout.json",
+        "layoutId": "mix-scenes-v3",
+        "defaultSpeed": 1.25,
+        "scene": {
+          "hostDescription": "Gustavo Gaiofato: homem de cabelo escuro curto e encaracolado, óculos redondos, bigode espesso e barba, camiseta preta, webcam em um cômodo com estantes. Pode ocupar o quadro ou aparecer em um inset no alto à direita.",
+          "hints": "O chat ao vivo e o QR code à direita são overlays, não conteúdo. Pessoas em chamadas de vídeo são conteúdo, não o apresentador. Exclua margens cinzentas das chamadas e a webcam sobreposta à imagem principal."
+        }
+      },
+      "autopilot": {
+        "channelUrl": "https://www.youtube.com/channel/UCqbz_4hrf2D58UFBOleuFnQ/videos",
+        "shortsPerVideo": 2,
+        "platforms": [
+          "instagram",
+          "tiktok"
+        ],
+        "reviewWindowHours": 3,
+        "bookingHorizonHours": 24,
+        "maxShortAgeHours": 48,
+        "minVideoSeconds": 480
+      }
+    },
+    {
+      "id": "gustavo_machado",
+      "displayName": "Gustavo Machado",
+      "enabled": true,
+      "accountId": "mix",
+      "render": {
+        "layoutPath": "profiles/mix_layout.json",
+        "layoutId": "mix-scenes-v3",
+        "defaultSpeed": 1.25,
+        "scene": {
+          "hostDescription": "Gustavo Machado: homem de cabelo curto grisalho e cavanhaque pontudo escuro e grisalho, camiseta cinza, filmado de perto pela webcam; normalmente ocupa o painel esquerdo.",
+          "hints": "O painel direito contém slides, tabelas, gráficos ou divulgação de livro; classifique como document. Preserve linhas completas e números relevantes das tabelas. Separe a câmera esquerda dos limites exatos dos slides à direita."
+        }
+      },
+      "autopilot": {
+        "channelUrl": "https://www.youtube.com/channel/UCRLEkZpNRoZQBG8kUTBD8vQ/videos",
+        "shortsPerVideo": 2,
+        "platforms": [
+          "instagram",
+          "tiktok"
+        ],
+        "reviewWindowHours": 3,
+        "bookingHorizonHours": 24,
+        "maxShortAgeHours": 48,
+        "minVideoSeconds": 480
+      }
+    },
+    {
+      "id": "raul_sena_flow",
+      "displayName": "Raul Sena in Flow",
+      "enabled": true,
+      "accountId": "mix",
+      "render": {
+        "layoutPath": "profiles/mix_layout.json",
+        "layoutId": "mix-scenes-v3",
+        "defaultSpeed": 1.25,
+        "scene": {
+          "hostDescription": "Raul Sena (Investidor Sardinha): homem jovem de cabelo escuro ondulado e volumoso, barba curta, camiseta preta, falando num microfone de podcast; em close fica à direita do quadro diante de uma parede azul-escura com estantes.",
+          "hints": "Entrevista de podcast com duas pessoas e câmeras alternadas: close do Raul, close do entrevistador (homem de barba cheia em outro cenário) e plano aberto da mesa com os dois. O apresentador é sempre o Raul. Quando só o entrevistador aparece, marque host_visible=false e o quadro inteiro como conteúdo person, com subject na cabeça e ombros do entrevistador. QR code no alto à esquerda e logotipo Flow no alto à direita são overlays."
+        }
+      }
     }
   ]
 }

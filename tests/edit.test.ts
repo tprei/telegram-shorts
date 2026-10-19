@@ -11,6 +11,7 @@ import {
   keptWordIndices,
   normalizeEdit,
   normalizeFillerToken,
+  normalizeSceneEdit,
   removeCropKeyframe,
   removeRangeAt,
   replaceAutoCrops,
@@ -21,7 +22,8 @@ import {
   upsertCropKeyframe,
 } from '../src/domain/edit.js';
 import type { ShortEdit } from '../src/domain/edit.js';
-import type { TranscriptWord } from '../src/domain/model.js';
+import type { SceneTrack, TranscriptWord } from '../src/domain/model.js';
+import type { FixedLayoutProfile, ScenesLayoutProfile } from '../src/domain/layout.js';
 
 function word(text: string, index: number, secondsPerWord = 1): TranscriptWord {
   return {
@@ -49,6 +51,7 @@ function baseEdit(): ShortEdit {
     crops: [],
     zoom: { enabled: true, strength: 1.12 },
     endCard: { enabled: false },
+    layout: { split: null, overrides: [] },
   };
 }
 
@@ -262,5 +265,238 @@ test('replaceAutoCrops keeps manual keyframes and a manual wins against a near a
   assert.deepEqual(
     edit.crops.map((crop) => crop.origin),
     ['auto', 'manual'],
+  );
+});
+
+function fixedEditLayout(): FixedLayoutProfile {
+  return {
+    version: 3,
+    layoutId: 'screen-top-host-bottom-v2',
+    strategy: 'fixed',
+    canvas: { width: 1080, height: 1920, fps: 30 },
+    background: '#101010',
+    safeArea: { top: 0, bottom: 0, side: 0 },
+    font: { family: 'Montserrat ExtraBold', file: 'assets/fonts/Montserrat-ExtraBold.ttf', assSizeScale: 1.562 },
+    captions: {
+      sizePx: 62,
+      textColor: '#FFFFFF',
+      highlightColor: '#FFD400',
+      outlineColor: '#000000',
+      outlinePx: 6,
+      shadowPx: 0,
+      uppercase: true,
+      maxWordsPerCue: 4,
+      maxCharsPerLine: 22,
+      maxLines: 2,
+      centerY: 0.92,
+    },
+    hookBand: null,
+    safeArea: { top: 0.135, bottom: 0.17, side: 0.055 },
+    panels: [
+      { id: 'screen', role: 'content', sourceRect: { x: 0, y: 0, w: 0.632, h: 1 }, canvasRect: { x: 0, y: 0.1146, w: 1, h: 0.4375 } },
+      {
+        id: 'host',
+        role: 'host',
+        sourceRect: { x: 0.637, y: 0, w: 0.363, h: 1 },
+        canvasRect: { x: 0, y: 0.5521, w: 1, h: 0.4479 },
+        anchor: { x: 0.5, y: 0.42 },
+      },
+    ],
+  };
+}
+
+function scenesEditLayout(): ScenesLayoutProfile {
+  return {
+    version: 3,
+    layoutId: 'mix-scenes-v3',
+    strategy: 'scenes',
+    canvas: { width: 1080, height: 1920, fps: 30 },
+    background: '#101010',
+    safeArea: { top: 0, bottom: 0, side: 0 },
+    hookBand: {
+      rect: { x: 0, y: 0, w: 1, h: 220 / 1920 },
+      background: '#C8102E',
+      textColor: '#FFFFFF',
+      sizePx: 58,
+      maxCharsPerLine: 24,
+      maxLines: 2,
+      uppercase: true,
+    },
+    font: { family: 'Montserrat ExtraBold', file: 'assets/fonts/Montserrat-ExtraBold.ttf', assSizeScale: 1.562 },
+    captions: {
+      sizePx: 62,
+      textColor: '#FFFFFF',
+      highlightColor: '#FFD400',
+      outlineColor: '#000000',
+      outlinePx: 6,
+      shadowPx: 0,
+      uppercase: true,
+      maxWordsPerCue: 4,
+      maxCharsPerLine: 22,
+      maxLines: 2,
+      centerY: 0.92,
+    },
+    safeArea: { top: 0.135, bottom: 0.17, side: 0.055 },
+    scene: { captionCenterY: { host: 0.85, content: 0.9 } },
+  };
+}
+
+function sceneEditTrack(): SceneTrack {
+  return {
+    version: 1,
+    analyzedAt: '2026-10-19T10:00:00.000Z',
+    frame: { width: 1920, height: 1080 },
+    segments: [
+      {
+        startSeconds: 0,
+        endSeconds: 10,
+        host: {
+          camera: { x: 0.1, y: 0.6, w: 0.6, h: 0.35 },
+          head: { x: 0.4, y: 0.7, w: 0.2, h: 0.15 },
+        },
+        content: {
+          box: { x: 0.05, y: 0.05, w: 0.9, h: 0.55 },
+          kind: 'document',
+          vertical: false,
+          subject: { x: 0.2, y: 0.1, w: 0.4, h: 0.3 },
+        },
+        overlays: [],
+      },
+      {
+        startSeconds: 10,
+        endSeconds: 20,
+        host: null,
+        content: {
+          box: { x: 0, y: 0, w: 1, h: 1 },
+          kind: 'footage',
+          vertical: false,
+          subject: { x: 0.25, y: 0.25, w: 0.5, h: 0.5 },
+        },
+        overlays: [],
+      },
+      {
+        startSeconds: 20,
+        endSeconds: 30,
+        host: {
+          camera: { x: 0.1, y: 0.6, w: 0.6, h: 0.35 },
+          head: { x: 0.4, y: 0.7, w: 0.2, h: 0.15 },
+        },
+        content: null,
+        overlays: [],
+      },
+    ],
+  };
+}
+
+test('scene overrides target one segment and impossible modes are rejected', () => {
+  const layout = scenesEditLayout();
+  const track = sceneEditTrack();
+  const canonical = normalizeSceneEdit(
+    { ...baseEdit(), layout: { split: null, overrides: [{ sourceSeconds: 5, composition: 'content' }] } },
+    layout,
+    track,
+  );
+  assert.deepEqual(canonical.layout.overrides, [{ sourceSeconds: 0, composition: 'content' }]);
+  const duplicate = normalizeSceneEdit(
+    {
+      ...baseEdit(),
+      layout: {
+        split: 0.55,
+        overrides: [
+          { sourceSeconds: 5, composition: 'host' },
+          { sourceSeconds: 7, composition: 'content' },
+        ],
+      },
+    },
+    layout,
+    track,
+  );
+  assert.deepEqual(duplicate.layout.overrides, [{ sourceSeconds: 0, composition: 'content' }]);
+  assert.equal(duplicate.layout.split, 0.55);
+  assert.throws(
+    () => normalizeSceneEdit({ ...baseEdit(), layout: { split: null, overrides: [{ sourceSeconds: 15, composition: 'host' }] } }, layout, track),
+    /no usable host/,
+  );
+  assert.throws(
+    () => normalizeSceneEdit({ ...baseEdit(), layout: { split: null, overrides: [{ sourceSeconds: 15, composition: 'stack' }] } }, layout, track),
+    /stack/,
+  );
+  assert.throws(
+    () => normalizeSceneEdit({ ...baseEdit(), layout: { split: null, overrides: [{ sourceSeconds: 35, composition: 'host' }] } }, layout, track),
+    /outside the scene track/,
+  );
+  assert.throws(
+    () => normalizeSceneEdit({ ...baseEdit(), layout: { split: 0.5, overrides: [] } }, fixedEditLayout(), null),
+    /Fixed layouts reject scene layout edits/,
+  );
+  assert.throws(
+    () => normalizeSceneEdit({ ...baseEdit(), layout: { split: null, overrides: [{ sourceSeconds: 1, composition: 'host' }] } }, fixedEditLayout(), null),
+    /Fixed layouts reject scene layout edits/,
+  );
+  const untouched = normalizeSceneEdit(baseEdit(), fixedEditLayout(), null);
+  assert.deepEqual(untouched.layout, { split: null, overrides: [] });
+  assert.throws(
+    () => normalizeSceneEdit({ ...baseEdit(), crops: [{ sourceSeconds: 1, focus: { x: 0, y: 0, w: 0.1, h: 0.1 }, origin: 'manual' }] }, layout, null),
+    /require scene analysis/,
+  );
+});
+
+test('normalizeEdit validates split and override times', () => {
+  assert.throws(() => normalizeEdit({ ...baseEdit(), layout: { split: 0.7, overrides: [] } }, 6));
+  assert.throws(() => normalizeEdit({ ...baseEdit(), layout: { split: 0.3, overrides: [] } }, 6));
+  assert.throws(() => normalizeEdit({ ...baseEdit(), layout: { split: Number.NaN, overrides: [] } }, 6));
+  assert.throws(() => normalizeEdit({ ...baseEdit(), layout: { split: null, overrides: [{ sourceSeconds: -1, composition: 'host' }] } }, 6));
+  const deduped = normalizeEdit(
+    {
+      ...baseEdit(),
+      layout: {
+        split: null,
+        overrides: [
+          { sourceSeconds: 3, composition: 'host' },
+          { sourceSeconds: 2, composition: 'content' },
+          { sourceSeconds: 3, composition: 'stack' },
+        ],
+      },
+    },
+    6,
+  );
+  assert.deepEqual(deduped.layout.overrides, [
+    { sourceSeconds: 2, composition: 'content' },
+    { sourceSeconds: 3, composition: 'stack' },
+  ]);
+});
+
+test('scene focus is local to its content box and is rejected outside it', () => {
+  const layout = scenesEditLayout();
+  const track = sceneEditTrack();
+  const local = normalizeSceneEdit(
+    { ...baseEdit(), crops: [{ sourceSeconds: 4, focus: { x: 0.1, y: 0.2, w: 0.3, h: 0.3 }, origin: 'manual' }] },
+    layout,
+    track,
+  );
+  assert.deepEqual(local.crops, [{ sourceSeconds: 4, focus: { x: 0.1, y: 0.2, w: 0.3, h: 0.3 }, origin: 'manual' }]);
+  assert.throws(
+    () => normalizeSceneEdit(
+      { ...baseEdit(), crops: [{ sourceSeconds: 4, focus: { x: 0.5, y: 0.2, w: 0.6, h: 0.3 }, origin: 'manual' }] },
+      layout,
+      track,
+    ),
+    /inside its content box/,
+  );
+  assert.throws(
+    () => normalizeSceneEdit(
+      { ...baseEdit(), crops: [{ sourceSeconds: 25, focus: { x: 0.1, y: 0.2, w: 0.3, h: 0.3 }, origin: 'auto' }] },
+      layout,
+      track,
+    ),
+    /no content/,
+  );
+  assert.throws(
+    () => normalizeSceneEdit(
+      { ...baseEdit(), crops: [{ sourceSeconds: 35, focus: { x: 0.1, y: 0.2, w: 0.3, h: 0.3 }, origin: 'auto' }] },
+      layout,
+      track,
+    ),
+    /outside the scene track/,
   );
 });

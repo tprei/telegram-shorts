@@ -1,5 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
-import type { ExportDto, PlatformAvailabilityDto, PublicationDto, ScheduledPostDto } from '@api';
+import type { ExportDto, PlatformAvailabilityDto, PublicationDto } from '@api';
 import type { PostingSchedule, PublicationStatus, ShortVideoPlatform } from '@domain/model';
 import { scheduledAtProblem, SCHEDULE_LIMITS, suggestPostingSlots, zonedTimeToUtc } from '@domain/schedule';
 import { ApiError, Button, EmptyState, Icon, ScheduleCancelButton } from './StudioPrimitives';
@@ -11,8 +11,9 @@ export interface PublishPanelProps {
   publications: readonly PublicationDto[];
   platforms: readonly PlatformAvailabilityDto[];
   selectedPlatforms: readonly ShortVideoPlatform[];
-  upcomingPosts: readonly ScheduledPostDto[];
-  schedule: PostingSchedule;
+  accountId: string | null;
+  schedule: PostingSchedule | null;
+  takenSlots: readonly string[];
   cancellingPublicationIds?: readonly string[];
   cancelError?: string | null;
   onCancelPublication: (publicationId: string) => void;
@@ -204,8 +205,9 @@ export function PublishPanel({
   publications,
   platforms,
   selectedPlatforms,
-  upcomingPosts,
+  accountId,
   schedule,
+  takenSlots,
   cancellingPublicationIds = [],
   cancelError,
   onCancelPublication,
@@ -224,18 +226,19 @@ export function PublishPanel({
   const [customTime, setCustomTime] = useState('');
   const [timeChoice, setTimeChoice] = useState<string | null>(null);
   const [customTouched, setCustomTouched] = useState(false);
-  const suggestedSlots = useMemo(() => suggestPostingSlots({
+  const timeZone = schedule?.timeZone ?? operatorTimeZone;
+  const suggestedSlots = useMemo(() => schedule === null ? [] : suggestPostingSlots({
     now: scheduleNow,
-    taken: upcomingPosts.map((post) => new Date(post.scheduledFor)),
+    taken: takenSlots.map((slot) => new Date(slot)),
     count: 4,
     schedule,
-  }), [upcomingPosts, scheduleNow, schedule]);
+  }), [takenSlots, scheduleNow, schedule]);
   const chosenTime = timeChoice === 'custom' ? customTime : timeChoice ?? suggestedSlots[0]?.toISOString() ?? '';
   const scheduledDate = timeChoice === 'custom'
-    ? postingDateFromInput(customTime, schedule.timeZone)
+    ? schedule !== null ? postingDateFromInput(customTime, schedule.timeZone) : null
     : chosenTime ? new Date(chosenTime) : null;
-  const scheduleFormats = postingDateFormatters(schedule.timeZone);
-  const zoneLabel = postingTimeZoneLabel(schedule.timeZone);
+  const scheduleFormats = postingDateFormatters(timeZone);
+  const zoneLabel = postingTimeZoneLabel(timeZone);
   const localFormats = postingDateFormatters(operatorTimeZone);
   const localZoneLabel = postingTimeZoneLabel(operatorTimeZone);
   const timeProblem = !scheduledDate || !Number.isFinite(scheduledDate.getTime())
@@ -338,7 +341,7 @@ export function PublishPanel({
   const forceTargets = forceOpen
     ? repostable.filter((platform) => forceDraft.platforms.includes(platform))
     : [];
-  const validTime = when === 'now' || !timeProblem;
+  const validTime = when === 'now' || (schedule !== null && !timeProblem);
   const canPublish = Boolean(latestReadyExport && copyReady && selected.length > 0 && !feedbackPending && validTime);
   const canRepost = Boolean(latestReadyExport && copyReady && repostable.length > 0 && !feedbackPending && validTime);
   const publishHelp = !latestReadyExport
@@ -393,7 +396,7 @@ export function PublishPanel({
 
   function startPublish(force: boolean, targets: ShortVideoPlatform[]) {
     if (!latestReadyExport || targets.length === 0 || feedbackPending || actionLock.current) return;
-    if (when === 'schedule' && (!scheduledDate || timeProblem || scheduledAtProblem(scheduledDate, new Date()))) {
+    if (when === 'schedule' && (schedule === null || !scheduledDate || timeProblem || scheduledAtProblem(scheduledDate, new Date()))) {
       setCustomTouched(true);
       setScheduleNow(new Date());
       return;
@@ -434,6 +437,7 @@ export function PublishPanel({
                 name={`${id}-when`}
                 value={value}
                 checked={when === value}
+                disabled={value === 'schedule' && accountId === null}
                 onChange={() => {
                   setWhen(value);
                   setScheduleNow(new Date());
@@ -445,7 +449,7 @@ export function PublishPanel({
             </label>
           ))}
         </div>
-        {when === 'schedule' && (
+        {when === 'schedule' && schedule !== null && (
           <div className="publish-schedule">
             <p className="publish-schedule-label">Suggested times · <strong>{zoneLabel}</strong></p>
             <div className="publish-slot-options" role="group" aria-label="Suggested posting times">
@@ -530,7 +534,7 @@ export function PublishPanel({
                     <PublicationOutcome
                       key={latest.id}
                       publication={latest}
-                      timeZone={schedule.timeZone}
+                      timeZone={timeZone}
                       exportItem={exports.find((item) => item.id === latest.exportId)}
                       cancellingPublicationIds={cancellingPublicationIds}
                       onCancelPublication={onCancelPublication}
@@ -553,7 +557,7 @@ export function PublishPanel({
                         <PublicationOutcome
                           key={publication.id}
                           publication={publication}
-                          timeZone={schedule.timeZone}
+                          timeZone={timeZone}
                           exportItem={exports.find((item) => item.id === publication.exportId)}
                           cancellingPublicationIds={cancellingPublicationIds}
                           onCancelPublication={onCancelPublication}
@@ -596,7 +600,7 @@ export function PublishPanel({
                           <a href={publication.url} target="_blank" rel="noopener noreferrer">
                             Live · View post <Icon name="external" size={12} />
                           </a>
-                        ) : publication ? statusLabel(publication, schedule.timeZone) : pending
+                        ) : publication ? statusLabel(publication, timeZone) : pending
                           ? 'Starting publish request…'
                           : 'Request did not complete. Check the error below before trying again.'}
                       </span>

@@ -1,9 +1,12 @@
 import { DatabaseSync } from 'node:sqlite';
 import { z } from 'zod';
 import { publicationStartedAt, type AutopilotVideoRecord, type ExportRecord, type JobRecord, type JobSummaryRecord, type PublicationRecord, type QueueTask, type QueueTaskKind, type QueueTaskPayloads, type ShortRecord } from '../domain/model.js';
+import { migrateToV8, readLegacyManifestAccountMap } from './migrate-v8.js';
 import { createId, ensureParent, nowIso, parseJson } from './util.js';
 
-const SCHEMA_VERSION = 7;
+const CropBackfillRowSchema = z.strictObject({ job_id: z.string(), short_id: z.string() });
+
+const SCHEMA_VERSION = 8;
 
 export const CHECK_PUBLISH_DELAY_MS = 15_000;
 
@@ -113,7 +116,7 @@ function parseAutopilotVideoPayload(payload: string): AutopilotVideoRecord {
 export class ShortsStore {
   constructor(private readonly db: DatabaseSync) {}
 
-  static async open(path: string): Promise<ShortsStore> {
+  static async open(path: string, options: { manifestPath?: string } = {}): Promise<ShortsStore> {
     await ensureParent(path);
     const db = new DatabaseSync(path);
     db.exec('PRAGMA journal_mode = WAL');
@@ -127,6 +130,19 @@ export class ShortsStore {
     if (userVersion !== 0 && (userVersion < 2 || userVersion > SCHEMA_VERSION)) {
       db.close();
       throw new Error(`Incompatible database at ${path}; delete it to start fresh`);
+    }
+    let legacyAccountMap: Map<string, string | null> | null = null;
+    if (userVersion >= 2 && userVersion <= 7) {
+      if (options.manifestPath === undefined) {
+        db.close();
+        throw new Error(`Database at ${path} is at schema version ${userVersion} and needs a creator manifest to migrate to version ${SCHEMA_VERSION}.`);
+      }
+      try {
+        legacyAccountMap = readLegacyManifestAccountMap(options.manifestPath);
+      } catch (error) {
+        db.close();
+        throw error;
+      }
     }
     db.exec(SCHEMA_SQL);
     db.exec('BEGIN IMMEDIATE');
@@ -148,6 +164,9 @@ export class ShortsStore {
       }
       if (userVersion >= 2 && userVersion <= 6) {
         db.exec(`UPDATE jobs SET payload_json = json_set(payload_json, '$.creatorProfileSnapshot.schedule', json('{"timeZone":"America/Sao_Paulo","slots":["12:00","19:00","21:00"]}'))`);
+      }
+      if (legacyAccountMap !== null) {
+        migrateToV8(db, legacyAccountMap);
       }
       db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
       db.exec('COMMIT');
@@ -297,7 +316,7 @@ export class ShortsStore {
     const rows = this.db.prepare("SELECT payload_json FROM jobs WHERE json_extract(payload_json, '$.media') IS NOT NULL AND json_extract(payload_json, '$.hostFramingAnalyzedAt') IS NULL").all();
     for (const payload of rows.map((row) => payloadJsonColumn(row)).filter((value): value is string => value !== null)) {
       const job = parseJson<JobRecord>(payload);
-      if (!job.layoutProfileSnapshot.panels.some((panel) => panel.role === 'host')) {
+      if (job.layoutProfileSnapshot.strategy !== 'fixed' || !job.layoutProfileSnapshot.panels.some((panel) => panel.role === 'host')) {
         continue;
       }
       const pending = this.db.prepare("SELECT 1 FROM queue_tasks WHERE kind = 'analyze_host' AND status IN ('queued', 'running') AND job_id = ? LIMIT 1").get(job.id);
@@ -306,6 +325,53 @@ export class ShortsStore {
       }
       this.enqueueTask(job.id, 'analyze_host', {});
     }
+  }
+
+  enqueueMissingSceneAnalyses(): void {
+    const rows = this.db.prepare("SELECT payload_json FROM jobs WHERE json_extract(payload_json, '$.media') IS NOT NULL AND json_extract(payload_json, '$.layoutProfileSnapshot.strategy') = 'scenes'").all();
+    for (const payload of rows.map((row) => payloadJsonColumn(row)).filter((value): value is string => value !== null)) {
+      const job = parseJson<JobRecord>(payload);
+      if (job.status === 'failed') {
+        continue;
+      }
+      if (job.sceneAnalysis === 'failed' || (job.sceneAnalysis === 'done' && job.sceneTrack !== null)) {
+        continue;
+      }
+      const pending = this.db.prepare("SELECT 1 FROM queue_tasks WHERE kind = 'analyze_scenes' AND status IN ('queued', 'running') AND job_id = ? LIMIT 1").get(job.id);
+      if (pending !== null && typeof pending === 'object') {
+        continue;
+      }
+      const ingestionFinished = job.status === 'ready' || job.status === 'awaiting_speaker';
+      const markedInFlight = job.sceneAnalysis === 'queued' || job.sceneAnalysis === 'running';
+      if (!ingestionFinished && !markedInFlight) {
+        continue;
+      }
+      this.enqueueTask(job.id, 'analyze_scenes', {});
+      if (job.sceneAnalysis !== 'queued') {
+        job.sceneAnalysis = 'queued';
+        job.sceneAnalysisError = null;
+        job.updatedAt = nowIso();
+        this.updateJob(job);
+      }
+    }
+  }
+
+  enqueueMissingCropAnalyses(): void {
+    const rows = this.db.prepare("SELECT s.job_id AS job_id, s.id AS short_id FROM shorts s JOIN jobs j ON j.id = s.job_id WHERE json_extract(j.payload_json, '$.layoutProfileSnapshot.strategy') = 'scenes' AND json_extract(s.payload_json, '$.cropAnalysis') IN ('queued', 'running')").all();
+    for (const entry of CropBackfillRowSchema.array().parse(rows)) {
+      const pending = this.db.prepare("SELECT 1 FROM queue_tasks WHERE kind = 'analyze_crops' AND status IN ('queued', 'running') AND job_id = ? AND json_extract(payload_json, '$.payload.shortId') = ? LIMIT 1").get(entry.job_id, entry.short_id);
+      if (pending !== null && typeof pending === 'object') {
+        continue;
+      }
+      this.enqueueTask(entry.job_id, 'analyze_crops', { shortId: entry.short_id });
+    }
+  }
+
+  hasActiveTask(jobId: string, kind: QueueTaskKind, shortId: string | null = null): boolean {
+    const row = shortId === null
+      ? this.db.prepare("SELECT 1 FROM queue_tasks WHERE kind = ? AND status IN ('queued', 'running') AND job_id = ? LIMIT 1").get(kind, jobId)
+      : this.db.prepare("SELECT 1 FROM queue_tasks WHERE kind = ? AND status IN ('queued', 'running') AND job_id = ? AND json_extract(payload_json, '$.payload.shortId') = ? LIMIT 1").get(kind, jobId, shortId);
+    return row !== null && typeof row === 'object';
   }
 
   enqueueTask<K extends QueueTaskKind>(jobId: string, kind: K, payload: QueueTaskPayloads[K], options: { availableAt?: string | null } = {}): QueueTask {

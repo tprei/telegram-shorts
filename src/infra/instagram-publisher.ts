@@ -1,10 +1,11 @@
 import { z } from 'zod';
-import type { ShortVideoPlatform } from '../domain/model.js';
+import type { PublishingAccount, ShortVideoPlatform } from '../domain/model.js';
 
 export const lenientRemoteString = z.unknown().optional().transform((value) => (typeof value === 'string' && value.trim().length > 0 ? value : null));
 
 export interface ShortVideoPublishInput {
   platform: ShortVideoPlatform;
+  account: PublishingAccount;
   filePath: string;
   message: string;
   idempotencyKey: string;
@@ -105,6 +106,7 @@ export interface ShortVideoPublishProvider {
   readonly supportedPlatforms: ShortVideoPlatform[];
   readonly supportsScheduling: boolean;
   supports(platform: ShortVideoPlatform): boolean;
+  canPublish(input: { account: PublishingAccount; platform: ShortVideoPlatform; scheduled: boolean }): boolean;
   publishShortVideo(input: ShortVideoPublishInput): Promise<ShortVideoPublishResult>;
   checkPublication(input: ShortVideoCheckPublicationInput): Promise<RemotePublicationState>;
   cancelScheduled(input: ShortVideoCheckPublicationInput): Promise<void>;

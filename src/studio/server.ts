@@ -124,8 +124,9 @@ export function createStudioApp(input: StudioAppInput): Hono {
   );
   app.post('/api/jobs/:jobId/replan', (c) => c.json(api.replan(c.req.param('jobId'))));
   app.post('/api/jobs/:jobId/host-framing/analyze', (c) => c.json(api.analyzeHostFraming(c.req.param('jobId'))));
+  app.post('/api/jobs/:jobId/scenes/analyze', (c) => c.json(api.analyzeScenes(c.req.param('jobId'))));
   app.post('/api/jobs/:jobId/shorts', async (c) =>
-    c.json(api.createManualShort(c.req.param('jobId'), CreateManualShortRequestSchema.parse(await parseBody(c)))),
+    c.json(await api.createManualShort(c.req.param('jobId'), CreateManualShortRequestSchema.parse(await parseBody(c)))),
   );
   app.get('/api/shorts/:shortId', async (c) => c.json(await api.getShort(c.req.param('shortId'))));
   app.put('/api/shorts/:shortId/edit', async (c) =>
@@ -150,7 +151,7 @@ export function createStudioApp(input: StudioAppInput): Hono {
   app.post('/api/exports/:exportId/publish', async (c) =>
     c.json(await api.publish(c.req.param('exportId'), PublishRequestSchema.parse(await parseBody(c)))),
   );
-  app.get('/api/schedule', (c) => c.json(api.listScheduledPosts()));
+  app.get('/api/schedule', async (c) => c.json(await api.listScheduledPosts()));
   app.post('/api/publications/:publicationId/cancel', async (c) =>
     c.json(await api.cancelPublication(c.req.param('publicationId'))),
   );

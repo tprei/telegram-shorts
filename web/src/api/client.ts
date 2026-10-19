@@ -127,6 +127,10 @@ export function replan(jobId: string): Promise<JobDetailDto> {
   return jsonRequest<JobDetailDto>('POST', `/api/jobs/${encodeURIComponent(jobId)}/replan`, {});
 }
 
+export function analyzeScenes(jobId: string): Promise<JobDetailDto> {
+  return jsonRequest<JobDetailDto>('POST', `/api/jobs/${encodeURIComponent(jobId)}/scenes/analyze`, {});
+}
+
 export function createManualShort(
   jobId: string,
   request: CreateManualShortRequest,

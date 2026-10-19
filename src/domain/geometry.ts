@@ -1,4 +1,4 @@
-import type { ContentPanel, HostPanel, LayoutPanel, NormRect, PxRect } from './layout.js';
+import type { ContentPanel, HostPanel, LayoutPanel, NormRect, PanelFill, PxRect } from './layout.js';
 
 export interface Rect {
   x: number;
@@ -66,11 +66,9 @@ export function contentSourceCrop(
   return toEvenPxRect(fitRectToAspect(focusRect, aspect, bounds, minWidth));
 }
 
-export type HostPanelFill = 'cover' | 'blur';
-
 export interface HostSourceCrop {
   source: PxRect;
-  fill: HostPanelFill;
+  fill: PanelFill;
 }
 
 export const HOST_HEAD_FILL = 0.62;
@@ -122,7 +120,7 @@ export function hostSourceCrop(
     height = Math.min(bounds.h, Math.max(head.h / HOST_HEAD_FILL / zoom, head.h / HOST_HEAD_MAX_FILL));
     width = Math.min(bounds.w, height * aspect);
   }
-  const fill: HostPanelFill = width < height * aspect - 1 ? 'blur' : 'cover';
+  const fill: PanelFill = width < height * aspect - 1 ? 'contain' : 'cover';
   return {
     source: toEvenPxRect({
       x: clamp(head.x + head.w / 2 - width / 2, bounds.x, bounds.x + bounds.w - width),

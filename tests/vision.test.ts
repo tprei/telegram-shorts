@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { boxToSourceFocus, distributeSampleBudget, hostHeadBoxFromFrames, hostHeadSampleTimes, medianHeadBox, medianValue, parseShowinfoSceneTimes, selectSpanSamples, wordsSpokenBetween } from '../src/infra/vision.js';
+import { analyzeContentCrops, boxToSourceFocus, distributeSampleBudget, hostHeadBoxFromFrames, hostHeadSampleTimes, medianHeadBox, medianValue, parseShowinfoSceneTimes, selectSpanSamples, wordsSpokenBetween } from '../src/infra/vision.js';
+import { runProcess } from '../src/infra/process.js';
 import { isTransientNetworkError } from '../src/infra/instagram-publisher.js';
 import { ContentPanel, HostPanel, NormRect } from '../src/domain/layout.js';
 import { TranscriptWord } from '../src/domain/model.js';
@@ -218,5 +222,74 @@ test('hostHeadBoxFromFrames carries a transient cause when the failing samples h
     );
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test('scene document crops respect one short-wide budget and stay in their segment', { timeout: 120_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'vision-crops-'));
+  const videoPath = join(dir, 'source.mp4');
+  await runProcess('ffmpeg', [
+    '-v', 'error', '-y',
+    '-f', 'lavfi', '-i', 'color=c=green:s=320x180:r=30:d=6',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-pix_fmt', 'yuv420p',
+    videoPath,
+  ]);
+  const panel: ContentPanel = {
+    id: 'screen',
+    role: 'content',
+    sourceRect: { x: 0, y: 0, w: 1, h: 1 },
+    canvasRect: { x: 0, y: 0.1146, w: 1, h: 0.4375 },
+  };
+  const spans = [
+    { startSeconds: 0.2, endSeconds: 2.2, text: 'primeira fala' },
+    { startSeconds: 2.6, endSeconds: 2.8, text: 'fala curta' },
+    { startSeconds: 5.85, endSeconds: 6, text: 'fala final' },
+  ];
+  const words: TranscriptWord[] = [
+    makeWord('w0', 'primeira', 0.2, 1),
+    makeWord('w1', 'fala', 2.6, 2.8),
+    makeWord('w2', 'final', 5.85, 5.95),
+  ];
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    return chatCompletion(JSON.stringify({ box_2d: [100, 100, 900, 900], reason: 'manchete' }));
+  }) as typeof fetch;
+  try {
+    const budgeted = await analyzeContentCrops({
+      config: visionConfig,
+      videoPath,
+      source: { width: 320, height: 180 },
+      panel,
+      spans,
+      words,
+      workDir: dir,
+      maxSamples: 2,
+    });
+    assert.equal(calls, 2);
+    assert.deepEqual(budgeted.map((keyframe) => keyframe.sourceSeconds), [0.2, 2.6]);
+    assert.deepEqual(budgeted.map((keyframe) => keyframe.focus), [{ x: 0.1, y: 0.1, w: 0.8, h: 0.8 }, { x: 0.1, y: 0.1, w: 0.8, h: 0.8 }]);
+    assert.ok(budgeted.every((keyframe) => keyframe.origin === 'auto'));
+
+    calls = 0;
+    const full = await analyzeContentCrops({
+      config: visionConfig,
+      videoPath,
+      source: { width: 320, height: 180 },
+      panel,
+      spans,
+      words,
+      workDir: dir,
+      maxSamples: 16,
+    });
+    assert.equal(calls, 3);
+    assert.deepEqual(full.map((keyframe) => keyframe.sourceSeconds), [0.2, 2.6, 5.85]);
+    assert.ok(full.every((keyframe) => spans.some((span) =>
+      keyframe.sourceSeconds >= span.startSeconds && keyframe.sourceSeconds < span.endSeconds,
+    )));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(dir, { recursive: true, force: true });
   }
 });

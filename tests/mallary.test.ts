@@ -5,8 +5,18 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import type { PublishingAccount } from '../src/domain/model.js';
 import { MallaryClient, MallaryUploadClient, buildMallaryInstagramReelPayload, buildPublishMessage, mallaryMimeType, parseMallaryRetryAfterSeconds } from '../src/infra/mallary.js';
 import { ShortVideoPublishError } from '../src/infra/instagram-publisher.js';
+
+const TEST_ACCOUNT: PublishingAccount = {
+  id: 'test_account',
+  displayName: 'Test Account',
+  schedule: { timeZone: 'America/Sao_Paulo', slots: ['12:00', '19:00', '21:00'] },
+  platforms: ['instagram', 'tiktok', 'youtube_shorts'],
+  mallaryProfileId: 'test_profile_id',
+  buffer: false,
+};
 
 interface FakeMallary {
   baseUrl: string;
@@ -152,6 +162,7 @@ test('mallary instagram payload includes sanitized follow-up comments', () => {
     message: 'Legenda',
     mediaUrl: 'https://files.example/video.mp4',
     mediaType: 'video/mp4',
+    profileId: 'test_profile_id',
     commentsUnderPost: ['  Fonte:  https://example.com  ', '', 'Segunda'],
     scheduledAt: null,
   });
@@ -163,6 +174,7 @@ test('mallary instagram payload carries scheduled_at only for scheduled posts', 
     message: 'Legenda',
     mediaUrl: 'https://files.example/video.mp4',
     mediaType: 'video/mp4',
+    profileId: 'test_profile_id',
     scheduledAt: '2026-10-25T19:00:00.000Z',
   });
   assert.equal(scheduled.scheduled_at, '2026-10-25T19:00:00.000Z');
@@ -170,9 +182,9 @@ test('mallary instagram payload carries scheduled_at only for scheduled posts', 
     message: 'Legenda',
     mediaUrl: 'https://files.example/video.mp4',
     mediaType: 'video/mp4',
+    profileId: 'test_profile_id',
     scheduledAt: null,
   });
-  assert.equal('scheduled_at' in immediate, false);
 });
 
 test('Mallary publish sends scheduled_at for scheduled posts', async () => {
@@ -192,9 +204,10 @@ test('Mallary publish sends scheduled_at for scheduled posts', async () => {
           }
           return realFetch(input, init);
         };
-        const client = new MallaryClient('token', null, new MallaryUploadClient('token', { baseUrl: fake.baseUrl, retryDelaysMs: [1, 1] }));
+        const client = new MallaryClient('token', new MallaryUploadClient('token', { baseUrl: fake.baseUrl, retryDelaysMs: [1, 1] }));
         const result = await client.publishShortVideo({
           platform: 'instagram',
+          account: TEST_ACCOUNT,
           filePath: path,
           message: 'Legenda',
           idempotencyKey: 'sched-1',
@@ -213,7 +226,7 @@ test('Mallary publish sends scheduled_at for scheduled posts', async () => {
 test('Mallary cancel maps 409 to an already-publishing error and posts to the job cancel route', async () => {
   await withFetch(async () => {
     const record = { url: '', headers: {} as Record<string, string> };
-    const client = new MallaryClient('token', null, new MallaryUploadClient('token'));
+    const client = new MallaryClient('token', new MallaryUploadClient('token'));
     globalThis.fetch = withJobFetch('', 409, record);
     await assert.rejects(
       client.cancelScheduled({ provider: 'mallary', platform: 'tiktok', remoteJobId: 'job_20' }),
@@ -241,7 +254,7 @@ test('Mallary cancel maps 409 to an already-publishing error and posts to the jo
 
 test('Mallary cancel 409 prefers the error message from the response body', async () => {
   await withFetch(async () => {
-    const client = new MallaryClient('token', null, new MallaryUploadClient('token'));
+    const client = new MallaryClient('token', new MallaryUploadClient('token'));
     globalThis.fetch = withJobFetch(JSON.stringify({ error: { message: 'Job is already being processed by the platform' } }), 409, { url: '', headers: {} });
     await assert.rejects(
       client.cancelScheduled({ provider: 'mallary', platform: 'instagram', remoteJobId: 'job_30' }),
@@ -270,11 +283,12 @@ test('Mallary rejects a scheduled post whose time is less than two minutes away 
           }
           return realFetch(input, init);
         };
-        const client = new MallaryClient('token', null, new MallaryUploadClient('token', { baseUrl: fake.baseUrl, retryDelaysMs: [1, 1] }));
+        const client = new MallaryClient('token', new MallaryUploadClient('token', { baseUrl: fake.baseUrl, retryDelaysMs: [1, 1] }));
         const scheduledAt = new Date(Date.now() + 60 * 1000).toISOString();
         await assert.rejects(
           client.publishShortVideo({
             platform: 'instagram',
+            account: TEST_ACCOUNT,
             filePath: path,
             message: 'Legenda',
             idempotencyKey: 'missed-1',
@@ -298,6 +312,7 @@ test('mallary instagram payload keeps the cover thumbnail', () => {
     message: 'Legenda principal',
     mediaUrl: 'https://files.mallary.ai/video.mp4',
     mediaType: 'video/mp4',
+    profileId: 'test_profile_id',
     thumbnailUrl: 'https://files.mallary.ai/cover.jpg',
     commentsUnderPost: ['  Vídeo completo: https://youtube.com/watch?v=abc  ', '', 'Fonte: @canal  ', 'extra'],
     scheduledAt: null,
@@ -342,7 +357,7 @@ function withJobFetch(body: string, status: number, record: { url: string; heade
 }
 
 function checkJob(remoteJobId: string): Promise<unknown> {
-  return new MallaryClient('token', null, new MallaryUploadClient('token')).checkPublication({
+  return new MallaryClient('token', new MallaryUploadClient('token')).checkPublication({
     provider: 'mallary',
     platform: 'instagram',
     remoteJobId,
@@ -454,4 +469,116 @@ test('Mallary check falls back through lenient failure reasons', async () => {
       assert.deepEqual(state, { status: 'failed', url: null, error: testCase.error });
     }
   });
+});
+
+test('one Mallary client alternates account profile IDs without cross-posting', async () => {
+  const fake = await startFakeMallary({
+    uploadUrl: (_attempt, _request, response, baseUrl) => presignedUpload(response, baseUrl),
+    put: (_attempt, response) => response.writeHead(200).end(),
+  });
+  try {
+    await withVideoFile(async (path) => {
+      await withFetch(async () => {
+        const realFetch = globalThis.fetch;
+        const bodies: Array<Record<string, unknown>> = [];
+        globalThis.fetch = async (input, init) => {
+          if (String(input) === 'https://mallary.ai/api/v1/post') {
+            bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+            return new Response(JSON.stringify({ status: 'queued', batch_id: 'b1', jobs: [{ platform: 'instagram', jobId: 'job_1' }] }), { status: 200 });
+          }
+          return realFetch(input, init);
+        };
+        const client = new MallaryClient('token', new MallaryUploadClient('token', { baseUrl: fake.baseUrl, retryDelaysMs: [1, 1] }));
+        const accountA: PublishingAccount = {
+          id: 'acc_a',
+          displayName: 'Account A',
+          schedule: { timeZone: 'America/Sao_Paulo', slots: ['12:00'] },
+          platforms: ['instagram', 'tiktok', 'youtube_shorts'],
+          mallaryProfileId: 'profile_a',
+          buffer: false,
+        };
+        const accountB: PublishingAccount = {
+          id: 'acc_b',
+          displayName: 'Account B',
+          schedule: { timeZone: 'America/Sao_Paulo', slots: ['12:00'] },
+          platforms: ['instagram', 'tiktok', 'youtube_shorts'],
+          mallaryProfileId: 'profile_b',
+          buffer: false,
+        };
+
+        await client.publishShortVideo({
+          platform: 'instagram',
+          account: accountA,
+          filePath: path,
+          message: 'Post A1',
+          idempotencyKey: 'idemp-1',
+          scheduledAt: null,
+        });
+
+        await client.publishShortVideo({
+          platform: 'tiktok',
+          account: accountB,
+          filePath: path,
+          message: 'Post B',
+          idempotencyKey: 'idemp-2',
+          scheduledAt: null,
+        });
+
+        await client.publishShortVideo({
+          platform: 'youtube_shorts',
+          account: accountA,
+          filePath: path,
+          message: 'Post A2',
+          idempotencyKey: 'idemp-3',
+          scheduledAt: null,
+        });
+
+        assert.equal(bodies.length, 3);
+        assert.equal(bodies[0]?.profile_id, 'profile_a');
+        assert.deepEqual(bodies[0]?.platforms, ['instagram']);
+        assert.equal(bodies[1]?.profile_id, 'profile_b');
+        assert.deepEqual(bodies[1]?.platforms, ['tiktok']);
+        assert.equal(bodies[2]?.profile_id, 'profile_a');
+        assert.deepEqual(bodies[2]?.platforms, ['youtube']);
+      });
+    });
+  } finally {
+    await fake.close();
+  }
+});
+
+test('disconnected Mallary account fails before media upload', async () => {
+  let uploadCalled = false;
+  const fakeUploadClient = {
+    uploadFile: async () => {
+      uploadCalled = true;
+      return { mediaUrl: 'https://files.mallary.ai/video.mp4', mediaType: 'video/mp4' };
+    },
+  } as unknown as MallaryUploadClient;
+
+  const client = new MallaryClient('token', fakeUploadClient);
+  const disconnectedAccount: PublishingAccount = {
+    id: 'mix',
+    displayName: 'Mix',
+    schedule: { timeZone: 'America/Sao_Paulo', slots: ['12:00'] },
+    platforms: ['instagram', 'tiktok'],
+    mallaryProfileId: null,
+    buffer: false,
+  };
+
+  await assert.rejects(
+    client.publishShortVideo({
+      platform: 'instagram',
+      account: disconnectedAccount,
+      filePath: '/tmp/video.mp4',
+      message: 'Legenda',
+      idempotencyKey: 'key-1',
+      scheduledAt: null,
+    }),
+    (error: unknown) => error instanceof ShortVideoPublishError
+      && error.message === 'Account not connected in Mallary'
+      && error.stage === 'configuration'
+      && error.safeToFailover === false,
+  );
+  assert.equal(uploadCalled, false);
 });

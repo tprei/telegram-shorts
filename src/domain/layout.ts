@@ -70,15 +70,44 @@ export interface LayoutCanvas {
   fps: number;
 }
 
-export interface LayoutProfile {
-  version: 2;
-  creatorId: string;
+export type Composition = 'stack' | 'host' | 'content';
+
+export type PanelFill = 'cover' | 'contain';
+
+export interface LayoutBase {
+  version: 3;
   layoutId: string;
   canvas: LayoutCanvas;
   background: string;
-  defaultSpeed: number;
   font: LayoutFont;
-  panels: LayoutPanel[];
   hookBand: HookBandStyle | null;
   captions: CaptionStyle;
+  safeArea: { top: number; bottom: number; side: number };
+}
+
+export interface FixedLayoutProfile extends LayoutBase {
+  strategy: 'fixed';
+  panels: LayoutPanel[];
+}
+
+export interface ScenesLayoutProfile extends LayoutBase {
+  strategy: 'scenes';
+  hookBand: HookBandStyle;
+  scene: { captionCenterY: { host: number; content: number } };
+}
+
+export type LayoutProfile = FixedLayoutProfile | ScenesLayoutProfile;
+
+export function contentPanelOf(layout: LayoutProfile): ContentPanel | null {
+  if (layout.strategy !== 'fixed') {
+    return null;
+  }
+  return layout.panels.find((entry): entry is ContentPanel => entry.role === 'content') ?? null;
+}
+
+export function hostPanelOf(layout: LayoutProfile): HostPanel | null {
+  if (layout.strategy !== 'fixed') {
+    return null;
+  }
+  return layout.panels.find((entry): entry is HostPanel => entry.role === 'host') ?? null;
 }

@@ -11,8 +11,10 @@ import {
   upsertCropKeyframe,
 } from '@domain/edit';
 import type { ShortEdit, WordRange } from '@domain/edit';
-import type { NormRect } from '@domain/layout';
-import type { PublishCopy, ShortVideoPlatform, TranscriptWord } from '@domain/model';
+import { contentPanelOf, type Composition, type NormRect } from '@domain/layout';
+import { FLASH_OUTPUT_SECONDS } from '@domain/composition';
+import type { PublishCopy, SceneSegment, SceneTrack, ShortVideoPlatform, TranscriptWord } from '@domain/model';
+import { allowedCompositions, sceneAt } from '@domain/scene';
 import {
   activeCueAt,
   buildTimeline,
@@ -24,6 +26,7 @@ import { ApiRequestError, errorMessage } from '../api/client';
 import {
   queryKeys,
   useAnalyzeCropsMutation,
+  useAnalyzeScenesMutation,
   useCancelScheduledPostMutation,
   useCorrectWordMutation,
   useExportShortMutation,
@@ -31,7 +34,6 @@ import {
   usePublishMutation,
   useReviseMutation,
   useSaveEditMutation,
-  useScheduleQuery,
   useShortQuery,
   useSuggestHooksMutation,
   useTranscriptQuery,
@@ -40,7 +42,9 @@ import {
 } from '../api/queries';
 import { useEditorState } from '../editor/useEditorState';
 import type { RevisionSummary } from '../components/EditorInspector';
+import { ApiError } from '../components/StudioPrimitives';
 import type { TranscriptAction } from '../components/TranscriptPanel';
+import { SceneAnalysisGate, type SceneLayoutSectionProps } from '../components/SceneLayoutSection';
 import { usePreviewEngine } from '../preview/usePreviewEngine';
 import { ShortEditorView } from '../views/ShortEditorView';
 import { LoadErrorState, NotFoundState } from './RouteStates';
@@ -48,11 +52,22 @@ import { LoadErrorState, NotFoundState } from './RouteStates';
 const FULL_FRAME: NormRect = { x: 0, y: 0, w: 1, h: 1 };
 const META_SAVE_DELAY_MS = 600;
 
+function activeSceneSegment(track: SceneTrack, timeline: Timeline, outputSeconds: number): SceneSegment | null {
+  const { clipIndex, sourceSeconds } = outputToSource(timeline, outputSeconds);
+  const clip = timeline.clips[clipIndex];
+  const played = sceneAt(track, sourceSeconds);
+  if (clip === undefined) return played;
+  if (played !== null && played.startSeconds === clip.sceneStartSeconds) return played;
+  return track.segments.find((segment) => segment.startSeconds === clip.sceneStartSeconds) ?? null;
+}
+
 export function ShortEditorPage() {
   const { shortId } = useParams();
   const shortQuery = useShortQuery(shortId ?? '', { enabled: shortId !== undefined });
   const detail = shortQuery.data;
   const transcriptQuery = useTranscriptQuery(detail?.job.id ?? '', detail !== undefined);
+  const analyzeScenesMutation = useAnalyzeScenesMutation(detail?.job.id ?? '');
+  const [gateError, setGateError] = useState<string | null>(null);
 
   if (shortId === undefined) return <NotFoundState message="This short does not exist." />;
   if (shortQuery.isPending) return null;
@@ -71,6 +86,24 @@ export function ShortEditorPage() {
   }
   const transcript = transcriptQuery.data;
   if (transcript === undefined) return null;
+
+  if (detail.job.layout.strategy === 'scenes' && detail.job.sceneTrack === null) {
+    return (
+      <>
+        <ApiError message={gateError} />
+        <SceneAnalysisGate
+          status={detail.job.sceneAnalysis}
+          analyzePending={analyzeScenesMutation.isPending}
+          onAnalyze={() => {
+            setGateError(null);
+            void analyzeScenesMutation.mutateAsync(undefined).catch((error: unknown) =>
+              setGateError(errorMessage(error)),
+            );
+          }}
+        />
+      </>
+    );
+  }
 
   return (
     <ShortEditorSurface
@@ -132,12 +165,12 @@ function ShortEditorSurface({ detail, transcript, refetchShort }: ShortEditorSur
   const suggestHooksMutation = useSuggestHooksMutation(detail.short.id);
   const updateShortMetaMutation = useUpdateShortMetaMutation(detail.short.id);
   const analyzeCropsMutation = useAnalyzeCropsMutation(detail.short.id);
+  const analyzeScenesMutation = useAnalyzeScenesMutation(detail.job.id);
   const exportShortMutation = useExportShortMutation(detail.short.id);
   const generateCopyMutation = useGeneratePublishCopyMutation(detail.short.id);
   const updatePublishCopyMutation = useUpdatePublishCopyMutation(detail.short.id);
   const publishMutation = usePublishMutation(detail.short.id);
   const cancelPublicationMutation = useCancelScheduledPostMutation();
-  const scheduleQuery = useScheduleQuery();
   const correctWordMutation = useCorrectWordMutation(detail.job.id, detail.short.id);
 
   const cancellingPublicationIds =
@@ -161,6 +194,7 @@ function ShortEditorSurface({ detail, transcript, refetchShort }: ShortEditorSur
   const layout = detail.job.layout;
   const media = detail.job.media;
   const hostFraming = detail.job.hostFraming;
+  const sceneTrack = detail.job.sceneTrack;
   const shortTitle = detail.short.title;
   const timeline = useMemo<Timeline>(
     () =>
@@ -175,8 +209,9 @@ function ShortEditorSurface({ detail, transcript, refetchShort }: ShortEditorSur
           durationSeconds: media.durationSeconds,
         },
         hostFraming,
+        sceneTrack,
       }),
-    [edit, transcriptWords, layout, media, shortTitle, hostFraming],
+    [edit, transcriptWords, layout, media, shortTitle, hostFraming, sceneTrack],
   );
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -197,6 +232,28 @@ function ShortEditorSurface({ detail, transcript, refetchShort }: ShortEditorSur
     if (active === null || active.activeWordIndex === null) return null;
     return active.cue.lines.flat()[active.activeWordIndex]?.wordIndex ?? null;
   }, [timeline, preview.outputSeconds]);
+
+  const sceneTiming = useMemo(() => {
+    if (layout.strategy !== 'scenes' || sceneTrack === null) return null;
+    const retainedSegments: SceneSegment[] = [];
+    for (const clip of timeline.clips) {
+      const start = clip.sceneStartSeconds;
+      if (start === null || retainedSegments.some((segment) => segment.startSeconds === start)) continue;
+      const segment = sceneTrack.segments.find((entry) => entry.startSeconds === start);
+      if (segment !== undefined) retainedSegments.push(segment);
+    }
+    const retainedOutput = new Map<number, number>();
+    for (const clip of timeline.clips) {
+      const start = clip.sceneStartSeconds;
+      if (start === null) continue;
+      retainedOutput.set(start, (retainedOutput.get(start) ?? 0) + clip.outputEnd - clip.outputStart);
+    }
+    const flashStarts = new Set<number>();
+    for (const [startSeconds, outputTotal] of retainedOutput) {
+      if (outputTotal < FLASH_OUTPUT_SECONDS) flashStarts.add(startSeconds);
+    }
+    return { retainedSegments, flashStarts };
+  }, [layout, sceneTrack, timeline]);
 
   const titleTimerRef = useRef<number | null>(null);
   const pendingTitleRef = useRef<string | null>(null);
@@ -332,14 +389,31 @@ function ShortEditorSurface({ detail, transcript, refetchShort }: ShortEditorSur
   const onAddCrop = useCallback(() => {
     applyEditOperation(() => {
       const { sourceSeconds } = outputToSource(timeline, preview.outputSeconds);
-      const activeCrop = [...edit.crops]
-        .reverse()
-        .find((crop) => crop.sourceSeconds <= sourceSeconds);
-      const contentPanel = layout.panels.find((panel) => panel.role === 'content');
-      const focus: NormRect = activeCrop?.focus ?? contentPanel?.sourceRect ?? FULL_FRAME;
+      if (layout.strategy !== 'scenes' || sceneTrack === null) {
+        const activeCrop = [...edit.crops]
+          .reverse()
+          .find((crop) => crop.sourceSeconds <= sourceSeconds);
+        const contentPanel = contentPanelOf(layout);
+        const focus: NormRect = activeCrop?.focus ?? contentPanel?.sourceRect ?? FULL_FRAME;
+        return upsertCropKeyframe(edit, { sourceSeconds, focus, origin: 'manual' });
+      }
+      const segment = activeSceneSegment(sceneTrack, timeline, preview.outputSeconds);
+      if (segment === null || segment.content === null) {
+        throw new Error('This shot has no content to focus on.');
+      }
+      const box = segment.content.box;
+      const segmentCrop = edit.crops.find(
+        (crop) => crop.sourceSeconds >= segment.startSeconds && crop.sourceSeconds < segment.endSeconds,
+      );
+      const focus: NormRect = segmentCrop?.focus ?? {
+        x: (segment.content.subject.x - box.x) / box.w,
+        y: (segment.content.subject.y - box.y) / box.h,
+        w: segment.content.subject.w / box.w,
+        h: segment.content.subject.h / box.h,
+      };
       return upsertCropKeyframe(edit, { sourceSeconds, focus, origin: 'manual' });
     });
-  }, [applyEditOperation, edit, layout, preview.outputSeconds, timeline]);
+  }, [applyEditOperation, edit, layout, preview.outputSeconds, sceneTrack, timeline]);
 
   const onSeekWord = useCallback(
     (wordIndex: number) => {
@@ -350,6 +424,109 @@ function ShortEditorSurface({ detail, transcript, refetchShort }: ShortEditorSur
     },
     [preview, timeline, transcriptWords],
   );
+
+  const onCompositionChange = useCallback(
+    (composition: 'auto' | Composition) => {
+      if (sceneTrack === null) return;
+      const segment = activeSceneSegment(sceneTrack, timeline, preview.outputSeconds);
+      if (segment === null) return;
+      applyEditOperation(() => {
+        const others = edit.layout.overrides.filter(
+          (override) => override.sourceSeconds !== segment.startSeconds,
+        );
+        const overrides = composition === 'auto'
+          ? others
+          : [...others, { sourceSeconds: segment.startSeconds, composition }];
+        return { ...edit, layout: { ...edit.layout, overrides } };
+      });
+    },
+    [applyEditOperation, edit, preview.outputSeconds, sceneTrack, timeline],
+  );
+
+  const onSplitChange = useCallback(
+    (split: number | null) =>
+      applyEditOperation(() => ({ ...edit, layout: { ...edit.layout, split } })),
+    [applyEditOperation, edit],
+  );
+
+  const onSeekSegment = useCallback(
+    (index: number) => {
+      if (sceneTiming === null) return;
+      const target = sceneTiming.retainedSegments[index];
+      const clip =
+        target === undefined
+          ? undefined
+          : timeline.clips.find((entry) => entry.sceneStartSeconds === target.startSeconds);
+      if (clip !== undefined) preview.seek(clip.outputStart);
+    },
+    [preview, sceneTiming, timeline],
+  );
+
+  const onAnalyzeScenes = useCallback(() => {
+    void runAction(async () => {
+      await flushPendingSave();
+      await analyzeScenesMutation.mutateAsync(undefined);
+    });
+  }, [analyzeScenesMutation.mutateAsync, flushPendingSave, runAction]);
+
+  const sceneLayout = useMemo<SceneLayoutSectionProps | null>(() => {
+    if (layout.strategy !== 'scenes' || sceneTrack === null || sceneTiming === null) return null;
+    const segment = activeSceneSegment(sceneTrack, timeline, preview.outputSeconds);
+    const activeStart = segment?.startSeconds ?? null;
+    const activeClip =
+      activeStart === null
+        ? null
+        : timeline.clips.find((entry) => entry.sceneStartSeconds === activeStart) ?? null;
+    const segmentIndex =
+      segment === null
+        ? null
+        : sceneTiming.retainedSegments.findIndex((entry) => entry.startSeconds === segment.startSeconds);
+    const flashInherited =
+      activeStart !== null
+      && sceneTiming.flashStarts.has(activeStart)
+      && timeline.clips.some(
+        (entry) =>
+          entry.index < (activeClip?.index ?? 0)
+          && entry.sceneStartSeconds !== null
+          && entry.sceneStartSeconds !== activeStart
+          && !sceneTiming.flashStarts.has(entry.sceneStartSeconds),
+      );
+    return {
+      analysis: detail.job.sceneAnalysis,
+      segment,
+      segmentIndex: segmentIndex === -1 ? null : segmentIndex,
+      segmentCount: sceneTiming.retainedSegments.length,
+      sourceSeconds: outputToSource(timeline, preview.outputSeconds).sourceSeconds,
+      selected:
+        activeStart === null
+          ? 'auto'
+          : edit.layout.overrides.find((override) => override.sourceSeconds === activeStart)?.composition
+            ?? 'auto',
+      effectiveComposition: activeClip?.composition ?? null,
+      allowed: segment === null ? [] : allowedCompositions(segment),
+      split: edit.layout.split,
+      effectiveSplit: timeline.stackSplit,
+      flashInherited,
+      rerunPending: analyzeScenesMutation.isPending,
+      onCompositionChange,
+      onSplitChange,
+      onSeekSegment,
+      onAnalyzeScenes,
+    };
+  }, [
+    analyzeScenesMutation.isPending,
+    detail.job.sceneAnalysis,
+    edit.layout,
+    layout.strategy,
+    onAnalyzeScenes,
+    onCompositionChange,
+    onSeekSegment,
+    onSplitChange,
+    preview.outputSeconds,
+    sceneTiming,
+    sceneTrack,
+    timeline,
+  ]);
 
   const onCorrectWord = useCallback(
     (wordIndex: number, text: string) => {
@@ -503,7 +680,7 @@ function ShortEditorSurface({ detail, transcript, refetchShort }: ShortEditorSur
       publishCopy={publishCopyDraft}
       copyPending={generateCopyMutation.isPending}
       selectedPlatforms={selectedPlatforms}
-      upcomingPosts={scheduleQuery.data ?? []}
+      sceneLayout={sceneLayout}
       publishPending={publishMutation.isPending}
       error={actionError}
       cancellingPublicationIds={cancellingPublicationIds}

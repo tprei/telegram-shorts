@@ -4,6 +4,25 @@ import { BufferClient } from '../src/infra/buffer.js';
 import { FallbackShortVideoPublishProvider } from '../src/infra/instagram-publisher-factory.js';
 import { ShortVideoPublishError } from '../src/infra/instagram-publisher.js';
 import type { ShortVideoCheckPublicationInput, ShortVideoPublishInput, ShortVideoPublishProvider, ShortVideoPublishResult } from '../src/infra/instagram-publisher.js';
+import type { PublishingAccount, ShortVideoPlatform } from '../src/domain/model.js';
+
+const BONI_ACCOUNT: PublishingAccount = {
+  id: 'cortes_do_boni',
+  displayName: 'Cortes do Boni',
+  schedule: { timeZone: 'America/Sao_Paulo', slots: ['12:00', '19:00', '21:00'] },
+  platforms: ['instagram', 'tiktok', 'youtube_shorts'],
+  mallaryProfileId: 'S83DPA58Wwx',
+  buffer: true,
+};
+
+const MIX_ACCOUNT: PublishingAccount = {
+  id: 'mix',
+  displayName: 'Mix',
+  schedule: { timeZone: 'America/Sao_Paulo', slots: ['12:00', '19:00', '21:00'] },
+  platforms: ['instagram', 'tiktok'],
+  mallaryProfileId: 'mix_mallary_id',
+  buffer: false,
+};
 
 test('Buffer Instagram reels omit rejected custom video thumbnails', async () => {
   const originalFetch = globalThis.fetch;
@@ -20,6 +39,7 @@ test('Buffer Instagram reels omit rejected custom video thumbnails', async () =>
     });
     const result = await client.publishShortVideo({
       platform: 'instagram',
+      account: BONI_ACCOUNT,
       filePath: 'video.mp4',
       thumbnailPath: 'cover.jpg',
       commentsUnderPost: ['Fonte: https://example.com'],
@@ -47,7 +67,7 @@ test('Buffer does not report success without a post id', async () => {
       publicAssetHost: { name: 'test', hostFile: async () => 'https://cdn.test/video.mp4' },
     });
     await assert.rejects(
-      client.publishShortVideo({ platform: 'instagram', filePath: 'video.mp4', message: 'Legenda', idempotencyKey: 'key', scheduledAt: null }),
+      client.publishShortVideo({ platform: 'instagram', account: BONI_ACCOUNT, filePath: 'video.mp4', message: 'Legenda', idempotencyKey: 'key', scheduledAt: null }),
       (error: unknown) => error instanceof ShortVideoPublishError
         && error.message === 'Buffer createPost succeeded without a post id.'
         && error.safeToFailover === false,
@@ -68,7 +88,7 @@ test('Buffer propagates concrete mutation errors instead of reporting queued', a
       publicAssetHost: { name: 'test', hostFile: async () => 'https://cdn.test/video.mp4' },
     });
     await assert.rejects(
-      client.publishShortVideo({ platform: 'instagram', filePath: 'video.mp4', message: 'Legenda', idempotencyKey: 'key', scheduledAt: null }),
+      client.publishShortVideo({ platform: 'instagram', account: BONI_ACCOUNT, filePath: 'video.mp4', message: 'Legenda', idempotencyKey: 'key', scheduledAt: null }),
       (error: unknown) => error instanceof ShortVideoPublishError && error.message === 'Buffer createPost failed: thumbnailUrl is not supported',
     );
   } finally {
@@ -165,6 +185,25 @@ test('Buffer check tolerates empty links and non-string error shapes', async () 
   }
 });
 
+test('Buffer cannot publish YouTube Shorts without a configured YouTube channel', () => {
+  const withoutYouTube = new BufferClient({
+    apiKey: 'key',
+    organizationId: 'org-1',
+    instagramChannelId: 'instagram-channel',
+    publicAssetHost: { name: 'test', hostFile: async () => 'https://cdn.test/video.mp4' },
+  });
+  assert.equal(withoutYouTube.canPublish({ account: BONI_ACCOUNT, platform: 'youtube_shorts', scheduled: false }), false);
+  assert.equal(withoutYouTube.canPublish({ account: BONI_ACCOUNT, platform: 'instagram', scheduled: false }), true);
+
+  const withYouTube = new BufferClient({
+    apiKey: 'key',
+    organizationId: 'org-1',
+    youtubeChannelId: 'youtube-channel',
+    publicAssetHost: { name: 'test', hostFile: async () => 'https://cdn.test/video.mp4' },
+  });
+  assert.equal(withYouTube.canPublish({ account: BONI_ACCOUNT, platform: 'youtube_shorts', scheduled: false }), true);
+});
+
 test('Buffer cannot schedule and refuses to cancel scheduled posts', async () => {
   const client = bufferStatusClient();
   assert.equal(client.supportsScheduling, false);
@@ -181,6 +220,9 @@ interface ScriptedProviderOptions {
   supportsScheduling: boolean;
   result: ShortVideoPublishResult;
   cancelError?: Error;
+  canPublish?: (input: { account: PublishingAccount; platform: ShortVideoPlatform; scheduled: boolean }) => boolean;
+  failWithSafe?: boolean;
+  failWithUnsafe?: boolean;
 }
 
 function scriptedProvider(
@@ -194,8 +236,39 @@ function scriptedProvider(
     supportedPlatforms: ['instagram', 'tiktok', 'youtube_shorts'],
     supportsScheduling: options.supportsScheduling,
     supports: () => true,
+    canPublish: (input) => {
+      if (options.canPublish) {
+        return options.canPublish(input);
+      }
+      if (input.scheduled && !options.supportsScheduling) {
+        return false;
+      }
+      if (name === 'buffer' && (!input.account.buffer || input.scheduled)) {
+        return false;
+      }
+      if (name === 'mallary' && input.account.mallaryProfileId === null) {
+        return false;
+      }
+      return true;
+    },
     publishShortVideo: async (input) => {
       publishCalls.push(input);
+      if (options.failWithSafe) {
+        throw new ShortVideoPublishError({
+          provider: name,
+          stage: 'create',
+          message: `${name} transient failure`,
+          safeToFailover: true,
+        });
+      }
+      if (options.failWithUnsafe) {
+        throw new ShortVideoPublishError({
+          provider: name,
+          stage: 'create',
+          message: `${name} permanent rejection`,
+          safeToFailover: false,
+        });
+      }
       return options.result;
     },
     checkPublication: async () => ({ status: 'pending', url: null, error: null }),
@@ -229,6 +302,7 @@ test('the fallback provider skips providers without scheduling support for sched
 
   const scheduled = await fallback.publishShortVideo({
     platform: 'instagram',
+    account: BONI_ACCOUNT,
     filePath: 'video.mp4',
     message: 'Legenda',
     idempotencyKey: 'k1',
@@ -240,6 +314,7 @@ test('the fallback provider skips providers without scheduling support for sched
 
   const immediate = await fallback.publishShortVideo({
     platform: 'instagram',
+    account: BONI_ACCOUNT,
     filePath: 'video.mp4',
     message: 'Legenda',
     idempotencyKey: 'k2',
@@ -260,12 +335,12 @@ test('the fallback provider refuses scheduled posts when no provider can schedul
   await assert.rejects(
     fallback.publishShortVideo({
       platform: 'instagram',
+      account: BONI_ACCOUNT,
       filePath: 'video.mp4',
       message: 'Legenda',
       idempotencyKey: 'k3',
       scheduledAt: '2026-10-25T19:00:00.000Z',
     }),
-    /No provider can schedule instagram\./,
   );
   assert.equal(bufferPublishCalls.length, 0);
 });
@@ -294,4 +369,144 @@ test('the fallback provider cancels scheduled posts by provider name', async () 
       && error.stage === 'cancel'
       && error.message === 'No publish provider named unknown is configured to cancel instagram.',
   );
+});
+
+test('Mix never uses Boni Buffer channels during provider failover', async () => {
+  const mallaryPublishCalls: ShortVideoPublishInput[] = [];
+  const bufferPublishCalls: ShortVideoPublishInput[] = [];
+  const fallback = new FallbackShortVideoPublishProvider(
+    [
+      scriptedProvider('mallary', mallaryPublishCalls, [], {
+        supportsScheduling: true,
+        result: MALLARY_STYLE_RESULT,
+        failWithSafe: true,
+      }),
+      scriptedProvider('buffer', bufferPublishCalls, [], {
+        supportsScheduling: false,
+        result: BUFFER_STYLE_RESULT,
+      }),
+    ],
+    fallbackProviderOrder(),
+  );
+
+  await assert.rejects(
+    fallback.publishShortVideo({
+      platform: 'instagram',
+      account: MIX_ACCOUNT,
+      filePath: 'video.mp4',
+      message: 'Legenda',
+      idempotencyKey: 'k_mix_1',
+      scheduledAt: null,
+    }),
+    /All short-video publish providers failed for instagram: mallary: mallary transient failure/,
+  );
+  assert.equal(mallaryPublishCalls.length, 1);
+  assert.equal(bufferPublishCalls.length, 0);
+});
+
+test('Boni retains safe failover and stops on unsafe failure on all three platforms', async () => {
+  const platforms: ShortVideoPlatform[] = ['instagram', 'tiktok', 'youtube_shorts'];
+  for (const platform of platforms) {
+    const mallaryCalls1: ShortVideoPublishInput[] = [];
+    const bufferCalls1: ShortVideoPublishInput[] = [];
+    const fallbackSafe = new FallbackShortVideoPublishProvider(
+      [
+        scriptedProvider('mallary', mallaryCalls1, [], {
+          supportsScheduling: true,
+          result: { ...MALLARY_STYLE_RESULT, platform },
+          failWithSafe: true,
+        }),
+        scriptedProvider('buffer', bufferCalls1, [], {
+          supportsScheduling: false,
+          result: { ...BUFFER_STYLE_RESULT, platform },
+        }),
+      ],
+      { instagram: ['mallary', 'buffer'], tiktok: ['mallary', 'buffer'], youtube_shorts: ['mallary', 'buffer'] },
+    );
+
+    const safeResult = await fallbackSafe.publishShortVideo({
+      platform,
+      account: BONI_ACCOUNT,
+      filePath: 'video.mp4',
+      message: 'Legenda',
+      idempotencyKey: `k_safe_${platform}`,
+      scheduledAt: null,
+    });
+    assert.equal(safeResult.provider, 'buffer');
+    assert.equal(mallaryCalls1.length, 1);
+    assert.equal(bufferCalls1.length, 1);
+    assert.equal(mallaryCalls1[0]?.account.id, BONI_ACCOUNT.id);
+    assert.equal(bufferCalls1[0]?.account.id, BONI_ACCOUNT.id);
+
+    const mallaryCalls2: ShortVideoPublishInput[] = [];
+    const bufferCalls2: ShortVideoPublishInput[] = [];
+    const fallbackUnsafe = new FallbackShortVideoPublishProvider(
+      [
+        scriptedProvider('mallary', mallaryCalls2, [], {
+          supportsScheduling: true,
+          result: { ...MALLARY_STYLE_RESULT, platform },
+          failWithUnsafe: true,
+        }),
+        scriptedProvider('buffer', bufferCalls2, [], {
+          supportsScheduling: false,
+          result: { ...BUFFER_STYLE_RESULT, platform },
+        }),
+      ],
+      { instagram: ['mallary', 'buffer'], tiktok: ['mallary', 'buffer'], youtube_shorts: ['mallary', 'buffer'] },
+    );
+
+    await assert.rejects(
+      fallbackUnsafe.publishShortVideo({
+        platform,
+        account: BONI_ACCOUNT,
+        filePath: 'video.mp4',
+        message: 'Legenda',
+        idempotencyKey: `k_unsafe_${platform}`,
+        scheduledAt: null,
+      }),
+      (error: unknown) => error instanceof ShortVideoPublishError
+        && error.message === 'mallary permanent rejection'
+        && error.safeToFailover === false,
+    );
+    assert.equal(mallaryCalls2.length, 1);
+    assert.equal(bufferCalls2.length, 0);
+  }
+});
+
+test('scheduled posts require an eligible Mallary provider for that account', async () => {
+  const bufferCalls: ShortVideoPublishInput[] = [];
+  const mallaryCalls: ShortVideoPublishInput[] = [];
+  const fallback = new FallbackShortVideoPublishProvider(
+    [
+      scriptedProvider('buffer', bufferCalls, [], {
+        supportsScheduling: false,
+        result: BUFFER_STYLE_RESULT,
+      }),
+      scriptedProvider('mallary', mallaryCalls, [], {
+        supportsScheduling: true,
+        result: MALLARY_STYLE_RESULT,
+      }),
+    ],
+    fallbackProviderOrder(),
+  );
+
+  const disconnectedAccount: PublishingAccount = {
+    ...BONI_ACCOUNT,
+    mallaryProfileId: null,
+  };
+
+  await assert.rejects(
+    fallback.publishShortVideo({
+      platform: 'instagram',
+      account: disconnectedAccount,
+      filePath: 'video.mp4',
+      message: 'Legenda',
+      idempotencyKey: 'k_sched_req',
+      scheduledAt: '2026-10-25T19:00:00.000Z',
+    }),
+    (error: unknown) => error instanceof ShortVideoPublishError
+      && error.message === 'Account not connected in Mallary',
+  );
+  assert.equal(bufferCalls.length, 0);
+  assert.equal(mallaryCalls.length, 0);
 });

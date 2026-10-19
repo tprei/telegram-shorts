@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -8,21 +8,18 @@ import { buildEndCardAss, buildExportAss } from '../src/infra/ass.js';
 import { buildSubtitlesFilterArg, extractFrame, renderCoverImage, renderShortExport } from '../src/infra/render.js';
 import { runProcess } from '../src/infra/process.js';
 import { buildTimeline } from '../src/domain/timeline.js';
+import type { SceneSegment } from '../src/domain/model.js';
 import type { LayoutProfile, PxRect } from '../src/domain/layout.js';
 import type { CaptionCue, CaptionWord, ShortEdit, Timeline, TimelineEndCard, TimelinePanelPlacement, TranscriptWord } from '../src/domain/timeline.js';
 
 const layout: LayoutProfile = {
-  version: 2,
-  creatorId: 'filipe_boni',
-  layoutId: 'screen-top-host-bottom-v2',
+  version: 3,
+  strategy: 'fixed',
+  layoutId: 'screen-top-host-bottom-v3',
   canvas: { width: 1080, height: 1920, fps: 30 },
   background: '#101010',
-  defaultSpeed: 1.1,
+  safeArea: { top: 0, bottom: 0, side: 0 },
   font: { family: 'Montserrat ExtraBold', file: 'assets/fonts/Montserrat-ExtraBold.ttf', assSizeScale: 1.562 },
-  panels: [
-    { id: 'screen', role: 'content', sourceRect: { x: 0, y: 0, w: 0.632, h: 1 }, canvasRect: { x: 0, y: 0.1146, w: 1, h: 0.4375 } },
-    { id: 'host', role: 'host', sourceRect: { x: 0.637, y: 0, w: 0.363, h: 1 }, canvasRect: { x: 0, y: 0.5521, w: 1, h: 0.4479 }, anchor: { x: 0.5, y: 0.42 } },
-  ],
   hookBand: {
     rect: { x: 0, y: 0, w: 1, h: 0.1146 },
     background: '#C8102E',
@@ -32,6 +29,10 @@ const layout: LayoutProfile = {
     maxLines: 2,
     uppercase: true,
   },
+  panels: [
+    { id: 'screen', role: 'content', sourceRect: { x: 0, y: 0, w: 0.632, h: 1 }, canvasRect: { x: 0, y: 0.1146, w: 1, h: 0.4375 } },
+    { id: 'host', role: 'host', sourceRect: { x: 0.637, y: 0, w: 0.363, h: 1 }, canvasRect: { x: 0, y: 0.5521, w: 1, h: 0.4479 }, anchor: { x: 0.5, y: 0.42 } },
+  ],
   captions: {
     sizePx: 62,
     textColor: '#FFFFFF',
@@ -80,11 +81,13 @@ const fixtureCues: CaptionCue[] = [
     lines: [[word(0, 'OLHA', 0, 0.5), word(1, 'COMO', 0.5, 1.0)], [word(2, 'ISSO', 1.0, 1.5)]],
     outputStart: 0,
     outputEnd: 1.75,
+    centerY: 0.5521,
   },
   {
     lines: [[word(3, 'AQUI', 8.0, 8.5), word(4, 'FICA', 8.5, 9.0)]],
     outputStart: 8.0,
     outputEnd: 9.25,
+    centerY: 0.5521,
   },
 ];
 
@@ -92,13 +95,14 @@ const fixtureTimeline: Timeline = {
   canvas: { width: 1080, height: 1920, fps: 30 },
   speed: 1.1,
   durationSeconds: 11.090909090909092,
+  stackSplit: null,
   clips: [
-    { index: 0, sourceStart: 20, sourceEnd: 24, outputStart: 0, outputEnd: 3.6363636363636362, joinsPrevious: false, zoom: 1, panels: panels(hostSourceZoom1) },
-    { index: 1, sourceStart: 30, sourceEnd: 34, outputStart: 3.6363636363636362, outputEnd: 7.2727272727272725, joinsPrevious: false, zoom: 1.25, panels: panels(hostSourceZoom125) },
-    { index: 2, sourceStart: 34, sourceEnd: 38.2, outputStart: 7.2727272727272725, outputEnd: 11.090909090909092, joinsPrevious: true, zoom: 1.25, panels: panels(hostSourceZoom125) },
+    { index: 0, sourceStart: 20, sourceEnd: 24, outputStart: 0, outputEnd: 3.6363636363636362, joinsPrevious: false, zoom: 1, composition: null, sceneStartSeconds: null, captionCenterY: 0.5521, panels: panels(hostSourceZoom1) },
+    { index: 1, sourceStart: 30, sourceEnd: 34, outputStart: 3.6363636363636362, outputEnd: 7.2727272727272725, joinsPrevious: false, zoom: 1.25, composition: null, sceneStartSeconds: null, captionCenterY: 0.5521, panels: panels(hostSourceZoom125) },
+    { index: 2, sourceStart: 34, sourceEnd: 38.2, outputStart: 7.2727272727272725, outputEnd: 11.090909090909092, joinsPrevious: true, zoom: 1.25, composition: null, sceneStartSeconds: null, captionCenterY: 0.5521, panels: panels(hostSourceZoom125) },
   ],
   cues: fixtureCues,
-  hook: { lines: ['POR QUE 90% DOS', 'DEVS ERRAM ASSIM'], canvas: { x: 0, y: 0, w: 1080, h: 220 }, sizePx: 58 },
+  hook: { lines: ['POR QUE 90% DOS', 'DEVS ERRAM ASSIM'], canvas: { x: 0, y: 0, w: 1080, h: 220 }, sizePx: 58, textCenterY: 110 },
   endCard: fixtureEndCard,
 };
 
@@ -159,7 +163,7 @@ function endCardTimeline(title: string): Timeline {
     zoom: { enabled: false, strength: 1.12 },
     endCard: { enabled: true },
   };
-  return buildTimeline({ edit, words: transcriptWords(3), layout, title, source: { width: 1920, height: 1080, durationSeconds: 180 }, hostFraming: null });
+  return buildTimeline({ edit, words: transcriptWords(3), layout, title, source: { width: 1920, height: 1080, durationSeconds: 180 }, hostFraming: null, sceneTrack: null });
 }
 
 async function generateSource(target: string, seconds: number): Promise<void> {
@@ -264,6 +268,7 @@ test('caption words escape backslashes and braces', () => {
     lines: [[word(0, '\\{X}', 0, 1)]],
     outputStart: 0,
     outputEnd: 1.25,
+    centerY: 0.5521,
   };
   const ass = buildExportAss({ timeline: { ...fixtureTimeline, cues: [escaped] }, layout });
   const events = dialogueEvents(ass, 'Caption');
@@ -356,14 +361,16 @@ test('renders through a work dir containing ffmpeg-hostile characters', { timeou
     canvas: { width: 1080, height: 1920, fps: 30 },
     speed: 1,
     durationSeconds: 1,
+    stackSplit: null,
     clips: [
-      { index: 0, sourceStart: 0.2, sourceEnd: 0.7, outputStart: 0, outputEnd: 0.5, joinsPrevious: false, zoom: 1, panels: [contentPlacement, hostPlacement] },
-      { index: 1, sourceStart: 0.7, sourceEnd: 1.2, outputStart: 0.5, outputEnd: 1, joinsPrevious: true, zoom: 1, panels: [contentPlacement, hostPlacement] },
+      { index: 0, sourceStart: 0.2, sourceEnd: 0.7, outputStart: 0, outputEnd: 0.5, joinsPrevious: false, zoom: 1, composition: null, sceneStartSeconds: null, captionCenterY: 0.5521, panels: [contentPlacement, hostPlacement] },
+      { index: 1, sourceStart: 0.7, sourceEnd: 1.2, outputStart: 0.5, outputEnd: 1, joinsPrevious: true, zoom: 1, composition: null, sceneStartSeconds: null, captionCenterY: 0.5521, panels: [contentPlacement, hostPlacement] },
     ],
     cues: [{
       lines: [[word(0, 'TESTE', 0, 0.25), word(1, 'DOIS', 0.25, 0.5)]],
       outputStart: 0,
       outputEnd: 0.75,
+      centerY: 0.5521,
     }],
     hook: null,
     endCard: null,
@@ -417,6 +424,7 @@ test('renders frame-accurate audio and video across many crop-split clips', { ti
     title: 'Um titulo de teste para o cartao final do short',
     source: { width: 640, height: 360, durationSeconds: 40 },
     hostFraming: null,
+    sceneTrack: null,
   });
   assert.ok(timeline.clips.length >= 60, `clips ${timeline.clips.length}`);
   assert.ok(timeline.clips.some((clip) => clip.joinsPrevious));
@@ -470,8 +478,8 @@ test('renders frame-accurate audio and video across many crop-split clips', { ti
   assert.ok(tail < body * 0.15, `end card tail ${tail} vs body ${body}`);
 });
 
-test('renderShortExport with a blur host panel produces the right output size and centered foreground', { timeout: 120_000 }, async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'render-blur-'));
+test('renderShortExport with a contained host panel produces the right output size and centered foreground', { timeout: 120_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'render-contain-'));
   const sourcePath = join(dir, 'source.mp4');
   await runProcess('ffmpeg', [
     '-y',
@@ -490,12 +498,13 @@ test('renderShortExport with a blur host panel produces the right output size an
     role: 'host',
     source: { x: 220, y: 0, w: 200, h: 360 },
     canvas: hostCanvas,
-    fill: 'blur',
+    fill: 'contain',
   };
   const timeline: Timeline = {
     canvas: { width: 1080, height: 1920, fps: 30 },
     speed: 1,
     durationSeconds: 0.5,
+    stackSplit: null,
     clips: [
       {
         index: 0,
@@ -505,6 +514,9 @@ test('renderShortExport with a blur host panel produces the right output size an
         outputEnd: 0.5,
         joinsPrevious: false,
         zoom: 1,
+        composition: null,
+        sceneStartSeconds: null,
+        captionCenterY: 0.5521,
         panels: [hostPlacement],
       },
     ],
@@ -558,4 +570,358 @@ test('renderShortExport with a blur host panel produces the right output size an
   const bgRight = pixel(980, sampleY);
   assert.ok(bgLeft.r < 200 && bgLeft.r > 30, `blurred left should be darkened red, got ${JSON.stringify(bgLeft)}`);
   assert.ok(bgRight.b < 200 && bgRight.b > 30, `blurred right should be darkened blue, got ${JSON.stringify(bgRight)}`);
+});
+
+test('ASS uses each cue position across changing compositions', () => {
+  const timeline: Timeline = {
+    ...fixtureTimeline,
+    cues: [
+      { lines: [[word(0, 'UM', 0, 0.5)]], outputStart: 0, outputEnd: 1, centerY: 0.4 },
+      { lines: [[word(1, 'DOIS', 1, 1.5)]], outputStart: 1, outputEnd: 2, centerY: 0.8 },
+    ],
+  };
+  const ass = buildExportAss({ timeline, layout });
+  const events = dialogueEvents(ass, 'Caption');
+  assert.equal(events.length, 2);
+  assert.match(events[0]!.text, /\{\\an5\\pos\(540,768\)\}/);
+  assert.match(events[1]!.text, /\{\\an5\\pos\(540,1536\)\}/);
+});
+
+async function generateBarsVideo(target: string): Promise<void> {
+  await runProcess('ffmpeg', [
+    '-v', 'error', '-y',
+    '-f', 'lavfi', '-i', 'color=c=green:s=640x360:r=30:d=1',
+    '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
+    '-vf', 'drawbox=x=0:y=0:w=20:h=360:color=red:t=fill,drawbox=x=620:y=0:w=20:h=360:color=blue:t=fill,drawbox=x=0:y=0:w=640:h=20:color=yellow:t=fill,drawbox=x=0:y=340:w=640:h=20:color=cyan:t=fill',
+    '-map', '0:v', '-map', '1:a',
+    '-t', '1',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-pix_fmt', 'yuv420p',
+    '-ac', '2', '-c:a', 'aac', '-b:a', '96k',
+    target,
+  ]);
+}
+
+function containTimeline(source: TimelinePanelPlacement['source'], canvas: TimelinePanelPlacement['canvas']): Timeline {
+  return {
+    canvas: { width: 1080, height: 1920, fps: 30 },
+    speed: 1,
+    durationSeconds: 0.5,
+    stackSplit: null,
+    clips: [{
+      index: 0,
+      sourceStart: 0,
+      sourceEnd: 0.5,
+      outputStart: 0,
+      outputEnd: 0.5,
+      joinsPrevious: false,
+      zoom: 1,
+      composition: null,
+      sceneStartSeconds: null,
+      captionCenterY: 0.5521,
+      panels: [{ panelId: 'content', role: 'content', source, canvas, fill: 'contain' }],
+    }],
+    cues: [],
+    hook: null,
+    endCard: null,
+  };
+}
+
+async function framePixels(videoPath: string, outputPath: string): Promise<Buffer> {
+  await runProcess('ffmpeg', ['-v', 'error', '-y', '-i', videoPath, '-vframes', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', outputPath]);
+  return readFile(outputPath);
+}
+
+function pixelOf(pixels: Buffer, width: number, x: number, y: number): { r: number; g: number; b: number } {
+  const offset = (y * width + x) * 3;
+  return { r: pixels[offset]!, g: pixels[offset + 1]!, b: pixels[offset + 2]! };
+}
+
+test('contained wide and tall panels fit sharp foreground in both axes', { timeout: 300_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'render-two-axis-'));
+  try {
+    const sourcePath = join(dir, 'bars.mp4');
+    await generateBarsVideo(sourcePath);
+    const fontsDir = join(import.meta.dirname, '..', 'assets', 'fonts');
+
+    const wide = await renderShortExport({
+      timeline: containTimeline({ x: 0, y: 120, w: 640, h: 80 }, { x: 0, y: 0, w: 1080, h: 400 }),
+      layout,
+      sourceVideoPath: sourcePath,
+      workDir: join(dir, 'wide'),
+      fontsDir,
+      endCardThumbnailPath: null,
+    });
+    assert.ok(Math.abs(wide.durationSeconds - 0.5) < 1 / 30, `wide duration ${wide.durationSeconds}`);
+    const widePixels = await framePixels(wide.artifactPath, join(dir, 'wide.rgb'));
+    const wideForeground = pixelOf(widePixels, 1080, 10, 200);
+    assert.ok(wideForeground.r > 200 && wideForeground.g < 90 && wideForeground.b < 90, `wide left edge ${JSON.stringify(wideForeground)}`);
+    const wideRight = pixelOf(widePixels, 1080, 1070, 200);
+    assert.ok(wideRight.b > 200 && wideRight.r < 90, `wide right edge ${JSON.stringify(wideRight)}`);
+    const wideCenter = pixelOf(widePixels, 1080, 540, 200);
+    assert.ok(wideCenter.g > 110 && wideCenter.r < 90, `wide foreground body ${JSON.stringify(wideCenter)}`);
+    const above = pixelOf(widePixels, 1080, 540, 60);
+    const below = pixelOf(widePixels, 1080, 540, 380);
+    assert.ok(above.g > 40 && above.g < 130 && above.r < 80 && above.b < 80, `wide background above ${JSON.stringify(above)}`);
+    assert.ok(Math.abs(above.g - below.g) < 30, `wide background not centered vertically: ${JSON.stringify(above)} vs ${JSON.stringify(below)}`);
+
+    const tall = await renderShortExport({
+      timeline: containTimeline({ x: 300, y: 0, w: 40, h: 360 }, { x: 0, y: 0, w: 400, h: 800 }),
+      layout,
+      sourceVideoPath: sourcePath,
+      workDir: join(dir, 'tall'),
+      fontsDir,
+      endCardThumbnailPath: null,
+    });
+    assert.ok(Math.abs(tall.durationSeconds - 0.5) < 1 / 30, `tall duration ${tall.durationSeconds}`);
+    const tallPixels = await framePixels(tall.artifactPath, join(dir, 'tall.rgb'));
+    const tallTop = pixelOf(tallPixels, 1080, 200, 10);
+    assert.ok(tallTop.r > 200 && tallTop.g > 180 && tallTop.b < 130, `tall top edge ${JSON.stringify(tallTop)}`);
+    const tallBottom = pixelOf(tallPixels, 1080, 200, 790);
+    assert.ok(tallBottom.b > 200 && tallBottom.g > 180 && tallBottom.r < 130, `tall bottom edge ${JSON.stringify(tallBottom)}`);
+    const tallCenter = pixelOf(tallPixels, 1080, 200, 400);
+    assert.ok(tallCenter.g > 110 && tallCenter.r < 90, `tall foreground body ${JSON.stringify(tallCenter)}`);
+    const left = pixelOf(tallPixels, 1080, 80, 400);
+    const right = pixelOf(tallPixels, 1080, 320, 400);
+    assert.ok(left.g > 40 && left.g < 130 && left.r < 80 && left.b < 80, `tall background left ${JSON.stringify(left)}`);
+    assert.ok(Math.abs(left.g - right.g) < 30, `tall background not centered horizontally: ${JSON.stringify(left)} vs ${JSON.stringify(right)}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+interface CountedSceneFixture {
+  composition: 'stack' | null;
+}
+
+function sceneCutTimeline(input: CountedSceneFixture): Timeline {
+  const fps = 30;
+  const speed = 1.1;
+  const sourceBounds = [0, 0.5, 1, 1.5, 2, 2.5];
+  const contentCanvas = { x: 0, y: 0, w: 540, h: 400 };
+  const hostCanvasPanel = { x: 0, y: 400, w: 540, h: 400 };
+  const panels: TimelinePanelPlacement[] = [
+    { panelId: 'content', role: 'content', source: { x: 0, y: 0, w: 320, h: 180 }, canvas: contentCanvas, fill: 'cover' },
+    { panelId: 'host', role: 'host', source: { x: 320, y: 0, w: 320, h: 180 }, canvas: hostCanvasPanel, fill: 'contain' },
+  ];
+  let cumulativeFrames = 0;
+  let outputStart = 0;
+  const clips = sourceBounds.slice(0, -1).map((sourceStart, index) => {
+    const sourceEnd = sourceBounds[index + 1]!;
+    if (input.composition !== null) {
+      const targetFrames = Math.round(((sourceEnd / speed) * fps));
+      const frames = targetFrames - cumulativeFrames;
+      const outputEnd = targetFrames / fps;
+      const clip = {
+        index,
+        sourceStart,
+        sourceEnd,
+        outputStart,
+        outputEnd,
+        joinsPrevious: index > 0,
+        zoom: 1,
+        composition: input.composition,
+        sceneStartSeconds: sourceStart,
+        captionCenterY: 0.55,
+        panels,
+      };
+      cumulativeFrames = targetFrames;
+      outputStart = outputEnd;
+      return clip;
+    }
+    const outputDuration = (sourceEnd - sourceStart) / speed;
+    const clip = {
+      index,
+      sourceStart,
+      sourceEnd,
+      outputStart,
+      outputEnd: outputStart + outputDuration,
+      joinsPrevious: index > 0,
+      zoom: 1,
+      composition: null,
+      sceneStartSeconds: null,
+      captionCenterY: 0.55,
+      panels,
+    };
+    outputStart += outputDuration;
+    return clip;
+  });
+  return {
+    canvas: { width: 540, height: 960, fps },
+    speed,
+    durationSeconds: clips[clips.length - 1]!.outputEnd,
+    stackSplit: input.composition === null ? null : 0.5,
+    clips,
+    cues: [],
+    hook: null,
+    endCard: null,
+  };
+}
+
+async function countVideoFrames(videoPath: string): Promise<number> {
+  const probe = await runProcess('ffprobe', [
+    '-v', 'error', '-count_frames',
+    '-select_streams', 'v:0',
+    '-show_entries', 'stream=nb_read_frames',
+    '-of', 'default=noprint_wrappers=1:nokey=1',
+    videoPath,
+  ]);
+  return Number(probe.stdout.trim());
+}
+
+async function chunkAudioSamples(workDir: string, outputPath: string): Promise<number> {
+  await runProcess('ffmpeg', [
+    '-v', 'error', '-y',
+    '-i', join(workDir, 'chunk_0.mkv'),
+    '-map', '0:a', '-ac', '1', '-ar', '48000',
+    '-f', 's16le',
+    outputPath,
+  ]);
+  const pcm = await readFile(outputPath);
+  return pcm.byteLength / 2;
+}
+
+test('many scene cuts preserve frame count audio duration and frozen geometry', { timeout: 300_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'render-scene-cuts-'));
+  try {
+    const sourcePath = join(dir, 'source.mp4');
+    await generateSource(sourcePath, 6);
+    const timeline = sceneCutTimeline({ composition: 'stack' });
+    assert.equal(timeline.clips.map((clip) => Math.round((clip.outputEnd - clip.outputStart) * 30)).reduce((sum, frames) => sum + frames, 0), 68);
+    const result = await renderShortExport({
+      timeline,
+      layout: { ...layout, canvas: timeline.canvas },
+      sourceVideoPath: sourcePath,
+      workDir: join(dir, 'export'),
+      fontsDir: join(import.meta.dirname, '..', 'assets', 'fonts'),
+      endCardThumbnailPath: null,
+    });
+    assert.equal(await countVideoFrames(result.artifactPath), 68);
+    assert.ok(Math.abs(result.durationSeconds - 68 / 30) < 1 / 30, `duration ${result.durationSeconds}`);
+    assert.equal(await chunkAudioSamples(join(dir, 'export'), join(dir, 'audio.raw')), 108800);
+    const beforeCut = await outputFramePixels(result.artifactPath, 0.4, join(dir, 'before.rgb'));
+    const afterCut = await outputFramePixels(result.artifactPath, 0.5, join(dir, 'after.rgb'));
+    for (const pixels of [beforeCut, afterCut]) {
+      const band = pixelOf(pixels, 540, 270, 900);
+      assert.ok(band.r < 40 && band.g < 40 && band.b < 40, `frozen background band moved: ${JSON.stringify(band)}`);
+      const contentTop = pixelOf(pixels, 540, 270, 100);
+      const hostBottom = pixelOf(pixels, 540, 270, 700);
+      assert.ok(contentTop.g + contentTop.b + contentTop.r > 40, 'content panel missing before the cut');
+      assert.ok(hostBottom.g + hostBottom.b + hostBottom.r > 40, 'host panel missing after the cut');
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+
+async function outputFramePixels(videoPath: string, seconds: number, outputPath: string): Promise<Buffer> {
+  await runProcess('ffmpeg', ['-v', 'error', '-y', '-ss', String(seconds), '-i', videoPath, '-vframes', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', outputPath]);
+  return readFile(outputPath);
+}
+
+test('fixed exports keep baseline frame and audio sample counts', { timeout: 300_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'render-fixed-baseline-'));
+  try {
+    const sourcePath = join(dir, 'source.mp4');
+    await generateSource(sourcePath, 6);
+    const timeline = sceneCutTimeline({ composition: null });
+    const result = await renderShortExport({
+      timeline,
+      layout: { ...layout, canvas: timeline.canvas },
+      sourceVideoPath: sourcePath,
+      workDir: join(dir, 'export'),
+      fontsDir: join(import.meta.dirname, '..', 'assets', 'fonts'),
+      endCardThumbnailPath: null,
+    });
+    assert.equal(await countVideoFrames(result.artifactPath), 70);
+    assert.ok(Math.abs(result.durationSeconds - 70 / 30) < 1 / 30, `duration ${result.durationSeconds}`);
+    assert.equal(await chunkAudioSamples(join(dir, 'export'), join(dir, 'audio.raw')), 111418);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('renders scenes timelines with output frames equal to the timeline frames', { timeout: 600_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'render-scenes-frames-'));
+  const sourcePath = join(dir, 'source.mp4');
+  await generateSource(sourcePath, 20);
+  const words: TranscriptWord[] = Array.from({ length: 18 }, (_, index) => ({
+    id: `w_${index}`,
+    text: `palavra${index}`,
+    startSeconds: index < 9 ? index * 0.5 : 6 + (index - 9) * 0.5,
+    endSeconds: index < 9 ? index * 0.5 + 0.48 : 6 + (index - 9) * 0.5 + 0.48,
+    speakerId: 'A',
+    confidence: 0.9,
+  }));
+  const edit: ShortEdit = {
+    ranges: [{ startWord: 0, endWord: 17 }],
+    removedWords: [],
+    tightenPauses: { enabled: true, maxGapSeconds: 0.35 },
+    speed: 1,
+    hook: { enabled: false, text: '' },
+    captions: { enabled: true },
+    crops: [],
+    zoom: { enabled: false, strength: 1.12 },
+    endCard: { enabled: false },
+    layout: { split: null, overrides: [] },
+  };
+  const scenesLayout: LayoutProfile = {
+    version: 3,
+    layoutId: 'mix-scenes-v3',
+    strategy: 'scenes',
+    canvas: { width: 540, height: 960, fps: 30 },
+    background: '#101010',
+    safeArea: { top: 0.135, bottom: 0.17, side: 0.055 },
+    font: { family: 'Montserrat ExtraBold', file: 'assets/fonts/Montserrat-ExtraBold.ttf', assSizeScale: 1.562 },
+    hookBand: { rect: { x: 0, y: 0, w: 1, h: 0.1146 }, background: '#C8102E', textColor: '#FFFFFF', sizePx: 40, maxCharsPerLine: 24, maxLines: 2, uppercase: true },
+    captions: { sizePx: 42, textColor: '#FFFFFF', highlightColor: '#FFD400', outlineColor: '#000000', outlinePx: 4, shadowPx: 2, uppercase: true, maxWordsPerCue: 4, maxCharsPerLine: 16, maxLines: 2, centerY: 0.5521 },
+    scene: { captionCenterY: { host: 0.72, content: 0.78 } },
+  };
+  const sceneSegment = (startSeconds: number, endSeconds: number): SceneSegment => ({
+    startSeconds,
+    endSeconds,
+    host: { camera: { x: 0.15, y: 0.6, w: 0.5, h: 0.35 }, head: { x: 0.35, y: 0.66, w: 0.1, h: 0.15 } },
+    content: { box: { x: 0, y: 0, w: 1, h: 0.5 }, kind: 'document', vertical: false, subject: { x: 0.2, y: 0.05, w: 0.4, h: 0.3 } },
+    overlays: [],
+  });
+  const probeTimeline = buildTimeline({
+    edit,
+    words,
+    layout: scenesLayout,
+    title: 'Titulo do cartao final',
+    source: { width: 640, height: 360, durationSeconds: 20 },
+    hostFraming: null,
+    sceneTrack: { version: 1, analyzedAt: '2026-10-19T10:00:00.000Z', frame: { width: 640, height: 360 }, segments: [sceneSegment(0, 12)] },
+  });
+  const clipEnd = probeTimeline.clips[probeTimeline.clips.length - 1]!.sourceEnd;
+  const timeline = buildTimeline({
+    edit,
+    words,
+    layout: scenesLayout,
+    title: 'Titulo do cartao final',
+    source: { width: 640, height: 360, durationSeconds: 20 },
+    hostFraming: null,
+    sceneTrack: { version: 1, analyzedAt: '2026-10-19T10:00:00.000Z', frame: { width: 640, height: 360 }, segments: [sceneSegment(0, clipEnd - 0.01), sceneSegment(clipEnd - 0.01, 12)] },
+  });
+  assert.ok(timeline.clips.length >= 2, `clips ${timeline.clips.length}`);
+  const lastClip = timeline.clips[timeline.clips.length - 1]!;
+  assert.ok(Math.abs(lastClip.sourceEnd - clipEnd) < 1e-6, `last source end ${lastClip.sourceEnd}`);
+  const result = await renderShortExport({
+    timeline,
+    layout: scenesLayout,
+    sourceVideoPath: sourcePath,
+    workDir: join(dir, 'export'),
+    fontsDir: join(import.meta.dirname, '..', 'assets', 'fonts'),
+    endCardThumbnailPath: null,
+  });
+  const probe = await runProcess('ffprobe', [
+    '-v', 'error',
+    '-select_streams', 'v:0',
+    '-count_frames',
+    '-show_entries', 'stream=nb_read_frames',
+    '-of', 'csv=p=0',
+    result.artifactPath,
+  ]);
+  const expectedFrames = timeline.clips.reduce((total, clip) => total + Math.round(clip.outputEnd * 30) - Math.round(clip.outputStart * 30), 0);
+  assert.equal(Number(probe.stdout.trim()), expectedFrames);
 });

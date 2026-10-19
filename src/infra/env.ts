@@ -19,7 +19,6 @@ const EnvSchema = z.object({
   DEEPGRAM_API_KEY: OptionalStringSchema,
   ELEVENLABS_API_KEY: OptionalStringSchema,
   MALLARY_AI_API_TOKEN: OptionalStringSchema,
-  MALLARY_PROFILE_ID: OptionalStringSchema,
   BUFFER_API_KEY: OptionalStringSchema,
   BUFFER_ORGANIZATION_ID: OptionalStringSchema,
   BUFFER_INSTAGRAM_CHANNEL_ID: OptionalStringSchema,

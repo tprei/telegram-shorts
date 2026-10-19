@@ -1,5 +1,5 @@
 import { useState, type KeyboardEvent } from 'react';
-import type { HookSuggestionsDto, ScheduledPostDto, ShortDetailDto } from '@api';
+import type { HookSuggestionsDto, ShortDetailDto } from '@api';
 import { EDIT_LIMITS, type ShortEdit } from '@domain/edit';
 import type { NormRect } from '@domain/layout';
 import type { PublishCopy, ShortVideoPlatform } from '@domain/model';
@@ -15,6 +15,7 @@ import {
 import { CropEditor } from './CropEditor';
 import { ExportFeedback, newestExport } from './ExportFeedback';
 import { PublishPanel } from './PublishPanel';
+import { SceneLayoutSection, type SceneLayoutSectionProps } from './SceneLayoutSection';
 
 export type InspectorTab = 'edit' | 'framing' | 'revise' | 'publish';
 export interface RevisionSummary {
@@ -27,6 +28,7 @@ export interface EditorInspectorProps {
   edit: ShortEdit;
   title: string;
   frameUrl: (sourceSeconds: number, width: number) => string;
+  sceneLayout: SceneLayoutSectionProps | null;
   hookSuggestions?: HookSuggestionsDto | null;
   hooksPending?: boolean;
   revisePending?: boolean;
@@ -35,7 +37,6 @@ export interface EditorInspectorProps {
   publishCopy: PublishCopy | null;
   copyPending?: boolean;
   selectedPlatforms: ShortVideoPlatform[];
-  upcomingPosts: readonly ScheduledPostDto[];
   publishPending?: boolean;
   error?: string | null;
   cancellingPublicationIds?: readonly string[];
@@ -74,6 +75,7 @@ export function EditorInspector(props: EditorInspectorProps) {
     edit,
     title,
     frameUrl,
+    sceneLayout,
     hookSuggestions,
     hooksPending,
     revisePending,
@@ -82,7 +84,6 @@ export function EditorInspector(props: EditorInspectorProps) {
     publishCopy: savedPublishCopy,
     copyPending,
     selectedPlatforms,
-    upcomingPosts,
     publishPending,
     error,
     cancellingPublicationIds,
@@ -116,8 +117,21 @@ export function EditorInspector(props: EditorInspectorProps) {
     publishCopy.line1.trim() && publishCopy.line2.trim() && publishCopy.hashtags.length,
   );
   const crop = edit.crops[cropIndex];
-  const contentRegion = detail.job.layout.panels.find((panel) => panel.role === 'content')
-    ?.sourceRect ?? { x: 0, y: 0, w: 1, h: 1 };
+  const layout = detail.job.layout;
+  const fullFrame: NormRect = { x: 0, y: 0, w: 1, h: 1 };
+  const contentRegion = layout.strategy === 'fixed'
+    ? layout.panels.find((panel) => panel.role === 'content')?.sourceRect ?? fullFrame
+    : fullFrame;
+  const cropSegment = crop !== undefined && layout.strategy === 'scenes' && detail.job.sceneTrack !== null
+    ? detail.job.sceneTrack.segments.find(
+        (segment) => crop.sourceSeconds >= segment.startSeconds && crop.sourceSeconds < segment.endSeconds,
+      ) ?? null
+    : null;
+  const cropContentRegion = cropSegment?.content?.box ?? null;
+  const sceneAnalyzing =
+    detail.job.sceneAnalysis.status === 'queued' || detail.job.sceneAnalysis.status === 'running';
+  const canAddCrop = !sceneAnalyzing
+    && (sceneLayout === null || (sceneLayout.segment !== null && sceneLayout.segment.content !== null));
   const analyzing =
     detail.short.cropAnalysis === 'queued' || detail.short.cropAnalysis === 'running';
   const currentExport = newestExport(detail.exports);
@@ -319,6 +333,7 @@ export function EditorInspector(props: EditorInspectorProps) {
         )}
         {tab === 'framing' && (
           <>
+            {sceneLayout && <SceneLayoutSection {...sceneLayout} />}
             <section className="inspector-section">
               <div className="field-line">
                 <div>
@@ -330,7 +345,7 @@ export function EditorInspector(props: EditorInspectorProps) {
               <p className="field-help">
                 Keyframes follow source time. Manual changes stay in your hands.
               </p>
-              <Button className="full-width" icon="plus" onClick={onAddCrop}>
+              <Button className="full-width" icon="plus" onClick={onAddCrop} disabled={!canAddCrop}>
                 Add keyframe at playhead
               </Button>
               <div className="keyframe-list">
@@ -361,7 +376,8 @@ export function EditorInspector(props: EditorInspectorProps) {
                   keyframe={crop}
                   frameUrl={frameUrl(crop.sourceSeconds, 960)}
                   sourceAspectRatio={detail.job.media.width / detail.job.media.height}
-                  contentRegion={contentRegion}
+                  contentRegion={cropContentRegion ?? contentRegion}
+                  focusSpace={cropContentRegion !== null ? 'content' : 'source'}
                   onChange={(focus) => onCropChange(cropIndex, focus)}
                   onDelete={() => {
                     onDeleteCrop(cropIndex);
@@ -455,6 +471,7 @@ export function EditorInspector(props: EditorInspectorProps) {
                 className="full-width"
                 icon="download"
                 pending={exportPending || rendering}
+                disabled={sceneAnalyzing}
                 onClick={onExport}
               >
                 {currentExport?.status === 'failed' ? 'Try export again' : currentExport?.status === 'ready' ? 'Export again' : 'Export video'}
@@ -568,8 +585,9 @@ export function EditorInspector(props: EditorInspectorProps) {
               publications={detail.publications}
               platforms={detail.platforms}
               selectedPlatforms={selectedPlatforms}
-              upcomingPosts={upcomingPosts}
-              schedule={detail.job.schedule}
+              accountId={detail.job.account?.id ?? null}
+              schedule={detail.job.account?.schedule ?? null}
+              takenSlots={detail.job.takenSlots}
               cancellingPublicationIds={cancellingPublicationIds}
               cancelError={cancelError}
               onCancelPublication={onCancelPublication}

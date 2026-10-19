@@ -659,3 +659,65 @@ test('an HTTP 4xx response is never retried', async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test('aborted caller signal stops repair and network retry', async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  const controller = new AbortController();
+  controller.abort();
+  globalThis.fetch = ((_url: string | URL | Request, init?: RequestInit) => {
+    calls += 1;
+    const { promise, reject } = Promise.withResolvers<Response>();
+    const signal = init?.signal;
+    if (signal !== undefined && !signal.aborted) {
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      return promise;
+    }
+    reject(signal?.reason ?? new DOMException('This operation was aborted', 'AbortError'));
+    return promise;
+  }) as typeof fetch;
+  try {
+    await assert.rejects(
+      () => requestStructuredJson(baseConfig, {
+        title: 'scene_layout',
+        system: 'sistema',
+        userText: 'pedido',
+        temperature: 0.1,
+        responseFormat: { name: 'scene_layout', schema: { type: 'object' } },
+        parse: (value) => value,
+        signal: controller.signal,
+      }),
+      (error: unknown) => error instanceof Error && error.name === 'AbortError',
+    );
+    assert.equal(calls, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const retryController = new AbortController();
+  let retryCalls = 0;
+  globalThis.fetch = (async () => {
+    retryCalls += 1;
+    retryController.abort();
+    const error = new Error('connect timed out');
+    (error as Error & { code: string }).code = 'ETIMEDOUT';
+    throw error;
+  }) as typeof fetch;
+  try {
+    await assert.rejects(
+      () => requestStructuredJson(baseConfig, {
+        title: 'scene_layout',
+        system: 'sistema',
+        userText: 'pedido',
+        temperature: 0.1,
+        responseFormat: { name: 'scene_layout', schema: { type: 'object' } },
+        parse: (value) => value,
+        signal: retryController.signal,
+      }),
+      (error: unknown) => error instanceof Error && error.name === 'AbortError',
+    );
+    assert.equal(retryCalls, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

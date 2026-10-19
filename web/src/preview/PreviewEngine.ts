@@ -459,7 +459,10 @@ export class PreviewEngine {
     if (active.currentTime >= clip.sourceEnd - CUT_MARGIN_SECONDS) {
       this.advanceFrom(clip);
     } else {
-      const output = clip.outputStart + (active.currentTime - clip.sourceStart) / timeline.speed;
+      const clipRatio = (active.currentTime - clip.sourceStart) / (clip.sourceEnd - clip.sourceStart);
+      const output = clip.composition === null
+        ? clip.outputStart + (active.currentTime - clip.sourceStart) / timeline.speed
+        : clip.outputStart + (clip.outputEnd - clip.outputStart) * clipRatio;
       this.state.outputSeconds = Math.min(Math.max(output, clip.outputStart), clip.outputEnd);
       this.drawCurrentFrame();
       this.notify(false);

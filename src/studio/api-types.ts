@@ -11,14 +11,30 @@ import type {
   PostingSchedule,
   PublicationStatus,
   PublishCopy,
+  SceneAnalysisStatus,
+  SceneTrack,
   ShortStatus,
   ShortVideoPlatform,
 } from '../domain/model.js';
+
+export interface PublishingAccountDto {
+  id: string;
+  displayName: string;
+  schedule: PostingSchedule;
+  platforms: ShortVideoPlatform[];
+  connected: boolean;
+}
 
 export interface CreatorDto {
   id: string;
   displayName: string;
   isDefault: boolean;
+  accountId: string | null;
+}
+
+export interface SceneAnalysisDto {
+  status: SceneAnalysisStatus;
+  error: string | null;
 }
 
 export interface JobMediaDto {
@@ -38,6 +54,7 @@ export interface JobSummaryDto {
   progress: string | null;
   error: string | null;
   creator: { id: string; displayName: string };
+  sceneAnalysis: SceneAnalysisDto;
   shortCounts: { active: number; rejected: number; exported: number };
   createdAt: string;
   updatedAt: string;
@@ -140,6 +157,7 @@ export interface ScheduledPostDto {
   scheduledFor: string;
   provider: string | null;
   timeZone: string;
+  accountId: string;
 }
 
 export interface ShortDetailDto {
@@ -162,8 +180,11 @@ export interface ShortDetailDto {
     media: JobMediaDto;
     layout: LayoutProfile;
     hostFraming: HostFraming | null;
+    sceneTrack: SceneTrack | null;
+    sceneAnalysis: SceneAnalysisDto;
     fontUrl: string;
-    schedule: PostingSchedule;
+    account: PublishingAccountDto | null;
+    takenSlots: string[];
   };
   exports: ExportDto[];
   publications: PublicationDto[];
@@ -265,7 +286,8 @@ export interface StudioApi {
   chooseSpeaker(jobId: string, request: ChooseSpeakerRequest): JobDetailDto;
   replan(jobId: string): JobDetailDto;
   analyzeHostFraming(jobId: string): JobDetailDto;
-  createManualShort(jobId: string, request: CreateManualShortRequest): ShortDetailDto;
+  analyzeScenes(jobId: string): JobDetailDto;
+  createManualShort(jobId: string, request: CreateManualShortRequest): Promise<ShortDetailDto>;
   getShort(shortId: string): Promise<ShortDetailDto>;
   saveEdit(shortId: string, request: SaveEditRequest): Promise<ShortDetailDto>;
   revise(shortId: string, request: ReviseRequest): Promise<ReviseResultDto>;
@@ -278,7 +300,7 @@ export interface StudioApi {
   updatePublishCopy(shortId: string, request: UpdatePublishCopyRequest): Promise<ShortDetailDto>;
   publish(exportId: string, request: PublishRequest): Promise<PublicationDto[]>;
   cancelPublication(publicationId: string): Promise<ShortDetailDto>;
-  listScheduledPosts(): ScheduledPostDto[];
+  listScheduledPosts(): Promise<ScheduledPostDto[]>;
 }
 
 export interface AutopilotShortDto {
@@ -304,7 +326,10 @@ export interface AutopilotStatusDto {
   displayName: string;
   enabled: boolean;
   channelUrl: string;
-  schedule: PostingSchedule;
+  accountId: string | null;
+  accountConnected: boolean;
+  reason: string | null;
+  schedule: PostingSchedule | null;
   shortsPerVideo: number;
   platforms: ShortVideoPlatform[];
   reviewWindowHours: number;

@@ -5,7 +5,7 @@ import { request as httpsRequest } from 'node:https';
 import { basename, extname } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { z } from 'zod';
-import type { PublishCopy, ShortVideoPlatform } from '../domain/model.js';
+import type { PublishingAccount, PublishCopy, ShortVideoPlatform } from '../domain/model.js';
 import type { RemotePublicationState, ShortVideoCheckPublicationInput, ShortVideoPublishInput, ShortVideoPublishProvider, ShortVideoPublishResult, ShortVideoPublishErrorStage } from './instagram-publisher.js';
 import { ShortVideoPublishError, isTransientNetworkError as sharedIsTransientNetworkError, lenientRemoteString } from './instagram-publisher.js';
 import { logError } from './util.js';
@@ -212,12 +212,15 @@ export class MallaryClient implements ShortVideoPublishProvider {
 
   constructor(
     private readonly apiToken: string,
-    private readonly profileId: string | null | undefined,
     private readonly uploadClient: MallaryUploadClient,
   ) {}
 
   supports(platform: ShortVideoPlatform): boolean {
     return this.supportedPlatforms.includes(platform);
+  }
+
+  canPublish(input: { account: PublishingAccount; platform: ShortVideoPlatform; scheduled: boolean }): boolean {
+    return this.supports(input.platform) && input.account.mallaryProfileId !== null;
   }
 
   async checkPublication(input: ShortVideoCheckPublicationInput): Promise<RemotePublicationState> {
@@ -284,6 +287,14 @@ export class MallaryClient implements ShortVideoPublishProvider {
   }
 
   async publishShortVideo(input: ShortVideoPublishInput): Promise<ShortVideoPublishResult> {
+    if (!input.account.mallaryProfileId) {
+      throw new ShortVideoPublishError({
+        provider: this.name,
+        stage: 'configuration',
+        message: 'Account not connected in Mallary',
+        safeToFailover: false,
+      });
+    }
     const upload = await this.uploadClient.uploadFile(input.filePath);
     const thumbnailUpload = input.platform === 'instagram' && input.thumbnailPath
       ? await this.uploadClient.uploadFile(input.thumbnailPath)
@@ -294,7 +305,7 @@ export class MallaryClient implements ShortVideoPublishProvider {
       title: input.title,
       mediaUrl: upload.mediaUrl,
       mediaType: mallaryMimeType(input.filePath),
-      profileId: this.profileId,
+      profileId: input.account.mallaryProfileId,
       thumbnailUrl: thumbnailUpload?.mediaUrl ?? null,
       commentsUnderPost: input.commentsUnderPost,
       scheduledAt: input.scheduledAt,
@@ -350,7 +361,7 @@ export function buildMallaryInstagramReelPayload(input: {
   message: string;
   mediaUrl: string;
   mediaType: string;
-  profileId?: string | null;
+  profileId: string;
   thumbnailUrl?: string | null;
   commentsUnderPost?: string[];
   scheduledAt: string | null;
@@ -359,7 +370,7 @@ export function buildMallaryInstagramReelPayload(input: {
   return {
     message: input.message,
     platforms: ['instagram'],
-    ...(input.profileId ? { profile_id: input.profileId } : {}),
+    profile_id: input.profileId,
     ...(input.scheduledAt !== null ? { scheduled_at: input.scheduledAt } : {}),
     media: [{
       url: input.mediaUrl,
@@ -381,7 +392,7 @@ function buildMallaryShortVideoPayload(input: {
   title?: string | null;
   mediaUrl: string;
   mediaType: string;
-  profileId?: string | null;
+  profileId: string;
   thumbnailUrl?: string | null;
   commentsUnderPost?: string[];
   scheduledAt: string | null;
@@ -393,7 +404,7 @@ function buildMallaryShortVideoPayload(input: {
     return {
       message: input.message,
       platforms: ['tiktok'],
-      ...(input.profileId ? { profile_id: input.profileId } : {}),
+      profile_id: input.profileId,
       ...(input.scheduledAt !== null ? { scheduled_at: input.scheduledAt } : {}),
       media: [{
         url: input.mediaUrl,
@@ -411,7 +422,7 @@ function buildMallaryShortVideoPayload(input: {
   return {
     message: input.message,
     platforms: ['youtube'],
-    ...(input.profileId ? { profile_id: input.profileId } : {}),
+    profile_id: input.profileId,
     ...(input.scheduledAt !== null ? { scheduled_at: input.scheduledAt } : {}),
     media: [{
       url: input.mediaUrl,

@@ -452,6 +452,7 @@ export async function requestStructuredJson<T>(config: AppConfig, input: {
   temperature: number;
   responseFormat: ResponseFormat;
   parse: (value: unknown) => T;
+  signal?: AbortSignal;
 }): Promise<T> {
   const model = input.model ?? config.OPENROUTER_MODEL;
   const content = await requestCompletionContent(config, {
@@ -462,6 +463,7 @@ export async function requestStructuredJson<T>(config: AppConfig, input: {
     user: buildUserContent(input.userText, input.images),
     temperature: input.temperature,
     responseFormat: input.responseFormat,
+    signal: input.signal,
   });
   try {
     return input.parse(JSON.parse(extractJson(content)));
@@ -473,6 +475,7 @@ export async function requestStructuredJson<T>(config: AppConfig, input: {
       user: JSON.stringify({ parse_error: error instanceof Error ? error.message : String(error), malformed_json: content }),
       temperature: 0,
       responseFormat: input.responseFormat,
+      signal: input.signal,
     });
     return input.parse(JSON.parse(extractJson(repairedContent)));
   }
@@ -496,6 +499,7 @@ async function requestCompletionContent(config: AppConfig, input: {
   user: string | ChatPart[];
   temperature: number;
   responseFormat: ResponseFormat;
+  signal?: AbortSignal;
 }): Promise<string> {
   for (let attempt = 1; ; attempt += 1) {
     const response = await postCompletion(config, input);
@@ -518,6 +522,13 @@ async function requestCompletionContent(config: AppConfig, input: {
   }
 }
 
+function isAbortOrTimeout(error: unknown): boolean {
+  if (error instanceof DOMException) {
+    return error.name === 'TimeoutError' || error.name === 'AbortError';
+  }
+  return error instanceof Error && error.name === 'AbortError';
+}
+
 async function postCompletion(config: AppConfig, input: {
   title: string;
   model: string;
@@ -526,6 +537,7 @@ async function postCompletion(config: AppConfig, input: {
   user: string | ChatPart[];
   temperature: number;
   responseFormat: ResponseFormat;
+  signal?: AbortSignal;
 }): Promise<Response> {
   for (let attempt = 0; ; attempt += 1) {
     try {
@@ -537,7 +549,7 @@ async function postCompletion(config: AppConfig, input: {
           'HTTP-Referer': 'http://127.0.0.1',
           'X-Title': input.title,
         },
-        signal: AbortSignal.timeout(20 * 60_000),
+        signal: input.signal ?? AbortSignal.timeout(20 * 60_000),
         body: JSON.stringify({
           model: input.model,
           temperature: input.temperature,
@@ -559,8 +571,8 @@ async function postCompletion(config: AppConfig, input: {
         }),
       });
     } catch (error) {
-      if (error instanceof DOMException && error.name === 'TimeoutError') {
-        logError('OpenRouter request timed out', error, { title: input.title, model: input.model });
+      if (isAbortOrTimeout(error)) {
+        logError('OpenRouter request aborted', error, { title: input.title, model: input.model });
         throw error;
       }
       const delay = NETWORK_RETRY_DELAYS_MS[attempt];
@@ -569,7 +581,7 @@ async function postCompletion(config: AppConfig, input: {
         throw error;
       }
       logError(`OpenRouter request failed; retrying in ${delay / 1000}s`, error, { title: input.title, model: input.model, attempt: attempt + 1 });
-      await sleep(delay);
+      await sleep(delay, undefined, { signal: input.signal });
     }
   }
 }

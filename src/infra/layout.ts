@@ -36,54 +36,92 @@ const HostPanelSchema = z.strictObject({
 
 const PanelSchema = z.discriminatedUnion('role', [ContentPanelSchema, HostPanelSchema]);
 
-const LayoutProfileSchema = z.strictObject({
-  version: z.literal(2),
-  creatorId: z.string().min(1),
+const FontSchema = z.strictObject({
+  family: z.string().min(1),
+  file: z.string().min(1),
+  assSizeScale: z.number().gt(0),
+});
+
+const HookBandSchema = z.strictObject({
+  rect: RectSchema,
+  background: HexColorSchema,
+  textColor: HexColorSchema,
+  sizePx: z.number().positive(),
+  maxCharsPerLine: z.number().int().positive(),
+  maxLines: z.number().int().positive(),
+  uppercase: z.boolean(),
+});
+
+const CaptionStyleSchema = z.strictObject({
+  sizePx: z.number().positive(),
+  textColor: HexColorSchema,
+  highlightColor: HexColorSchema,
+  outlineColor: HexColorSchema,
+  outlinePx: z.number().nonnegative(),
+  shadowPx: z.number().nonnegative(),
+  uppercase: z.boolean(),
+  maxWordsPerCue: z.number().int().positive(),
+  maxCharsPerLine: z.number().int().positive(),
+  maxLines: z.number().int().positive(),
+  centerY: z.number().min(0).max(1),
+});
+
+const SafeAreaSchema = z.strictObject({
+  top: z.number().min(0).lt(0.3),
+  bottom: z.number().min(0).lt(0.3),
+  side: z.number().min(0).lt(0.3),
+});
+
+function hookBandClearsSafeArea(canvas: { height: number }, safeArea: { top: number }, hookBand: { rect: { y: number; h: number }; maxLines: number; sizePx: number }): boolean {
+  return (hookBand.rect.y + hookBand.rect.h) * canvas.height - safeArea.top * canvas.height >= hookBand.maxLines * 1.12 * hookBand.sizePx;
+}
+
+const BaseLayoutShape = {
+  version: z.literal(3),
   layoutId: z.string().min(1),
   canvas: z.strictObject({
-    width: z.number().positive(),
-    height: z.number().positive(),
+    width: z.number().int().positive(),
+    height: z.number().int().positive(),
     fps: z.number().positive(),
   }),
   background: HexColorSchema,
-  defaultSpeed: z.number().min(1).max(1.5),
-  font: z.strictObject({
-    family: z.string().min(1),
-    file: z.string().min(1),
-    assSizeScale: z.number().gt(0),
-  }),
+  font: FontSchema,
+  captions: CaptionStyleSchema,
+  safeArea: SafeAreaSchema,
+};
+
+const FixedLayoutSchema = z.strictObject({
+  ...BaseLayoutShape,
+  strategy: z.literal('fixed'),
+  hookBand: HookBandSchema.nullable(),
   panels: z.array(PanelSchema).min(1),
-  hookBand: z.strictObject({
-    rect: RectSchema,
-    background: HexColorSchema,
-    textColor: HexColorSchema,
-    sizePx: z.number().positive(),
-    maxCharsPerLine: z.number().int().positive(),
-    maxLines: z.number().int().positive(),
-    uppercase: z.boolean(),
-  }).nullable(),
-  captions: z.strictObject({
-    sizePx: z.number().positive(),
-    textColor: HexColorSchema,
-    highlightColor: HexColorSchema,
-    outlineColor: HexColorSchema,
-    outlinePx: z.number().nonnegative(),
-    shadowPx: z.number().nonnegative(),
-    uppercase: z.boolean(),
-    maxWordsPerCue: z.number().int().positive(),
-    maxCharsPerLine: z.number().int().positive(),
-    maxLines: z.number().int().positive(),
-    centerY: z.number().min(0).max(1),
+}).refine(
+  (layout) => layout.panels.filter((panel) => panel.role === 'content').length <= 1 && layout.panels.filter((panel) => panel.role === 'host').length <= 1,
+  { message: 'At most one panel of each role' },
+).refine(
+  (layout) => layout.hookBand === null || hookBandClearsSafeArea(layout.canvas, layout.safeArea, layout.hookBand),
+  { message: 'Hook band leaves no room for its text below the platform safe area.' },
+);
+
+const ScenesLayoutSchema = z.strictObject({
+  ...BaseLayoutShape,
+  strategy: z.literal('scenes'),
+  hookBand: HookBandSchema,
+  scene: z.strictObject({
+    captionCenterY: z.strictObject({
+      host: z.number().min(0).max(1),
+      content: z.number().min(0).max(1),
+    }),
   }),
-})
-  .refine((layout) => layout.panels.filter((panel) => panel.role === 'content').length <= 1, {
-    message: 'At most one content panel is allowed',
-    path: ['panels'],
-  })
-  .refine((layout) => layout.panels.filter((panel) => panel.role === 'host').length <= 1, {
-    message: 'At most one host panel is allowed',
-    path: ['panels'],
-  });
+}).refine(
+  (layout) => layout.canvas.width === 1080 && layout.canvas.height === 1920 && layout.hookBand.rect.x === 0 && layout.hookBand.rect.y === 0 && layout.hookBand.rect.w === 1 && layout.hookBand.rect.h < 1,
+  { message: 'Scenes requires a 1080x1920 canvas with a full-width top header' },
+).refine(
+  (layout) => hookBandClearsSafeArea(layout.canvas, layout.safeArea, layout.hookBand),
+  { message: 'Hook band leaves no room for its text below the platform safe area.' },
+);
+
+const LayoutProfileSchema = z.discriminatedUnion('strategy', [FixedLayoutSchema, ScenesLayoutSchema]);
 
 export async function loadLayoutProfile(path: string, rootDir: string): Promise<LayoutProfile> {
   const absolutePath = resolve(rootDir, path);

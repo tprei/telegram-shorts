@@ -52,3 +52,10 @@ export function parseHexColor(hex: string): RgbaColor {
     a: match[2] ? Number.parseInt(match[2], 16) / 255 : 1,
   };
 }
+
+const INVISIBLE_CHARACTERS = /[\u200B-\u200F\u2060-\u2064\uFEFF]/g;
+const CONTROL_CHARACTERS = /[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/g;
+
+export function sanitizePlainText(value: string): string {
+  return value.replace(INVISIBLE_CHARACTERS, '').replace(CONTROL_CHARACTERS, '').replace(/\s+/g, ' ').trim();
+}

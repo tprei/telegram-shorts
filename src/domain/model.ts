@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { ShortEdit } from './edit.js';
 import type { LayoutProfile, NormRect } from './layout.js';
+import { sanitizePlainText } from './text.js';
 
 export type ShortVideoPlatform = 'instagram' | 'tiktok' | 'youtube_shorts';
 
@@ -72,18 +73,19 @@ export interface SourceMedia {
 
 export type JobStatus = 'queued' | 'downloading' | 'transcribing' | 'awaiting_speaker' | 'planning' | 'ready' | 'failed';
 
-export type QueueTaskKind = 'process_source' | 'analyze_host' | 'plan_shorts' | 'analyze_crops' | 'export_short' | 'publish_short_video' | 'check_publication';
+export type QueueTaskKind = 'process_source' | 'analyze_host' | 'analyze_scenes' | 'plan_shorts' | 'analyze_crops' | 'export_short' | 'publish_short_video' | 'check_publication';
 
 export type QueueLane = 'ingest' | 'output';
 
 export const QUEUE_LANES: Record<QueueLane, readonly QueueTaskKind[]> = {
-  ingest: ['process_source', 'analyze_host', 'plan_shorts', 'analyze_crops'],
+  ingest: ['process_source', 'analyze_host', 'plan_shorts', 'analyze_scenes', 'analyze_crops'],
   output: ['export_short', 'publish_short_video', 'check_publication'],
 };
 
 export interface QueueTaskPayloads {
   process_source: Record<string, never>;
   analyze_host: Record<string, never>;
+  analyze_scenes: Record<string, never>;
   plan_shorts: Record<string, never>;
   analyze_crops: { shortId: string };
   export_short: { exportId: string };
@@ -107,6 +109,37 @@ export interface HostFraming {
   headBox: NormRect;
 }
 
+export type SceneContentKind = 'document' | 'footage' | 'person';
+
+export type SceneAnalysisStatus = 'none' | 'queued' | 'running' | 'done' | 'failed';
+
+export interface SceneHost {
+  camera: NormRect;
+  head: NormRect;
+}
+
+export interface SceneContent {
+  box: NormRect;
+  kind: SceneContentKind;
+  vertical: boolean;
+  subject: NormRect;
+}
+
+export interface SceneSegment {
+  startSeconds: number;
+  endSeconds: number;
+  host: SceneHost | null;
+  content: SceneContent | null;
+  overlays: NormRect[];
+}
+
+export interface SceneTrack {
+  version: 1;
+  analyzedAt: string;
+  frame: { width: number; height: number };
+  segments: SceneSegment[];
+}
+
 export interface JobRecord {
   id: string;
   sourceUrl: string;
@@ -126,6 +159,9 @@ export interface JobRecord {
   chosenSpeakerId: string | null;
   hostFraming: HostFraming | null;
   hostFramingAnalyzedAt: string | null;
+  sceneTrack: SceneTrack | null;
+  sceneAnalysis: SceneAnalysisStatus;
+  sceneAnalysisError: string | null;
   failedTaskKind: QueueTaskKind | null;
   error: string | null;
   createdAt: string;
@@ -177,6 +213,8 @@ export interface ExportRecord {
   edit: ShortEdit;
   title: string;
   hostFraming: HostFraming | null;
+  layoutProfileSnapshot: LayoutProfile;
+  sceneTrack: SceneTrack | null;
   status: ExportStatus;
   artifactPath: string | null;
   coverPath: string | null;
@@ -217,26 +255,30 @@ export function publicationStartedAt(publication: PublicationRecord): string | n
   return publication.scheduledFor ?? publication.submittedAt;
 }
 
-export type CreatorPublishMode = 'disabled' | 'global';
-
-export interface CreatorPlatformPublishConfig {
-  mode: CreatorPublishMode;
+export interface PostingSchedule {
+  timeZone: string;
+  slots: string[];
 }
 
-export interface CreatorPublishConfig {
-  instagram?: CreatorPlatformPublishConfig;
-  tiktok?: CreatorPlatformPublishConfig;
-  youtube_shorts?: CreatorPlatformPublishConfig;
+export interface PublishingAccount {
+  id: string;
+  displayName: string;
+  schedule: PostingSchedule;
+  platforms: ShortVideoPlatform[];
+  mallaryProfileId: string | null;
+  buffer: boolean;
+}
+
+export interface CreatorSceneConfig {
+  hostDescription: string;
+  hints: string | null;
 }
 
 export interface CreatorRenderConfig {
   layoutPath: string;
   layoutId: string;
-}
-
-export interface PostingSchedule {
-  timeZone: string;
-  slots: string[];
+  defaultSpeed: number;
+  scene: CreatorSceneConfig | null;
 }
 
 export interface CreatorAutopilotConfig {
@@ -254,10 +296,16 @@ export interface CreatorProfile {
   displayName: string;
   enabled: boolean;
   description?: string;
+  accountId: string | null;
   render: CreatorRenderConfig;
-  publish?: CreatorPublishConfig;
-  schedule: PostingSchedule;
   autopilot?: CreatorAutopilotConfig;
+}
+
+export interface CreatorProfileManifest {
+  version: 3;
+  defaultCreatorId?: string;
+  accounts: PublishingAccount[];
+  creators: CreatorProfile[];
 }
 
 export type AutopilotVideoStatus = 'baseline' | 'tracked';
@@ -274,12 +322,6 @@ export interface AutopilotVideoRecord {
 }
 
 export type AutopilotShortState = 'waiting' | 'exporting' | 'ready' | 'booked' | 'skipped' | 'expired';
-
-export interface CreatorProfileManifest {
-  version: 2;
-  defaultCreatorId?: string;
-  creators: CreatorProfile[];
-}
 
 export const SemanticBlockKindSchema = z.enum(['hook', 'setup', 'turn', 'explain', 'evidence', 'payoff']);
 
@@ -303,15 +345,21 @@ export const PlannedCandidateStepSchema = z.strictObject({
   block_ids: z.array(z.string().min(1)).min(1),
 });
 
+function sanitizedText(bounds: { min?: number; max?: number } = {}) {
+  const clean = z.string().transform(sanitizePlainText);
+  const bounded = z.string().min(bounds.min ?? 1);
+  return bounds.max === undefined ? clean.pipe(bounded) : clean.pipe(bounded.max(bounds.max));
+}
+
 const PlannedCandidateLikeSchema = z.strictObject({
   opportunity_id: z.string().min(1).optional(),
-  title: z.string().min(1),
-  summary: z.string().min(1),
-  hook: z.string().min(1),
-  hook_text: z.string().min(1).max(90),
-  payoff: z.string().min(1),
-  rationale: z.string().min(1),
-  thesis: z.string().min(1),
+  title: sanitizedText(),
+  summary: sanitizedText(),
+  hook: sanitizedText(),
+  hook_text: sanitizedText({ max: 90 }),
+  payoff: sanitizedText(),
+  rationale: sanitizedText(),
+  thesis: sanitizedText(),
   risk: z.enum(['low', 'medium', 'high']),
   block_ids: z.array(z.string().min(1)).min(2),
   steps: z.array(PlannedCandidateStepSchema).min(2),
@@ -326,17 +374,17 @@ export type PlannedCandidateResponse = z.infer<typeof PlannedCandidateResponseSc
 export const OpportunityPlanResponseSchema = z.strictObject({
   opportunities: z.array(PlannedCandidateLikeSchema.extend({
     id: z.string().min(1),
-    viewer_promise: z.string().min(1),
-    tension: z.string().min(1),
-    why_this_short: z.string().min(1),
+    viewer_promise: sanitizedText(),
+    tension: sanitizedText(),
+    why_this_short: sanitizedText(),
   })).min(1).max(8),
 });
 
 export type OpportunityPlanResponse = z.infer<typeof OpportunityPlanResponseSchema>;
 
 export const RevisionActionSchema = z.discriminatedUnion('kind', [
-  z.strictObject({ kind: z.literal('retitle'), title: z.string().min(1) }),
-  z.strictObject({ kind: z.literal('set_hook'), text: z.string().min(1).max(90) }),
+  z.strictObject({ kind: z.literal('retitle'), title: sanitizedText() }),
+  z.strictObject({ kind: z.literal('set_hook'), text: sanitizedText({ max: 90 }) }),
   z.strictObject({ kind: z.literal('trim_start'), seconds: z.number().positive() }),
   z.strictObject({ kind: z.literal('trim_end'), seconds: z.number().positive() }),
   z.strictObject({ kind: z.literal('extend_start'), seconds: z.number().positive() }),
@@ -352,7 +400,7 @@ export type RevisionAction = z.infer<typeof RevisionActionSchema>;
 
 export const RevisionIntentSchema = z.strictObject({
   actions: z.array(RevisionActionSchema).min(1),
-  summary: z.string().min(1),
+  summary: sanitizedText(),
 });
 
 export type RevisionIntent = z.infer<typeof RevisionIntentSchema>;
@@ -366,15 +414,15 @@ export const TranscriptSpanLocateSchema = z.strictObject({
 export type TranscriptSpanLocate = z.infer<typeof TranscriptSpanLocateSchema>;
 
 export const PublishCopyResponseSchema = z.strictObject({
-  line_1: z.string().min(1).max(180),
-  line_2: z.string().min(1).max(180),
-  hashtags: z.array(z.string().min(2).max(40)).min(3).max(6),
+  line_1: sanitizedText({ max: 180 }),
+  line_2: sanitizedText({ max: 180 }),
+  hashtags: z.array(sanitizedText({ min: 2, max: 40 })).min(3).max(6),
 });
 
 export type PublishCopyResponse = z.infer<typeof PublishCopyResponseSchema>;
 
 export const HookSuggestionsResponseSchema = z.strictObject({
-  options: z.array(z.string().min(1).max(90)).length(3),
+  options: z.array(sanitizedText({ max: 90 })).length(3),
 });
 
 export type HookSuggestionsResponse = z.infer<typeof HookSuggestionsResponseSchema>;

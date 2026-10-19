@@ -1,5 +1,5 @@
 import { PublicAssetHost } from './public-asset-host.js';
-import type { ShortVideoPlatform } from '../domain/model.js';
+import type { PublishingAccount, ShortVideoPlatform } from '../domain/model.js';
 import type { RemotePublicationState, ShortVideoCheckPublicationInput, ShortVideoPublishInput, ShortVideoPublishProvider, ShortVideoPublishResult } from './instagram-publisher.js';
 import { lenientRemoteString, ShortVideoPublishError } from './instagram-publisher.js';
 import { logError } from './util.js';
@@ -49,6 +49,19 @@ export class BufferClient implements ShortVideoPublishProvider {
     return this.supportedPlatforms.includes(platform);
   }
 
+  canPublish(input: { account: PublishingAccount; platform: ShortVideoPlatform; scheduled: boolean }): boolean {
+    if (input.scheduled || !input.account.buffer) {
+      return false;
+    }
+    if (!this.supports(input.platform)) {
+      return false;
+    }
+    return Boolean(
+      configuredChannelId(this.options, input.platform)?.trim()
+      || configuredChannelName(this.options, input.platform)?.trim()
+    );
+  }
+
   async cancelScheduled(_input: ShortVideoCheckPublicationInput): Promise<void> {
     throw new ShortVideoPublishError({
       provider: this.name,
@@ -59,6 +72,14 @@ export class BufferClient implements ShortVideoPublishProvider {
   }
 
   async publishShortVideo(input: ShortVideoPublishInput): Promise<ShortVideoPublishResult> {
+    if (!input.account.buffer) {
+      throw new ShortVideoPublishError({
+        provider: this.name,
+        stage: 'configuration',
+        message: 'Buffer publishing is not enabled for this account.',
+        safeToFailover: true,
+      });
+    }
     if (input.platform === 'instagram') {
       return this.publishInstagram(input);
     }

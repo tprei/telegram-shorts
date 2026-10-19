@@ -2,8 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { AUTOPILOT_LIVE_STATUSES_TO_SKIP, autopilotShortPlan, exportMatchesShort, isAutopilotEligibleUpload, orderReadyShorts, type AutopilotShortPlan } from '../src/domain/autopilot.js';
 import { createInitialEdit, type WordRange } from '../src/domain/edit.js';
-import type { LayoutProfile } from '../src/domain/layout.js';
-import type { AutopilotVideoRecord, CreatorAutopilotConfig, CreatorProfile, ExportRecord, JobRecord, PublicationRecord, ShortRecord, TranscriptWord } from '../src/domain/model.js';
+import { freezeSceneTrack } from '../src/domain/scene.js';
+import { computeSourceClips } from '../src/domain/timeline.js';
+import type { LayoutProfile, ScenesLayoutProfile } from '../src/domain/layout.js';
+import type { AutopilotVideoRecord, CreatorAutopilotConfig, CreatorProfile, ExportRecord, JobRecord, PublicationRecord, SceneSegment, SceneTrack, ShortRecord, TranscriptWord } from '../src/domain/model.js';
 
 const DETECTED_AT = '2026-10-18T12:00:00.000Z';
 const NOW = new Date('2026-10-18T13:00:00.000Z');
@@ -22,9 +24,8 @@ const PROFILE: CreatorProfile = {
   id: 'filipe_boni',
   displayName: 'Filipe Boni',
   enabled: true,
-  render: { layoutPath: 'profiles/filipe_boni_layout.json', layoutId: 'screen-top-host-bottom-v2' },
-  publish: { instagram: { mode: 'global' }, tiktok: { mode: 'global' }, youtube_shorts: { mode: 'global' } },
-  schedule: { timeZone: 'America/Sao_Paulo', slots: ['12:00', '19:00', '21:00'] },
+  accountId: 'cortes_do_boni',
+  render: { layoutPath: 'profiles/filipe_boni_layout.json', layoutId: 'screen-top-host-bottom-v2', defaultSpeed: 1.5, scene: null },
   autopilot: CONFIG,
 };
 
@@ -39,8 +40,62 @@ const WORDS: TranscriptWord[] = 'um dois tres quatro cinco seis sete oito nove d
 
 const RANGE: WordRange = { startWord: 0, endWord: 4 };
 
+function fixedLayoutFixture() {
+  return {
+    version: 3 as const,
+    layoutId: 'screen-top-host-bottom-v2',
+    strategy: 'fixed' as const,
+    canvas: { width: 1080, height: 1920, fps: 30 },
+    background: '#101010',
+    safeArea: { top: 0, bottom: 0, side: 0 },
+    font: { family: 'Montserrat ExtraBold', file: 'assets/fonts/Montserrat-ExtraBold.ttf', assSizeScale: 1.562 },
+    captions: {
+      sizePx: 62,
+      textColor: '#FFFFFF',
+      highlightColor: '#FFD400',
+      outlineColor: '#000000',
+      outlinePx: 6,
+      shadowPx: 2,
+      uppercase: true,
+      maxWordsPerCue: 4,
+      maxCharsPerLine: 16,
+      maxLines: 2,
+      centerY: 0.5521,
+    },
+    safeArea: { top: 0.135, bottom: 0.17, side: 0.055 },
+    hookBand: {
+      rect: { x: 0, y: 0, w: 1, h: 0.1146 },
+      background: '#C8102E',
+      textColor: '#FFFFFF',
+      sizePx: 58,
+      maxCharsPerLine: 24,
+      maxLines: 2,
+      uppercase: true,
+    },
+    panels: [
+      { id: 'screen', role: 'content' as const, sourceRect: { x: 0, y: 0, w: 0.632, h: 1 }, canvasRect: { x: 0, y: 0.1146, w: 1, h: 0.4375 } },
+      {
+        id: 'host',
+        role: 'host' as const,
+        sourceRect: { x: 0.637, y: 0, w: 0.363, h: 1 },
+        canvasRect: { x: 0, y: 0.5521, w: 1, h: 0.4479 },
+        anchor: { x: 0.5, y: 0.42 },
+      },
+    ],
+  };
+}
+
 function layoutSnapshot(): LayoutProfile {
-  return { creatorId: PROFILE.id, layoutId: PROFILE.render.layoutId } as unknown as LayoutProfile;
+  return fixedLayoutFixture();
+}
+
+function scenesJobLayout(): ScenesLayoutProfile {
+  return {
+    ...fixedLayoutFixture(),
+    layoutId: 'mix-scenes-v3',
+    strategy: 'scenes',
+    scene: { captionCenterY: { host: 0.85, content: 0.9 } },
+  };
 }
 
 function makeJob(overrides: Partial<JobRecord> = {}): JobRecord {
@@ -63,6 +118,9 @@ function makeJob(overrides: Partial<JobRecord> = {}): JobRecord {
     chosenSpeakerId: null,
     hostFraming: null,
     hostFramingAnalyzedAt: DETECTED_AT,
+    sceneTrack: null,
+    sceneAnalysis: 'done',
+    sceneAnalysisError: null,
     failedTaskKind: null,
     error: null,
     createdAt: DETECTED_AT,
@@ -120,6 +178,8 @@ function makeExport(short: ShortRecord, overrides: Partial<ExportRecord> = {}): 
     edit: short.edit,
     title: short.title,
     hostFraming: null,
+    layoutProfileSnapshot: layoutSnapshot(),
+    sceneTrack: null,
     status: 'ready',
     artifactPath: null,
     coverPath: null,
@@ -164,7 +224,7 @@ interface PlanOptions {
   video?: AutopilotVideoRecord;
   config?: CreatorAutopilotConfig;
   now?: Date;
-  hasHostPanel?: boolean;
+  accountConnected?: boolean;
 }
 
 function planFor(shorts: ShortRecord[], job: JobRecord = makeJob(), options: PlanOptions = {}): AutopilotShortPlan[] {
@@ -176,7 +236,7 @@ function planFor(shorts: ShortRecord[], job: JobRecord = makeJob(), options: Pla
     publications: options.publications ?? [],
     config: options.config ?? CONFIG,
     now: options.now ?? NOW,
-    hasHostPanel: options.hasHostPanel ?? true,
+    accountConnected: options.accountConnected ?? true,
   });
 }
 
@@ -300,15 +360,74 @@ test('shorts expire after maxShortAgeHours from detection', () => {
   assert.deepEqual([expired[0].state, expired[0].reason, expired[0].readyExportId], ['expired', null, null]);
 });
 
-test('shorts wait while crops or host framing are pending', () => {
+test('shorts wait while crops, host framing or scene analysis are pending', () => {
   const cropsQueued = planFor([makeShort(1, { cropAnalysis: 'queued' })]);
   assert.equal(cropsQueued[0].state, 'waiting');
   const cropsRunning = planFor([makeShort(1, { cropAnalysis: 'running' })]);
   assert.equal(cropsRunning[0].state, 'waiting');
   const hostPending = planFor([makeShort(1)], makeJob({ hostFramingAnalyzedAt: null }));
   assert.equal(hostPending[0].state, 'waiting');
-  const noHostPanel = planFor([makeShort(1)], makeJob({ hostFramingAnalyzedAt: null }), { hasHostPanel: false });
+  const hostlessLayout = { ...fixedLayoutFixture(), panels: [fixedLayoutFixture().panels[0]!] };
+  const noHostPanel = planFor(
+    [makeShort(1)],
+    makeJob({ hostFramingAnalyzedAt: null, layoutProfileSnapshot: hostlessLayout }),
+    { exports: [makeExport(makeShort(1), { layoutProfileSnapshot: hostlessLayout })] },
+  );
   assert.equal(noHostPanel[0].state, 'ready');
+});
+
+test('scene analysis gates exporting and disconnected accounts wait without hiding booked history', () => {
+  const short = makeShort(1);
+  const running = planFor([short], makeJob({ layoutProfileSnapshot: scenesJobLayout(), sceneAnalysis: 'running', sceneTrack: null }));
+  assert.deepEqual([running[0].state, running[0].reason], ['waiting', null]);
+  const missingTrack = planFor([short], makeJob({ layoutProfileSnapshot: scenesJobLayout(), sceneAnalysis: 'done', sceneTrack: null }));
+  assert.deepEqual([missingTrack[0].state, missingTrack[0].reason], ['waiting', null]);
+  const failed = planFor(
+    [short],
+    makeJob({
+      layoutProfileSnapshot: scenesJobLayout(),
+      sceneAnalysis: 'failed',
+      sceneAnalysisError: 'Scene analysis succeeded on 3 of 8 samples; at least 50% are required.',
+      sceneTrack: null,
+    }),
+  );
+  assert.deepEqual([failed[0].state, failed[0].reason], ['waiting', 'Scene analysis succeeded on 3 of 8 samples; at least 50% are required.']);
+  const disconnected = planFor([short], makeJob(), { accountConnected: false });
+  assert.deepEqual([disconnected[0].state, disconnected[0].reason], ['waiting', 'Account not connected in Mallary']);
+  const booked = planFor([short], makeJob(), { accountConnected: false, publications: [makePublication(short)] });
+  assert.deepEqual([booked[0].state, booked[0].reason, booked[0].scheduledFor], ['booked', null, '2026-10-18T19:00:00.000Z']);
+});
+
+test('rerunning scenes invalidates export currentness without changing the booked export', () => {
+  const short = makeShort(1);
+  const segments: SceneSegment[] = [
+    {
+      startSeconds: 0,
+      endSeconds: 2,
+      host: null,
+      content: { box: { x: 0, y: 0, w: 1, h: 1 }, kind: 'document', vertical: false, subject: { x: 0.2, y: 0.2, w: 0.5, h: 0.5 } },
+      overlays: [],
+    },
+    {
+      startSeconds: 2,
+      endSeconds: 5,
+      host: { camera: { x: 0.2, y: 0.6, w: 0.4, h: 0.3 }, head: { x: 0.35, y: 0.65, w: 0.1, h: 0.15 } },
+      content: null,
+      overlays: [],
+    },
+  ];
+  const media = { videoPath: 'source.mp4', audioPath: 'audio.wav', thumbnailPath: null, width: 1920, height: 1080, fps: 30, durationSeconds: 5 };
+  const track: SceneTrack = { version: 1, analyzedAt: '2026-10-18T12:00:00.000Z', frame: { width: 1920, height: 1080 }, segments };
+  const job = makeJob({ layoutProfileSnapshot: scenesJobLayout(), sceneAnalysis: 'done', sceneTrack: track, media });
+  const frozen = freezeSceneTrack(track, computeSourceClips(short.edit, WORDS, media.durationSeconds));
+  const exportRecord = makeExport(short, { layoutProfileSnapshot: scenesJobLayout(), sceneTrack: frozen });
+  assert.equal(exportMatchesShort(exportRecord, short, job), true);
+  const rerunJob = makeJob({ layoutProfileSnapshot: scenesJobLayout(), sceneAnalysis: 'done', sceneTrack: { ...track, analyzedAt: '2026-10-18T14:00:00.000Z' }, media });
+  assert.equal(exportMatchesShort(exportRecord, short, rerunJob), false);
+  const plans = planFor([short], rerunJob, { exports: [exportRecord], publications: [makePublication(short)] });
+  assert.deepEqual([plans[0].state, plans[0].scheduledFor], ['booked', '2026-10-18T19:00:00.000Z']);
+  const layoutChanged = makeJob({ layoutProfileSnapshot: { ...scenesJobLayout(), scene: { captionCenterY: { host: 0.8, content: 0.9 } } }, sceneAnalysis: 'done', sceneTrack: track, media });
+  assert.equal(exportMatchesShort(exportRecord, short, layoutChanged), false);
 });
 
 test('exporting sets the copy and export flags independently', () => {

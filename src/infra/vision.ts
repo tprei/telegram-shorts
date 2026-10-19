@@ -5,6 +5,7 @@ import { CropKeyframe } from '../domain/edit.js';
 import { normToPx, toEvenPxRect } from '../domain/geometry.js';
 import { ContentPanel, HostPanel, NormRect, PxRect } from '../domain/layout.js';
 import { CropFocusResponse, CropFocusResponseSchema, TranscriptWord } from '../domain/model.js';
+import { medianEdges } from '../domain/scene.js';
 import type { AppConfig } from './env.js';
 import { requestStructuredJson } from './openrouter.js';
 import { logError } from './util.js';
@@ -13,7 +14,6 @@ import { runProcess } from './process.js';
 const DEFAULT_SCENE_THRESHOLD = 0.18;
 const SAMPLE_MIN_GAP_SECONDS = 2;
 const MAX_SAMPLES_PER_SPAN = 8;
-const MAX_SAMPLES_TOTAL = 16;
 const SAMPLE_LEAD_SECONDS = 0.5;
 const VISION_CONCURRENCY = 3;
 const VISION_TEMPERATURE = 0.1;
@@ -141,11 +141,13 @@ export async function detectSceneTimes(input: {
     '-an',
     '-vf', `crop=${input.region.w}:${input.region.h}:${input.region.x}:${input.region.y},scale=480:-2,select='gt(scene,${threshold})',showinfo`,
     '-f', 'null', '-',
-  ]);
+  ], { timeoutMs: 120_000 });
   return parseShowinfoSceneTimes(stderr)
     .map((ptsTime) => input.startSeconds + ptsTime)
     .sort((a, b) => a - b);
 }
+
+export type AnalyzeContentCropsFunction = typeof analyzeContentCrops;
 
 export async function analyzeContentCrops(input: {
   config: AppConfig;
@@ -155,6 +157,7 @@ export async function analyzeContentCrops(input: {
   spans: Array<{ startSeconds: number; endSeconds: number; text: string }>;
   words: TranscriptWord[];
   workDir: string;
+  maxSamples: number;
 }): Promise<CropKeyframe[]> {
   const region = toEvenPxRect(normToPx(input.panel.sourceRect, input.source.width, input.source.height));
   const cropsDir = join(input.workDir, 'crops');
@@ -172,11 +175,14 @@ export async function analyzeContentCrops(input: {
   }
 
   const samples: Array<{ sampleSeconds: number; frameSeconds: number; nextSeconds: number; imagePath: string }> = [];
-  distributeSampleBudget(spanSamples, MAX_SAMPLES_TOTAL).forEach((capped, spanIndex) => {
+  distributeSampleBudget(spanSamples, input.maxSamples).forEach((capped, spanIndex) => {
     const span = input.spans[spanIndex];
     capped.forEach((sampleSeconds, sampleIndex) => {
       const nextSeconds = sampleIndex + 1 < capped.length ? capped[sampleIndex + 1] : span.endSeconds;
-      const frameSeconds = Math.min(sampleSeconds + SAMPLE_LEAD_SECONDS, span.endSeconds - 0.1);
+      const frameSeconds = Math.min(
+        sampleSeconds + SAMPLE_LEAD_SECONDS,
+        span.endSeconds - Math.min(0.1, (span.endSeconds - span.startSeconds) / 2),
+      );
       samples.push({
         sampleSeconds,
         frameSeconds,
@@ -227,7 +233,7 @@ async function extractContentFrame(input: {
     '-vf', `crop=${input.region.w}:${input.region.h}:${input.region.x}:${input.region.y},scale=${FRAME_WIDTH}:-2`,
     '-q:v', '3',
     input.outputPath,
-  ]);
+  ], { timeoutMs: 60_000 });
 }
 
 async function runWithConcurrency<T, R>(items: T[], limit: number, worker: (item: T) => Promise<R>): Promise<R[]> {
@@ -259,11 +265,7 @@ export function medianValue(values: number[]): number {
 }
 
 export function medianHeadBox(boxes: NormRect[]): NormRect {
-  const left = medianValue(boxes.map((box) => box.x));
-  const top = medianValue(boxes.map((box) => box.y));
-  const right = medianValue(boxes.map((box) => box.x + box.w));
-  const bottom = medianValue(boxes.map((box) => box.y + box.h));
-  return { x: left, y: top, w: right - left, h: bottom - top };
+  return medianEdges(boxes);
 }
 
 export async function detectHostHead(input: {
@@ -338,5 +340,5 @@ async function extractHostHeadFrame(input: {
     '-vf', `crop=${input.region.w}:${input.region.h}:${input.region.x}:${input.region.y},scale=-2:${HOST_HEAD_FRAME_HEIGHT}`,
     '-q:v', '3',
     input.outputPath,
-  ]);
+  ], { timeoutMs: 60_000 });
 }

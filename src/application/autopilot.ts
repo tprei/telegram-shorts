@@ -8,8 +8,8 @@ import {
   orderReadyShorts,
   type AutopilotShortPlan,
 } from '../domain/autopilot.js';
-import type { AutopilotVideoRecord, CreatorAutopilotConfig, CreatorProfile, JobRecord, ShortVideoPlatform } from '../domain/model.js';
-import { freePostingSlots, SCHEDULE_LIMITS } from '../domain/schedule.js';
+import type { AutopilotVideoRecord, CreatorAutopilotConfig, CreatorProfile, CreatorProfileManifest, JobRecord, PublicationRecord, PublishingAccount, ShortVideoPlatform } from '../domain/model.js';
+import { accountTakenSlots, freePostingSlots, zonedDateParts, zonedTimeToUtc } from '../domain/schedule.js';
 import type { AutopilotApi, AutopilotShortDto, AutopilotStatusDto, AutopilotVideoDto, SetAutopilotRequest } from '../studio/api-types.js';
 import { StudioError } from './errors.js';
 import type { StudioService } from './studio-service.js';
@@ -62,45 +62,63 @@ export class Autopilot implements AutopilotApi {
   constructor(private readonly deps: AutopilotDeps) {}
 
   async list(): Promise<AutopilotStatusDto[]> {
+    const manifest = await this.deps.profiles.getManifest();
     const statuses: AutopilotStatusDto[] = [];
-    for (const profile of await this.deps.profiles.getEnabledCreatorProfiles()) {
+    for (const profile of manifest.creators.filter((creator) => creator.enabled)) {
       if (!profile.autopilot) {
         continue;
       }
-      statuses.push(this.status(profile, profile.autopilot));
+      const account = profile.accountId ? manifest.accounts.find((candidate) => candidate.id === profile.accountId) ?? null : null;
+      statuses.push(this.status(profile, profile.autopilot, account));
     }
     return statuses;
   }
 
   async setEnabled(creatorId: string, request: SetAutopilotRequest): Promise<AutopilotStatusDto> {
-    const { profile, config } = await this.requireAutopilotProfile(creatorId);
+    const { profile, config, account } = await this.requireAutopilotProfile(creatorId);
+    const accountConnected = account !== null && account.mallaryProfileId !== null;
+    if (request.enabled && !accountConnected) {
+      const reason = account === null
+        ? 'No publishing account is assigned to this creator.'
+        : 'Account not connected in Mallary';
+      throw new StudioError('invalid', reason);
+    }
     this.updateState(creatorId, { enabled: request.enabled });
-    return this.status(profile, config);
+    return this.status(profile, config, account);
   }
 
   async checkNow(creatorId: string): Promise<AutopilotStatusDto> {
-    const { profile, config } = await this.requireAutopilotProfile(creatorId);
-    this.updateState(creatorId, { checkRequested: true });
-    return this.status(profile, config);
+    const { profile, config, account } = await this.requireAutopilotProfile(creatorId);
+    const accountConnected = account !== null && account.mallaryProfileId !== null;
+    if (accountConnected) {
+      this.updateState(creatorId, { checkRequested: true });
+    }
+    return this.status(profile, config, account);
   }
 
   async tick(): Promise<void> {
-    for (const profile of await this.deps.profiles.getEnabledCreatorProfiles()) {
+    const manifest = await this.deps.profiles.getManifest();
+    for (const profile of manifest.creators.filter((creator) => creator.enabled)) {
       if (!profile.autopilot || !this.readState(profile.id).enabled) {
         continue;
       }
-      await this.tickCreator(profile, profile.autopilot);
+      const account = profile.accountId ? manifest.accounts.find((candidate) => candidate.id === profile.accountId) ?? null : null;
+      const accountConnected = account !== null && account.mallaryProfileId !== null;
+      if (!accountConnected) {
+        continue;
+      }
+      await this.tickCreator(profile, profile.autopilot, account, manifest);
     }
   }
 
-  private async tickCreator(profile: CreatorProfile, config: CreatorAutopilotConfig): Promise<void> {
+  private async tickCreator(profile: CreatorProfile, config: CreatorAutopilotConfig, account: PublishingAccount, manifest: CreatorProfileManifest): Promise<void> {
     await this.runStep(`Autopilot check failed for ${profile.id}`, () => this.checkChannel(profile, config));
     await this.runStep(`Autopilot retry failed for ${profile.id}`, () => this.retryFailedJobs(profile));
     if (!this.readState(profile.id).enabled) {
       return;
     }
-    await this.runStep(`Autopilot prepare failed for ${profile.id}`, () => this.prepareShorts(profile, config));
-    await this.runStep(`Autopilot booking failed for ${profile.id}`, () => this.bookReadyShorts(profile, config));
+    await this.runStep(`Autopilot prepare failed for ${profile.id}`, () => this.prepareShorts(profile, config, account));
+    await this.runStep(`Autopilot booking failed for ${profile.id}`, () => this.bookReadyShorts(profile, config, account, manifest));
   }
 
   private async runStep(context: string, step: () => Promise<void>): Promise<void> {
@@ -216,9 +234,10 @@ export class Autopilot implements AutopilotApi {
     }
   }
 
-  private async prepareShorts(profile: CreatorProfile, config: CreatorAutopilotConfig): Promise<void> {
+  private async prepareShorts(profile: CreatorProfile, config: CreatorAutopilotConfig, account: PublishingAccount): Promise<void> {
     const now = this.deps.now();
-    for (const entry of this.trackedEntries(profile, config)) {
+    const accountConnected = account.mallaryProfileId !== null;
+    for (const entry of this.trackedEntries(profile, config, accountConnected)) {
       for (const plan of entry.plans) {
         if (plan.state !== 'exporting') {
           continue;
@@ -260,31 +279,26 @@ export class Autopilot implements AutopilotApi {
     return failure.count >= ACTION_MAX_FAILURES || failure.nextAttemptAt > now.getTime();
   }
 
-  private async bookReadyShorts(profile: CreatorProfile, config: CreatorAutopilotConfig): Promise<void> {
+  private async bookReadyShorts(profile: CreatorProfile, config: CreatorAutopilotConfig, account: PublishingAccount, manifest: CreatorProfileManifest): Promise<void> {
     if (!this.readState(profile.id).enabled) {
       return;
     }
-    const entries = this.trackedEntries(profile, config)
+    if (account.mallaryProfileId === null) {
+      return;
+    }
+    const entries = this.trackedEntries(profile, config, true)
       .flatMap((entry) => entry.plans.map((plan) => ({ video: entry.video, plan })))
       .filter((entry): entry is { video: AutopilotVideoRecord; plan: ReadyPlan } => entry.plan.state === 'ready' && entry.plan.readyExportId !== null);
     const ordered = orderReadyShorts(entries);
     if (ordered.length === 0) {
       return;
     }
-    const now = this.deps.now();
-    const free = freePostingSlots({
-      schedule: profile.schedule,
-      from: new Date(now.getTime() + config.reviewWindowHours * HOUR_MS),
-      to: new Date(now.getTime() + config.bookingHorizonHours * HOUR_MS),
-      taken: this.takenSlots(profile.id, now),
-    });
-    const pairs = Math.min(ordered.length, free.length);
-    for (let index = 0; index < pairs; index += 1) {
+    for (const { plan } of ordered) {
       if (!this.readState(profile.id).enabled) {
         return;
       }
-      const { plan } = ordered[index];
       const readyExportId = plan.readyExportId;
+      const now = this.deps.now();
       if (readyExportId === null || this.actionBlocked(plan.short.id, 'publish', now)) {
         continue;
       }
@@ -293,8 +307,28 @@ export class Autopilot implements AutopilotApi {
         this.preconditionErrors.set(plan.short.id, 'No schedulable platform');
         continue;
       }
+      const currentManifest = await this.deps.profiles.getManifest();
+      const currentAccount = currentManifest.accounts.find((candidate) => candidate.id === account.id);
+      if (!currentAccount) {
+        this.preconditionErrors.set(plan.short.id, `Account ${account.id} is missing from the creator manifest`);
+        continue;
+      }
+      if (currentAccount.mallaryProfileId === null) {
+        return;
+      }
+      const taken = this.takenSlots(currentAccount, currentManifest, this.deps.now());
+      const free = freePostingSlots({
+        schedule: currentAccount.schedule,
+        from: new Date(now.getTime() + config.reviewWindowHours * HOUR_MS),
+        to: new Date(now.getTime() + config.bookingHorizonHours * HOUR_MS),
+        taken,
+      });
+      if (free.length === 0) {
+        break;
+      }
+      const slot = free[0];
       try {
-        await this.deps.service.publish(readyExportId, { platforms, force: false, scheduledAt: free[index].toISOString() });
+        await this.deps.service.publish(readyExportId, { platforms, force: false, scheduledAt: slot.toISOString() });
         this.actionFailures.delete(`${plan.short.id}:publish`);
         this.preconditionErrors.delete(plan.short.id);
       } catch (error) {
@@ -312,33 +346,42 @@ export class Autopilot implements AutopilotApi {
     });
   }
 
-  private takenSlots(creatorId: string, now: Date): Date[] {
-    const earliest = now.getTime() - SCHEDULE_LIMITS.slotSpacingMinutes * 60_000;
-    const startByShort = new Map<string, number>();
+  private takenSlots(account: PublishingAccount, manifest: CreatorProfileManifest, now: Date): Date[] {
+    const today = zonedDateParts(now, account.schedule.timeZone);
+    const localDayStart = zonedTimeToUtc({
+      year: today.year,
+      month: today.month,
+      day: today.day,
+      hour: 0,
+      minute: 0,
+      timeZone: account.schedule.timeZone,
+    });
+    const from = new Date(localDayStart.getTime() - 120 * 60_000);
+    const creatorToAccount: Record<string, string | null> = {};
+    for (const c of manifest.creators) {
+      creatorToAccount[c.id] = c.accountId;
+    }
+    const jobs: Array<{ id: string; accountId: string | null }> = [];
+    const publications: PublicationRecord[] = [];
     for (const job of this.deps.store.listJobSummaries()) {
-      if (job.creatorProfileId !== creatorId) {
-        continue;
-      }
-      for (const short of this.deps.store.listShortsForJob(job.id)) {
-        for (const publication of this.deps.store.listPublicationsForShort(short.id)) {
-          if (publication.status === 'failed' || publication.status === 'cancelled') {
-            continue;
-          }
-          const started = Date.parse(publication.scheduledFor ?? publication.submittedAt ?? publication.availableAt ?? publication.createdAt);
-          if (Number.isNaN(started) || started < earliest) {
-            continue;
-          }
-          const previous = startByShort.get(short.id);
-          if (previous === undefined || started < previous) {
-            startByShort.set(short.id, started);
-          }
+      const accountId = creatorToAccount[job.creatorProfileId] ?? null;
+      jobs.push({ id: job.id, accountId });
+      if (accountId === account.id) {
+        for (const short of this.deps.store.listShortsForJob(job.id)) {
+          publications.push(...this.deps.store.listPublicationsForShort(short.id));
         }
       }
     }
-    return [...startByShort.values()].map((started) => new Date(started));
+    return accountTakenSlots({
+      accountId: account.id,
+      jobs,
+      publications,
+      from,
+      excludeShortId: null,
+    });
   }
 
-  private trackedEntries(profile: CreatorProfile, config: CreatorAutopilotConfig): TrackedEntry[] {
+  private trackedEntries(profile: CreatorProfile, config: CreatorAutopilotConfig, accountConnected: boolean): TrackedEntry[] {
     const now = this.deps.now();
     const maxAgeMs = config.maxShortAgeHours * HOUR_MS;
     const entries: TrackedEntry[] = [];
@@ -350,12 +393,12 @@ export class Autopilot implements AutopilotApi {
       if (!job) {
         continue;
       }
-      entries.push({ video, job, plans: this.plan(video, job, config, now) });
+      entries.push({ video, job, plans: this.plan(video, job, config, now, accountConnected) });
     }
     return entries;
   }
 
-  private plan(video: AutopilotVideoRecord, job: JobRecord, config: CreatorAutopilotConfig, now: Date): AutopilotShortPlan[] {
+  private plan(video: AutopilotVideoRecord, job: JobRecord, config: CreatorAutopilotConfig, now: Date, accountConnected: boolean): AutopilotShortPlan[] {
     const shorts = this.deps.store.listShortsForJob(job.id);
     return autopilotShortPlan({
       video,
@@ -365,12 +408,16 @@ export class Autopilot implements AutopilotApi {
       publications: shorts.flatMap((short) => this.deps.store.listPublicationsForShort(short.id)),
       config,
       now,
-      hasHostPanel: job.layoutProfileSnapshot.panels.some((panel) => panel.role === 'host'),
+      accountConnected,
     });
   }
 
-  private status(profile: CreatorProfile, config: CreatorAutopilotConfig): AutopilotStatusDto {
+  private status(profile: CreatorProfile, config: CreatorAutopilotConfig, account: PublishingAccount | null): AutopilotStatusDto {
     const state = this.readState(profile.id);
+    const accountConnected = account !== null && account.mallaryProfileId !== null;
+    const reason = account === null
+      ? 'No publishing account is assigned to this creator.'
+      : (account.mallaryProfileId === null ? 'Account not connected in Mallary' : null);
     const videos: AutopilotVideoDto[] = [];
     for (const video of this.deps.store.listAutopilotVideos(profile.id).filter((entry) => entry.status === 'tracked').slice(0, 8)) {
       const job = video.jobId === null ? null : this.deps.store.getJob(video.jobId);
@@ -380,15 +427,18 @@ export class Autopilot implements AutopilotApi {
         jobId: video.jobId,
         jobStatus: job?.status ?? null,
         detectedAt: video.detectedAt,
-        shorts: job === null ? [] : this.plan(video, job, config, this.deps.now()).map((plan) => this.shortDto(plan)),
+        shorts: job === null ? [] : this.plan(video, job, config, this.deps.now(), accountConnected).map((plan) => this.shortDto(plan)),
       });
     }
     return {
       creatorId: profile.id,
       displayName: profile.displayName,
-      enabled: state.enabled,
+      enabled: accountConnected ? state.enabled : false,
+      accountId: account?.id ?? null,
+      accountConnected,
+      reason,
+      schedule: account?.schedule ?? null,
       channelUrl: config.channelUrl,
-      schedule: profile.schedule,
       shortsPerVideo: config.shortsPerVideo,
       platforms: config.platforms,
       reviewWindowHours: config.reviewWindowHours,
@@ -448,12 +498,14 @@ export class Autopilot implements AutopilotApi {
     return null;
   }
 
-  private async requireAutopilotProfile(creatorId: string): Promise<{ profile: CreatorProfile; config: CreatorAutopilotConfig }> {
-    const profile = await this.deps.profiles.getCreatorProfileById(creatorId);
+  private async requireAutopilotProfile(creatorId: string): Promise<{ profile: CreatorProfile; config: CreatorAutopilotConfig; account: PublishingAccount | null; manifest: CreatorProfileManifest }> {
+    const manifest = await this.deps.profiles.getManifest();
+    const profile = manifest.creators.find((candidate) => candidate.id === creatorId);
     if (!profile?.autopilot) {
       throw new StudioError('invalid', `Creator ${creatorId} has no autopilot configuration.`);
     }
-    return { profile, config: profile.autopilot };
+    const account = profile.accountId ? manifest.accounts.find((candidate) => candidate.id === profile.accountId) ?? null : null;
+    return { profile, config: profile.autopilot, account, manifest };
   }
 
   private readState(creatorId: string): AutopilotState {

@@ -1,7 +1,8 @@
 import type { HookBandStyle, LayoutProfile } from '@domain/layout.js';
 import type { CaptionCue, Timeline, TimelineClip, TimelineEndCard, TimelineHook, TimelinePanelPlacement } from '@domain/timeline.js';
-import { HOST_BLUR_DARKEN, HOST_BLUR_SIGMA_PX } from '@domain/timeline.js';
-import { parseHexColor } from '@domain/text.js';
+import { containForeground } from '../../../src/domain/composition.js';
+import { HOST_BLUR_DARKEN, HOST_BLUR_SIGMA_PX } from '../../../src/domain/timeline.js';
+import { parseHexColor } from '../../../src/domain/text.js';
 
 export interface RgbaColorChannels {
   r: number;
@@ -21,8 +22,8 @@ export function drawBackground(ctx: CanvasRenderingContext2D, layout: LayoutProf
 
 export function drawClipPanels(ctx: CanvasRenderingContext2D, clip: TimelineClip, video: CanvasImageSource): void {
   for (const panel of clip.panels) {
-    if (panel.fill === 'blur') {
-      drawBlurredPanel(ctx, panel, video);
+    if (panel.fill === 'contain') {
+      drawContainedPanel(ctx, panel, video);
       continue;
     }
     ctx.drawImage(
@@ -39,13 +40,12 @@ export function drawClipPanels(ctx: CanvasRenderingContext2D, clip: TimelineClip
   }
 }
 
-function drawBlurredPanel(ctx: CanvasRenderingContext2D, panel: TimelinePanelPlacement, video: CanvasImageSource): void {
+function drawContainedPanel(ctx: CanvasRenderingContext2D, panel: TimelinePanelPlacement, video: CanvasImageSource): void {
   const cropAspect = panel.source.w / panel.source.h;
   const panelAspect = panel.canvas.w / panel.canvas.h;
   const coverWidth = cropAspect > panelAspect ? panel.canvas.h * cropAspect : panel.canvas.w;
   const coverHeight = cropAspect > panelAspect ? panel.canvas.h : panel.canvas.w / cropAspect;
-  const foregroundWidth = panel.canvas.h * cropAspect;
-  const foregroundX = panel.canvas.x + (panel.canvas.w - foregroundWidth) / 2;
+  const foreground = containForeground(panel.source, panel.canvas);
   const overscan = HOST_BLUR_SIGMA_PX;
   ctx.save();
   ctx.beginPath();
@@ -70,10 +70,10 @@ function drawBlurredPanel(ctx: CanvasRenderingContext2D, panel: TimelinePanelPla
     panel.source.y,
     panel.source.w,
     panel.source.h,
-    foregroundX,
-    panel.canvas.y,
-    foregroundWidth,
-    panel.canvas.h,
+    foreground.x,
+    foreground.y,
+    foreground.w,
+    foreground.h,
   );
   ctx.restore();
 }
@@ -92,7 +92,7 @@ export function drawHookBand(
   ctx.fillStyle = rgbaCss(parseHexColor(style.textColor));
   const lineHeight = 1.12 * hook.sizePx;
   const centerX = hook.canvas.x + hook.canvas.w / 2;
-  const centerY = hook.canvas.y + hook.canvas.h / 2;
+  const centerY = hook.textCenterY;
   for (const [lineIndex, line] of hook.lines.entries()) {
     const y = centerY + (lineIndex - (hook.lines.length - 1) / 2) * lineHeight;
     ctx.fillText(line, centerX, y);
@@ -118,7 +118,7 @@ export function drawCaptions(
   ctx.lineWidth = 2 * style.outlinePx;
   ctx.strokeStyle = outlineColor;
   const spaceWidth = ctx.measureText(' ').width;
-  const centerY = style.centerY * layout.canvas.height;
+  const centerY = cue.centerY * layout.canvas.height;
   const lineHeight = 1.12 * style.sizePx;
   let flatIndex = 0;
   for (const [lineIndex, line] of cue.lines.entries()) {

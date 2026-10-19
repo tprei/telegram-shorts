@@ -8,6 +8,7 @@ export interface CropEditorProps {
   frameUrl: string;
   sourceAspectRatio: number;
   contentRegion: NormRect;
+  focusSpace?: 'source' | 'content';
   onChange: (focus: NormRect) => void;
   onDelete: () => void;
 }
@@ -23,6 +24,23 @@ interface CropGesture {
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
 }
+const SOURCE_BOUNDS: NormRect = { x: 0, y: 0, w: 1, h: 1 };
+function focusInRegion(focus: NormRect, region: NormRect): NormRect {
+  return {
+    x: region.x + focus.x * region.w,
+    y: region.y + focus.y * region.h,
+    w: focus.w * region.w,
+    h: focus.h * region.h,
+  };
+}
+function focusInContent(focus: NormRect, region: NormRect): NormRect {
+  return {
+    x: (focus.x - region.x) / region.w,
+    y: (focus.y - region.y) / region.h,
+    w: focus.w / region.w,
+    h: focus.h / region.h,
+  };
+}
 function rectStyle(rect: NormRect): CSSProperties {
   return {
     left: `${rect.x * 100}%`,
@@ -36,23 +54,30 @@ export function CropEditor({
   frameUrl,
   sourceAspectRatio,
   contentRegion,
+  focusSpace = 'source',
   onChange,
   onDelete,
 }: CropEditorProps) {
   const surface = useRef<HTMLDivElement>(null);
   const gesture = useRef<CropGesture | null>(null);
+  const contentLocal = focusSpace === 'content';
+  const bounds = contentLocal ? contentRegion : SOURCE_BOUNDS;
+  const displayedFocus = contentLocal ? focusInRegion(keyframe.focus, contentRegion) : keyframe.focus;
+  function emit(focus: NormRect) {
+    onChange(contentLocal ? focusInContent(focus, contentRegion) : focus);
+  }
   function down(event: PointerEvent<HTMLElement>, handle: Handle) {
     event.preventDefault();
     event.stopPropagation();
-    const bounds = surface.current?.getBoundingClientRect();
-    if (!bounds) return;
+    const surfaceBounds = surface.current?.getBoundingClientRect();
+    if (!surfaceBounds) return;
     gesture.current = {
       handle,
       x: event.clientX,
       y: event.clientY,
-      focus: keyframe.focus,
-      width: bounds.width,
-      height: bounds.height,
+      focus: displayedFocus,
+      width: surfaceBounds.width,
+      height: surfaceBounds.height,
     };
     event.currentTarget.setPointerCapture(event.pointerId);
   }
@@ -63,16 +88,20 @@ export function CropEditor({
     const dy = (event.clientY - current.y) / current.height;
     const f = current.focus;
     if (current.handle === 'move') {
-      onChange({ ...f, x: clamp(f.x + dx, 0, 1 - f.w), y: clamp(f.y + dy, 0, 1 - f.h) });
+      emit({
+        ...f,
+        x: clamp(f.x + dx, bounds.x, bounds.x + bounds.w - f.w),
+        y: clamp(f.y + dy, bounds.y, bounds.y + bounds.h - f.h),
+      });
       return;
     }
-    const left = current.handle.endsWith('w') ? clamp(f.x + dx, 0, f.x + f.w - 0.02) : f.x;
-    const top = current.handle.startsWith('n') ? clamp(f.y + dy, 0, f.y + f.h - 0.02) : f.y;
-    const right = current.handle.endsWith('e') ? clamp(f.x + f.w + dx, f.x + 0.02, 1) : f.x + f.w;
+    const left = current.handle.endsWith('w') ? clamp(f.x + dx, bounds.x, f.x + f.w - 0.02) : f.x;
+    const top = current.handle.startsWith('n') ? clamp(f.y + dy, bounds.y, f.y + f.h - 0.02) : f.y;
+    const right = current.handle.endsWith('e') ? clamp(f.x + f.w + dx, f.x + 0.02, bounds.x + bounds.w) : f.x + f.w;
     const bottom = current.handle.startsWith('s')
-      ? clamp(f.y + f.h + dy, f.y + 0.02, 1)
+      ? clamp(f.y + f.h + dy, f.y + 0.02, bounds.y + bounds.h)
       : f.y + f.h;
-    onChange({ x: left, y: top, w: right - left, h: bottom - top });
+    emit({ x: left, y: top, w: right - left, h: bottom - top });
   }
   function keyDown(event: KeyboardEvent<HTMLElement>, handle: Handle) {
     if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return;
@@ -80,15 +109,19 @@ export function CropEditor({
     const delta = event.shiftKey ? 0.025 : 0.005;
     const dx = event.key === 'ArrowLeft' ? -delta : event.key === 'ArrowRight' ? delta : 0;
     const dy = event.key === 'ArrowUp' ? -delta : event.key === 'ArrowDown' ? delta : 0;
-    const f = keyframe.focus;
-    if (handle === 'move')
-      onChange({ ...f, x: clamp(f.x + dx, 0, 1 - f.w), y: clamp(f.y + dy, 0, 1 - f.h) });
-    else {
-      const left = handle.endsWith('w') ? clamp(f.x + dx, 0, f.x + f.w - 0.02) : f.x;
-      const top = handle.startsWith('n') ? clamp(f.y + dy, 0, f.y + f.h - 0.02) : f.y;
-      const right = handle.endsWith('e') ? clamp(f.x + f.w + dx, f.x + 0.02, 1) : f.x + f.w;
-      const bottom = handle.startsWith('s') ? clamp(f.y + f.h + dy, f.y + 0.02, 1) : f.y + f.h;
-      onChange({ x: left, y: top, w: right - left, h: bottom - top });
+    const f = displayedFocus;
+    if (handle === 'move') {
+      emit({
+        ...f,
+        x: clamp(f.x + dx, bounds.x, bounds.x + bounds.w - f.w),
+        y: clamp(f.y + dy, bounds.y, bounds.y + bounds.h - f.h),
+      });
+    } else {
+      const left = handle.endsWith('w') ? clamp(f.x + dx, bounds.x, f.x + f.w - 0.02) : f.x;
+      const top = handle.startsWith('n') ? clamp(f.y + dy, bounds.y, f.y + f.h - 0.02) : f.y;
+      const right = handle.endsWith('e') ? clamp(f.x + f.w + dx, f.x + 0.02, bounds.x + bounds.w) : f.x + f.w;
+      const bottom = handle.startsWith('s') ? clamp(f.y + f.h + dy, f.y + 0.02, bounds.y + bounds.h) : f.y + f.h;
+      emit({ x: left, y: top, w: right - left, h: bottom - top });
     }
   }
   return (
@@ -108,7 +141,7 @@ export function CropEditor({
         </div>
         <div
           className="crop-focus"
-          style={rectStyle(keyframe.focus)}
+          style={rectStyle(displayedFocus)}
           role="group"
           aria-label="Focus rectangle"
         >

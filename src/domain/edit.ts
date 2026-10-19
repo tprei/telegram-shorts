@@ -1,6 +1,7 @@
 import { z } from 'zod';
-import type { NormRect } from './layout.js';
-import type { TranscriptWord } from './model.js';
+import type { Composition, LayoutProfile, NormRect } from './layout.js';
+import { hostUsable } from './scene.js';
+import type { SceneSegment, SceneTrack, TranscriptWord } from './model.js';
 
 export interface WordRange {
   startWord: number;
@@ -13,6 +14,11 @@ export interface CropKeyframe {
   origin: 'auto' | 'manual';
 }
 
+export interface ShortLayoutEdit {
+  split: number | null;
+  overrides: { sourceSeconds: number; composition: Composition }[];
+}
+
 export interface ShortEdit {
   ranges: WordRange[];
   removedWords: number[];
@@ -23,6 +29,7 @@ export interface ShortEdit {
   crops: CropKeyframe[];
   zoom: { enabled: boolean; strength: number };
   endCard: { enabled: boolean };
+  layout: ShortLayoutEdit;
 }
 
 export const EDIT_LIMITS = {
@@ -55,6 +62,13 @@ export const CropKeyframeSchema = z.strictObject({
   origin: z.enum(['auto', 'manual']),
 });
 
+export const CompositionSchema = z.enum(['stack', 'host', 'content']);
+
+export const ShortLayoutEditSchema = z.strictObject({
+  split: z.number().finite().min(0.4).max(0.65).nullable(),
+  overrides: z.array(z.strictObject({ sourceSeconds: z.number().finite().nonnegative(), composition: CompositionSchema })),
+});
+
 export const ShortEditSchema = z.strictObject({
   ranges: z.array(WordRangeSchema).min(1),
   removedWords: z.array(z.number().int().min(0)),
@@ -68,9 +82,11 @@ export const ShortEditSchema = z.strictObject({
   crops: z.array(CropKeyframeSchema),
   zoom: z.strictObject({ enabled: z.boolean(), strength: z.number().min(EDIT_LIMITS.minZoom).max(EDIT_LIMITS.maxZoom) }),
   endCard: z.strictObject({ enabled: z.boolean() }),
+  layout: ShortLayoutEditSchema,
 });
 
 const CROP_KEYFRAME_TOLERANCE_SECONDS = 0.05;
+const SCENE_EDIT_EPSILON = 1e-6;
 
 export const FILLER_WORDS: ReadonlySet<string> = new Set([
   'hã',
@@ -116,6 +132,7 @@ export function createInitialEdit(input: { ranges: WordRange[]; words: Transcrip
       crops: [],
       zoom: { enabled: true, strength: EDIT_LIMITS.defaultZoom },
       endCard: { enabled: true },
+      layout: { split: null, overrides: [] },
     },
     input.words.length,
   );
@@ -142,6 +159,24 @@ export function normalizeEdit(edit: ShortEdit, wordCount: number): ShortEdit {
   const removedWords = [...new Set(edit.removedWords)]
     .filter((index) => ranges.some((range) => index >= range.startWord && index <= range.endWord))
     .sort((left, right) => left - right);
+  if (edit.layout.split !== null && (!Number.isFinite(edit.layout.split) || edit.layout.split < 0.4 || edit.layout.split > 0.65)) {
+    throw new Error('Layout split must be a finite number between 0.40 and 0.65.');
+  }
+  for (const override of edit.layout.overrides) {
+    if (!Number.isFinite(override.sourceSeconds) || override.sourceSeconds < 0) {
+      throw new Error('Layout override times must be finite and non-negative.');
+    }
+  }
+  const sortedOverrides = [...edit.layout.overrides].sort((left, right) => left.sourceSeconds - right.sourceSeconds);
+  const overrides: ShortLayoutEdit['overrides'] = [];
+  for (const override of sortedOverrides) {
+    const previous = overrides[overrides.length - 1];
+    if (previous !== undefined && previous.sourceSeconds === override.sourceSeconds) {
+      overrides[overrides.length - 1] = override;
+      continue;
+    }
+    overrides.push(override);
+  }
   return {
     ranges,
     removedWords,
@@ -155,6 +190,7 @@ export function normalizeEdit(edit: ShortEdit, wordCount: number): ShortEdit {
     crops: normalizeCrops(edit.crops),
     zoom: { enabled: edit.zoom.enabled, strength: clampNumber(edit.zoom.strength, EDIT_LIMITS.minZoom, EDIT_LIMITS.maxZoom) },
     endCard: { enabled: edit.endCard.enabled },
+    layout: { split: edit.layout.split, overrides },
   };
 }
 
@@ -289,6 +325,65 @@ export function replaceAutoCrops(edit: ShortEdit, keyframes: CropKeyframe[]): Sh
     (keyframe) => !manual.some((crop) => Math.abs(crop.sourceSeconds - keyframe.sourceSeconds) <= CROP_KEYFRAME_TOLERANCE_SECONDS),
   );
   return { ...edit, crops: normalizeCrops([...kept, ...manual]) };
+}
+
+function containingSegment(track: SceneTrack, sourceSeconds: number) {
+  return track.segments.find(
+    (segment) => sourceSeconds >= segment.startSeconds && sourceSeconds < segment.endSeconds,
+  );
+}
+
+function assertCompositionAllowed(segment: SceneSegment, composition: Composition): void {
+  if (composition === 'host' && !hostUsable(segment)) {
+    throw new Error('Scene segment has no usable host for a host composition.');
+  }
+  if (composition === 'content' && segment.content === null) {
+    throw new Error('Scene segment has no content for a content composition.');
+  }
+  if (composition === 'stack' && (segment.content === null || !hostUsable(segment))) {
+    throw new Error('Scene segment needs usable host and content for a stack composition.');
+  }
+}
+
+export function normalizeSceneEdit(edit: ShortEdit, layout: LayoutProfile, track: SceneTrack | null): ShortEdit {
+  if (layout.strategy === 'fixed') {
+    if (edit.layout.split !== null || edit.layout.overrides.length > 0) {
+      throw new Error('Fixed layouts reject scene layout edits.');
+    }
+    return edit;
+  }
+  if (track === null) {
+    if (edit.crops.length > 0 || edit.layout.overrides.length > 0) {
+      throw new Error('Scene layout edits require scene analysis.');
+    }
+    return edit;
+  }
+  for (const crop of edit.crops) {
+    const segment = containingSegment(track, crop.sourceSeconds);
+    if (segment === undefined) {
+      throw new Error(`Crop at ${crop.sourceSeconds}s is outside the scene track.`);
+    }
+    if (segment.content === null) {
+      throw new Error(`Crop at ${crop.sourceSeconds}s has no content in its scene segment.`);
+    }
+    const focus = crop.focus;
+    if (focus.x < -SCENE_EDIT_EPSILON || focus.y < -SCENE_EDIT_EPSILON || focus.x + focus.w > 1 + SCENE_EDIT_EPSILON || focus.y + focus.h > 1 + SCENE_EDIT_EPSILON) {
+      throw new Error(`Crop focus at ${crop.sourceSeconds}s must stay inside its content box.`);
+    }
+  }
+  const bySegment = new Map<number, Composition>();
+  for (const override of edit.layout.overrides) {
+    const segment = containingSegment(track, override.sourceSeconds);
+    if (segment === undefined) {
+      throw new Error(`Layout override at ${override.sourceSeconds}s is outside the scene track.`);
+    }
+    assertCompositionAllowed(segment, override.composition);
+    bySegment.set(segment.startSeconds, override.composition);
+  }
+  const overrides = [...bySegment.entries()]
+    .map(([sourceSeconds, composition]) => ({ sourceSeconds, composition }))
+    .sort((left, right) => left.sourceSeconds - right.sourceSeconds);
+  return { ...edit, layout: { split: edit.layout.split, overrides } };
 }
 
 function normalizeCrops(crops: CropKeyframe[]): CropKeyframe[] {

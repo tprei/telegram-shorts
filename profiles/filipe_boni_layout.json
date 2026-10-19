@@ -1,15 +1,15 @@
 {
-  "version": 2,
-  "creatorId": "filipe_boni",
+  "version": 3,
+  "strategy": "fixed",
   "layoutId": "screen-top-host-bottom-v2",
   "canvas": { "width": 1080, "height": 1920, "fps": 30 },
   "background": "#101010",
-  "defaultSpeed": 1.5,
+  "safeArea": { "top": 0.135, "bottom": 0.17, "side": 0.055 },
   "font": { "family": "Montserrat ExtraBold", "file": "assets/fonts/Montserrat-ExtraBold.ttf", "assSizeScale": 1.562 },
   "panels": [
-    { "id": "screen", "role": "content", "sourceRect": { "x": 0, "y": 0, "w": 0.632, "h": 1 }, "canvasRect": { "x": 0, "y": 0.1146, "w": 1, "h": 0.4375 } },
-    { "id": "host", "role": "host", "sourceRect": { "x": 0.637, "y": 0, "w": 0.363, "h": 1 }, "canvasRect": { "x": 0, "y": 0.5521, "w": 1, "h": 0.4479 }, "anchor": { "x": 0.5, "y": 0.42 } }
+    { "id": "screen", "role": "content", "sourceRect": { "x": 0, "y": 0, "w": 0.632, "h": 1 }, "canvasRect": { "x": 0, "y": 0.215, "w": 1, "h": 0.37 } },
+    { "id": "host", "role": "host", "sourceRect": { "x": 0.637, "y": 0, "w": 0.363, "h": 1 }, "canvasRect": { "x": 0, "y": 0.585, "w": 1, "h": 0.415 }, "anchor": { "x": 0.5, "y": 0.42 } }
   ],
-  "hookBand": { "rect": { "x": 0, "y": 0, "w": 1, "h": 0.1146 }, "background": "#C8102E", "textColor": "#FFFFFF", "sizePx": 58, "maxCharsPerLine": 24, "maxLines": 2, "uppercase": true },
-  "captions": { "sizePx": 62, "textColor": "#FFFFFF", "highlightColor": "#FFD400", "outlineColor": "#000000", "outlinePx": 6, "shadowPx": 2, "uppercase": true, "maxWordsPerCue": 4, "maxCharsPerLine": 16, "maxLines": 2, "centerY": 0.5521 }
+  "hookBand": { "rect": { "x": 0, "y": 0, "w": 1, "h": 0.215 }, "background": "#C8102E", "textColor": "#FFFFFF", "sizePx": 58, "maxCharsPerLine": 24, "maxLines": 2, "uppercase": true },
+  "captions": { "sizePx": 62, "textColor": "#FFFFFF", "highlightColor": "#FFD400", "outlineColor": "#000000", "outlinePx": 6, "shadowPx": 2, "uppercase": true, "maxWordsPerCue": 4, "maxCharsPerLine": 16, "maxLines": 2, "centerY": 0.585 }
 }

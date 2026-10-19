@@ -121,6 +121,8 @@ export function ShortEditorView(props: ShortEditorViewProps) {
   const rendering = detail.exports.some(
     (item) => item.status === 'queued' || item.status === 'rendering',
   );
+  const sceneAnalyzing =
+    detail.job.sceneAnalysis.status === 'queued' || detail.job.sceneAnalysis.status === 'running';
   return (
     <div className="editor-shell" ref={shell}>
       <header className="editor-topbar">
@@ -168,6 +170,7 @@ export function ShortEditorView(props: ShortEditorViewProps) {
             variant={currentExport?.status === 'ready' ? 'secondary' : 'primary'}
             icon="download"
             pending={exportPending || rendering}
+            disabled={sceneAnalyzing}
             onClick={startExport}
           >
             {exportPending ? 'Starting…' : rendering ? 'Exporting…' : currentExport?.status === 'failed' ? 'Retry export' : currentExport?.status === 'ready' ? 'Export again' : 'Export'}

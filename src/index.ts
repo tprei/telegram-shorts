@@ -12,6 +12,8 @@ import { loadConfig } from './infra/env.js';
 import { CreatorProfileRepository } from './infra/creator-profile-loader.js';
 import { createShortVideoPublishProvider } from './infra/instagram-publisher-factory.js';
 import { acquireStudioLock } from './infra/studio-lock.js';
+import { analyzeContentCrops } from './infra/vision.js';
+import { analyzeScenes } from './infra/scenes.js';
 import { OpenRouterClient } from './infra/openrouter.js';
 import { describeError, logError } from './infra/util.js';
 import { listChannelUploads } from './infra/youtube.js';
@@ -36,7 +38,7 @@ async function main(): Promise<void> {
     lockReleased = true;
     lock.release();
   };
-  const store = await ShortsStore.open(config.dbPath);
+  const store = await ShortsStore.open(config.dbPath, { manifestPath: resolve(config.rootDir, 'profiles', 'creator-profiles.json') });
   let server: { close(): Promise<void> } | null = null;
   let shuttingDown = false;
   const shutdown = async () => {
@@ -66,6 +68,8 @@ async function main(): Promise<void> {
   store.requeueRunningTasks();
   store.enqueueMissingPublicationChecks();
   store.enqueueMissingHostHeadAnalyses();
+  store.enqueueMissingSceneAnalyses();
+  store.enqueueMissingCropAnalyses();
   const openRouter = new OpenRouterClient(config);
   const profiles = new CreatorProfileRepository({
     rootDir: config.rootDir,
@@ -73,7 +77,7 @@ async function main(): Promise<void> {
   });
   const publisher = createShortVideoPublishProvider(config);
   const studio = new StudioService({ config, store, openRouter, profiles, publisher });
-  const pipeline = new ShortsPipeline({ config, store, openRouter, profiles, publisher });
+  const pipeline = new ShortsPipeline({ config, store, openRouter, profiles, publisher, analyzeScenes, analyzeContentCrops });
   const autopilot = new Autopilot({
     store,
     service: studio,

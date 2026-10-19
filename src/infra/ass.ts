@@ -33,7 +33,7 @@ export function buildExportAss(input: { timeline: Timeline; layout: LayoutProfil
       `Dialogue: 0,0:00:00.00,${spanEnd},Band,,0,0,0,,{\\an7\\pos(0,0)\\p1}m ${band.x} ${band.y} l ${band.x + band.w} ${band.y} l ${band.x + band.w} ${band.y + band.h} l ${band.x} ${band.y + band.h}{\\p0}`,
     );
     const centerX = band.x + band.w / 2;
-    const centerY = band.y + band.h / 2;
+    const centerY = timeline.hook.textCenterY;
     const lineHeight = 1.12 * timeline.hook.sizePx;
     timeline.hook.lines.forEach((line, index) => {
       const y = Math.round((centerY + (index - (timeline.hook!.lines.length - 1) / 2) * lineHeight) * 100) / 100;
@@ -42,12 +42,12 @@ export function buildExportAss(input: { timeline: Timeline; layout: LayoutProfil
   }
   for (const cue of timeline.cues) {
     const words = cue.lines.flat();
+    const posY = Math.round(cue.centerY * height);
     for (const [index, word] of words.entries()) {
       const start = index === 0 ? cue.outputStart : word.outputStart;
       const stop = index === words.length - 1 ? cue.outputEnd : words[index + 1]!.outputStart;
       const text = captionEventText(cue, index, layout.captions);
       const posX = Math.round(width / 2);
-      const posY = Math.round(layout.captions.centerY * height);
       lines.push(`Dialogue: 2,${assTime(start)},${assTime(stop)},Caption,,0,0,0,,{\\an5\\pos(${posX},${posY})}${text}`);
     }
   }

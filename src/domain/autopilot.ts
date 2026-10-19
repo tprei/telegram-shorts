@@ -1,4 +1,6 @@
 import { publicationStartedAt, type AutopilotShortState, type AutopilotVideoRecord, type CreatorAutopilotConfig, type ExportRecord, type JobRecord, type PublicationRecord, type PublicationStatus, type ShortRecord } from './model.js';
+import { computeSourceClips } from './timeline.js';
+import { freezeSceneTrack } from './scene.js';
 
 export const AUTOPILOT_POLL_INTERVAL_MS = 15 * 60_000;
 export const AUTOPILOT_TICK_MS = 60_000;
@@ -36,10 +38,29 @@ export interface AutopilotShortPlan {
 }
 
 export function exportMatchesShort(record: ExportRecord, short: ShortRecord, job: JobRecord): boolean {
-  return record.editRevision === short.editRevision
-    && record.title === short.title
-    && record.transcriptRevision === job.transcriptRevision
-    && JSON.stringify(record.hostFraming) === JSON.stringify(job.hostFraming);
+  if (record.editRevision !== short.editRevision) {
+    return false;
+  }
+  if (record.title !== short.title) {
+    return false;
+  }
+  if (record.transcriptRevision !== job.transcriptRevision) {
+    return false;
+  }
+  if (JSON.stringify(record.hostFraming) !== JSON.stringify(job.hostFraming)) {
+    return false;
+  }
+  if (JSON.stringify(record.layoutProfileSnapshot) !== JSON.stringify(job.layoutProfileSnapshot)) {
+    return false;
+  }
+  if (record.sceneTrack === null || job.sceneTrack === null) {
+    return record.sceneTrack === null && job.sceneTrack === null;
+  }
+  if (job.media === null) {
+    return false;
+  }
+  const clips = computeSourceClips(short.edit, job.transcriptWords, job.media.durationSeconds);
+  return JSON.stringify(record.sceneTrack) === JSON.stringify(freezeSceneTrack(job.sceneTrack, clips));
 }
 
 interface CandidateAssessment {
@@ -71,7 +92,7 @@ function assessCandidate(short: ShortRecord, publications: PublicationRecord[], 
   return { short, publications, used: false, ineligibilityReason: null };
 }
 
-function planSelectedCandidate(assessment: CandidateAssessment, video: AutopilotVideoRecord, config: CreatorAutopilotConfig, job: JobRecord, exports: ExportRecord[], now: Date, hasHostPanel: boolean): AutopilotShortPlan {
+function planSelectedCandidate(assessment: CandidateAssessment, video: AutopilotVideoRecord, config: CreatorAutopilotConfig, job: JobRecord, exports: ExportRecord[], now: Date, accountConnected: boolean): AutopilotShortPlan {
   const short = assessment.short;
   if (assessment.used) {
     const live = assessment.publications.filter((publication) => BOOKED_PUBLICATION_STATUSES[publication.status] === true);
@@ -92,9 +113,19 @@ function planSelectedCandidate(assessment: CandidateAssessment, video: Autopilot
   if (now.getTime() > Date.parse(video.detectedAt) + config.maxShortAgeHours * HOUR_MS) {
     return { ...idle, state: 'expired' };
   }
+  if (!accountConnected) {
+    return { ...idle, state: 'waiting', reason: 'Account not connected in Mallary' };
+  }
+  const layout = job.layoutProfileSnapshot;
   const waitingOnCrops = short.cropAnalysis === 'queued' || short.cropAnalysis === 'running';
-  if (waitingOnCrops || (hasHostPanel && job.hostFramingAnalyzedAt === null)) {
-    return { ...idle, state: 'waiting' };
+  const scenePending = layout.strategy === 'scenes'
+    && (job.sceneAnalysis === 'queued' || job.sceneAnalysis === 'running' || job.sceneTrack === null);
+  const sceneFailed = layout.strategy === 'scenes' && job.sceneAnalysis === 'failed';
+  const hostPending = layout.strategy === 'fixed'
+    && layout.panels.some((panel) => panel.role === 'host')
+    && job.hostFramingAnalyzedAt === null;
+  if (waitingOnCrops || scenePending || sceneFailed || hostPending) {
+    return { ...idle, state: 'waiting', reason: sceneFailed ? job.sceneAnalysisError ?? 'Scene analysis failed' : null };
   }
   const current = exports
     .filter((record) => record.shortId === short.id && exportMatchesShort(record, short, job))
@@ -125,7 +156,7 @@ export function autopilotShortPlan(input: {
   publications: PublicationRecord[];
   config: CreatorAutopilotConfig;
   now: Date;
-  hasHostPanel: boolean;
+  accountConnected: boolean;
 }): AutopilotShortPlan[] {
   if (input.job.status !== 'ready') {
     return [];
@@ -161,7 +192,7 @@ export function autopilotShortPlan(input: {
       }
       return;
     }
-    plans.push(planSelectedCandidate(assessment, input.video, input.config, input.job, input.exports, input.now, input.hasHostPanel));
+    plans.push(planSelectedCandidate(assessment, input.video, input.config, input.job, input.exports, input.now, input.accountConnected));
   });
   return plans;
 }

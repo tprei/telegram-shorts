@@ -1,4 +1,4 @@
-import type { PostingSchedule } from './model.js';
+import type { PostingSchedule, PublicationRecord, PublishingAccount } from './model.js';
 
 export const SCHEDULE_LIMITS = { minLeadMinutes: 15, maxLeadDays: 60, slotSpacingMinutes: 120 } as const;
 
@@ -69,11 +69,7 @@ export function freePostingSlots(input: { schedule: PostingSchedule; from: Date;
   const spacingMs = SCHEDULE_LIMITS.slotSpacingMinutes * MINUTE_MS;
   const dailyCap = input.schedule.slots.length;
   const timeZone = input.schedule.timeZone;
-  const dayKey = (date: Date): string => {
-    const parts = zonedDateParts(date, timeZone);
-    return `${parts.year}-${parts.month}-${parts.day}`;
-  };
-  const takenDayKeys = input.taken.map((taken) => dayKey(taken));
+  const takenDayKeys = input.taken.map((taken) => localDayKey(taken, timeZone));
   const startDate = zonedDateParts(input.from, timeZone);
   const free: Date[] = [];
   const returnedDayKeys: string[] = [];
@@ -100,7 +96,7 @@ export function freePostingSlots(input: { schedule: PostingSchedule; from: Date;
       if (tooCloseToTaken || tooCloseToReturned) {
         continue;
       }
-      const day = dayKey(new Date(instant));
+      const day = localDayKey(new Date(instant), timeZone);
       const dayCount = takenDayKeys.filter((key) => key === day).length + returnedDayKeys.filter((key) => key === day).length;
       if (dayCount >= dailyCap) {
         continue;
@@ -122,4 +118,51 @@ export function suggestPostingSlots(input: { now: Date; taken: readonly Date[]; 
     to: new Date(input.now.getTime() + SCHEDULE_LIMITS.maxLeadDays * DAY_MS),
     taken: input.taken,
   }).slice(0, input.count);
+}
+
+function localDayKey(date: Date, timeZone: string): string {
+  const parts = zonedDateParts(date, timeZone);
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+export function accountTakenSlots(input: {
+  accountId: string;
+  jobs: readonly { id: string; accountId: string | null }[];
+  publications: readonly PublicationRecord[];
+  from: Date;
+  excludeShortId: string | null;
+}): Date[] {
+  const accountByJob = new Map(input.jobs.map((job) => [job.id, job.accountId]));
+  const earliestByShort = new Map<string, Date>();
+  for (const publication of input.publications) {
+    if (publication.status === 'failed' || publication.status === 'cancelled') {
+      continue;
+    }
+    if (publication.shortId === input.excludeShortId) {
+      continue;
+    }
+    if (accountByJob.get(publication.jobId) !== input.accountId) {
+      continue;
+    }
+    const startedAt = publication.scheduledFor ?? publication.submittedAt ?? publication.availableAt ?? publication.createdAt;
+    const start = new Date(startedAt);
+    if (start.getTime() < input.from.getTime()) {
+      continue;
+    }
+    const previous = earliestByShort.get(publication.shortId);
+    if (previous === undefined || start.getTime() < previous.getTime()) {
+      earliestByShort.set(publication.shortId, start);
+    }
+  }
+  return [...earliestByShort.values()].sort((left, right) => left.getTime() - right.getTime());
+}
+
+export function accountSlotProblem(input: { account: PublishingAccount; at: Date; taken: readonly Date[] }): 'spacing' | 'daily_cap' | null {
+  const spacingMs = SCHEDULE_LIMITS.slotSpacingMinutes * MINUTE_MS;
+  if (input.taken.some((taken) => Math.abs(taken.getTime() - input.at.getTime()) < spacingMs)) {
+    return 'spacing';
+  }
+  const dayKey = localDayKey(input.at, input.account.schedule.timeZone);
+  const sameDayCount = input.taken.filter((taken) => localDayKey(taken, input.account.schedule.timeZone) === dayKey).length;
+  return sameDayCount >= input.account.schedule.slots.length ? 'daily_cap' : null;
 }

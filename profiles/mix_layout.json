@@ -1,0 +1,12 @@
+{
+  "version": 3,
+  "strategy": "scenes",
+  "layoutId": "mix-scenes-v3",
+  "canvas": { "width": 1080, "height": 1920, "fps": 30 },
+  "background": "#101010",
+  "safeArea": { "top": 0.135, "bottom": 0.17, "side": 0.055 },
+  "font": { "family": "Montserrat ExtraBold", "file": "assets/fonts/Montserrat-ExtraBold.ttf", "assSizeScale": 1.562 },
+  "hookBand": { "rect": { "x": 0, "y": 0, "w": 1, "h": 0.215 }, "background": "#C8102E", "textColor": "#FFFFFF", "sizePx": 58, "maxCharsPerLine": 24, "maxLines": 2, "uppercase": true },
+  "captions": { "sizePx": 62, "textColor": "#FFFFFF", "highlightColor": "#FFD400", "outlineColor": "#000000", "outlinePx": 6, "shadowPx": 2, "uppercase": true, "maxWordsPerCue": 4, "maxCharsPerLine": 16, "maxLines": 2, "centerY": 0.5521 },
+  "scene": { "captionCenterY": { "host": 0.72, "content": 0.78 } }
+}

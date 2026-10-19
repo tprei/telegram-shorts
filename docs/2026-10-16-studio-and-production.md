@@ -977,3 +977,8 @@ Deliberately left out: deduping manual `createJob` by video id. The operator re-
 - Auth, remote access, multi-user.
 - Background music, B-roll, face tracking.
 - Migrating old Telegram-era databases (none exist locally); old DBs fail loudly via `user_version`.
+
+
+## Mix accounts and scene layouts (follow-up, 2026-10-19)
+
+See [Mix accounts and scene layouts — implementation plan](2026-10-19-mix-scene-layouts.md) for the manifest/layout v3 cutover, shared pure-domain scene composition, account-scoped publishing and scheduling, one v8 stored-shape migration, editor interaction contract, and six implementation slices. That plan supersedes the creator-owned schedule/publish fields and global Mallary profile configuration described above; Boni and Jones fixed-layout output remains unchanged. Camera edges use averaged gradients from up to eight evenly spaced cluster members, a ±1.2% search radius, and the 2× median acceptance rule.

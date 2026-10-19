@@ -12,7 +12,8 @@ import { mallaryCooldownKey } from '../src/application/platforms.js';
 import { createInitialEdit, type ShortEdit, type WordRange } from '../src/domain/edit.js';
 import { buildSentences } from '../src/domain/policies.js';
 import type { LayoutProfile } from '../src/domain/layout.js';
-import { QUEUE_LANES, type AutopilotVideoRecord, type CreatorProfile, type ExportRecord, type JobRecord, type JobSummaryRecord, type PublicationRecord, type PublishCopyResponse, type RevisionIntent, type ShortRecord, type TranscriptWord } from '../src/domain/model.js';
+import { QUEUE_LANES, type AutopilotVideoRecord, type CreatorProfile, type ExportRecord, type JobRecord, type PublicationRecord, type PublishCopyResponse, type PublishingAccount, type RevisionIntent, type ShortRecord, type TranscriptWord } from '../src/domain/model.js';
+import { zonedDateParts, zonedTimeToUtc } from '../src/domain/schedule.js';
 import { acquireStudioLock } from '../src/infra/studio-lock.js';
 import { ShortsStore } from '../src/infra/db.js';
 import { runProcess } from '../src/infra/process.js';
@@ -21,33 +22,44 @@ import { CreatorProfileRepository } from '../src/infra/creator-profile-loader.js
 import type { OpenRouterClient } from '../src/infra/openrouter.js';
 import type { ShortVideoCheckPublicationInput, ShortVideoPublishInput, ShortVideoPublishProvider, ShortVideoPublishResult, RemotePublicationState } from '../src/infra/instagram-publisher.js';
 import { ShortVideoPublishError } from '../src/infra/instagram-publisher.js';
-import { boxToSourceFocus } from '../src/infra/vision.js';
+import { analyzeContentCrops, boxToSourceFocus } from '../src/infra/vision.js';
+import { analyzeScenes } from '../src/infra/scenes.js';
 import { nowIso } from '../src/infra/util.js';
+
+const repoManifestPath = join(import.meta.dirname, '..', 'profiles', 'creator-profiles.json');
+
+const ACCOUNT_A: PublishingAccount = {
+  id: 'account_a',
+  displayName: 'Account A',
+  schedule: { timeZone: 'America/Sao_Paulo', slots: ['12:00', '19:00', '21:00'] },
+  platforms: ['instagram', 'tiktok', 'youtube_shorts'],
+  mallaryProfileId: 'mallary_account_a',
+  buffer: false,
+};
+
+const ACCOUNT_B: PublishingAccount = {
+  id: 'account_b',
+  displayName: 'Account B',
+  schedule: { timeZone: 'America/Sao_Paulo', slots: ['12:00', '19:00', '21:00'] },
+  platforms: ['instagram', 'tiktok', 'youtube_shorts'],
+  mallaryProfileId: null,
+  buffer: false,
+};
 
 const CREATOR_A: CreatorProfile = {
   id: 'creator_a',
   displayName: 'Creator A',
   enabled: true,
-  render: { layoutPath: 'layouts/creator_a.json', layoutId: 'center-speaker-vertical-v2' },
-  publish: {
-    instagram: { mode: 'global' },
-    tiktok: { mode: 'global' },
-    youtube_shorts: { mode: 'global' },
-  },
-  schedule: { timeZone: 'America/Sao_Paulo', slots: ['12:00', '19:00', '21:00'] },
+  accountId: 'account_a',
+  render: { layoutPath: 'layouts/creator_a.json', layoutId: 'center-speaker-vertical-v2', defaultSpeed: 1, scene: null },
 };
 
 const CREATOR_B: CreatorProfile = {
   id: 'creator_b',
   displayName: 'Creator B',
   enabled: true,
-  render: { layoutPath: 'layouts/creator_b.json', layoutId: 'center-speaker-vertical-v2' },
-  publish: {
-    instagram: { mode: 'disabled' },
-    tiktok: { mode: 'disabled' },
-    youtube_shorts: { mode: 'disabled' },
-  },
-  schedule: { timeZone: 'America/Sao_Paulo', slots: ['12:00', '19:00', '21:00'] },
+  accountId: 'account_b',
+  render: { layoutPath: 'layouts/creator_b.json', layoutId: 'center-speaker-vertical-v2', defaultSpeed: 1, scene: null },
 };
 
 interface TestContext {
@@ -66,11 +78,12 @@ async function makeContext(
 ): Promise<TestContext> {
   const rootDir = await mkdtemp(join(tmpdir(), 'studio-service-'));
   await mkdir(join(rootDir, 'layouts'), { recursive: true });
-  await writeFile(join(rootDir, 'layouts', 'creator_a.json'), JSON.stringify(layoutJson('creator_a')));
-  await writeFile(join(rootDir, 'layouts', 'creator_b.json'), JSON.stringify(layoutJson('creator_b')));
+  await writeFile(join(rootDir, 'layouts', 'creator_a.json'), JSON.stringify(layoutJson()));
+  await writeFile(join(rootDir, 'layouts', 'creator_b.json'), JSON.stringify(layoutJson()));
   await writeFile(join(rootDir, 'creator-profiles.json'), JSON.stringify({
-    version: 2,
+    version: 3,
     defaultCreatorId: 'creator_a',
+    accounts: [ACCOUNT_A, ACCOUNT_B],
     creators: [CREATOR_A, CREATOR_B],
   }));
   const store = await ShortsStore.open(join(rootDir, 'shorts.sqlite'));
@@ -112,6 +125,7 @@ function fakePublisher(): ShortVideoPublishProvider {
     supportedPlatforms: ['instagram', 'tiktok', 'youtube_shorts'],
     supportsScheduling: true,
     supports: () => true,
+    canPublish: () => true,
     publishShortVideo: async () => {
       throw new Error('publisher must not be called from the studio service');
     },
@@ -121,14 +135,13 @@ function fakePublisher(): ShortVideoPublishProvider {
   };
 }
 
-function layoutJson(creatorId: string) {
+function layoutJson() {
   return {
-    version: 2,
-    creatorId,
+    version: 3,
+    strategy: 'fixed',
     layoutId: 'center-speaker-vertical-v2',
     canvas: { width: 1080, height: 1920, fps: 30 },
     background: '#101010',
-    defaultSpeed: 1,
     font: { family: 'Montserrat ExtraBold', file: 'assets/fonts/Montserrat-ExtraBold.ttf', assSizeScale: 1.562 },
     panels: [{
       id: 'speaker',
@@ -151,11 +164,12 @@ function layoutJson(creatorId: string) {
       maxLines: 2,
       centerY: 0.72,
     },
+    safeArea: { top: 0.135, bottom: 0.17, side: 0.055 },
   };
 }
 
-function layoutSnapshot(creatorId: string): LayoutProfile {
-  return layoutJson(creatorId) as unknown as LayoutProfile;
+function layoutSnapshot(): LayoutProfile {
+  return layoutJson() as unknown as LayoutProfile;
 }
 
 function transcriptWords(): TranscriptWord[] {
@@ -176,18 +190,18 @@ interface SeededJob {
   edit: ShortEdit;
 }
 
-function seedReadyJob(store: ShortsStore, creator: CreatorProfile, rootDir: string, words: TranscriptWord[] = transcriptWords()): SeededJob {
+function seedReadyJob(store: ShortsStore, creator: CreatorProfile, rootDir: string, words: TranscriptWord[] = transcriptWords(), ids: { jobId?: string; shortId?: string } = {}): SeededJob {
   const range: WordRange = { startWord: 0, endWord: words.length - 1 };
   const edit = createInitialEdit({ ranges: [range], words, speed: 1, hookText: 'A REGRA MUDOU' });
   const job: JobRecord = {
-    id: 'job_test',
+    id: ids.jobId ?? 'job_test',
     sourceUrl: 'https://youtube.com/watch?v=abc',
     sourceTitle: 'Video de teste',
     status: 'ready',
     progress: null,
     creatorProfileId: creator.id,
     creatorProfileSnapshot: creator,
-    layoutProfileSnapshot: layoutSnapshot(creator.id),
+    layoutProfileSnapshot: layoutSnapshot(),
     transcriptProvider: 'deepgram',
     media: {
       videoPath: join(rootDir, 'source.mp4'),
@@ -206,6 +220,9 @@ function seedReadyJob(store: ShortsStore, creator: CreatorProfile, rootDir: stri
     chosenSpeakerId: 'speaker_0',
     hostFraming: null,
     hostFramingAnalyzedAt: null,
+    sceneTrack: null,
+    sceneAnalysis: 'none',
+    sceneAnalysisError: null,
     failedTaskKind: null,
     error: null,
     createdAt: nowIso(),
@@ -213,7 +230,7 @@ function seedReadyJob(store: ShortsStore, creator: CreatorProfile, rootDir: stri
   };
   store.createJob(job);
   const short: ShortRecord = {
-    id: 'short_test',
+    id: ids.shortId ?? 'short_test',
     jobId: job.id,
     rank: 1,
     origin: 'manual',
@@ -237,9 +254,9 @@ function seedReadyJob(store: ShortsStore, creator: CreatorProfile, rootDir: stri
   return { jobId: job.id, shortId: short.id, edit };
 }
 
-function seedReadyExport(store: ShortsStore, seeded: SeededJob, rootDir: string): ExportRecord {
+function seedReadyExport(store: ShortsStore, seeded: SeededJob, rootDir: string, id = 'export_test'): ExportRecord {
   const record: ExportRecord = {
-    id: 'export_test',
+    id,
     jobId: seeded.jobId,
     shortId: seeded.shortId,
     editRevision: 1,
@@ -247,6 +264,8 @@ function seedReadyExport(store: ShortsStore, seeded: SeededJob, rootDir: string)
     edit: seeded.edit,
     title: 'Short de teste',
     hostFraming: null,
+    layoutProfileSnapshot: layoutSnapshot(),
+    sceneTrack: null,
     status: 'ready',
     artifactPath: join(rootDir, 'export.mp4'),
     sizeBytes: 1024,
@@ -298,6 +317,7 @@ function recordingPublisher(options: {
     supportedPlatforms: ['instagram', 'tiktok', 'youtube_shorts'],
     supportsScheduling: true,
     supports: () => true,
+    canPublish: () => true,
     publishShortVideo: async (input) => {
       publishInputs.push(input);
       return options.result;
@@ -321,6 +341,8 @@ function recordingPublisher(options: {
 
 function pipelineFor(context: TestContext, publisher: ShortVideoPublishProvider, openRouter: OpenRouterClient = context.openRouter): ShortsPipeline {
   return new ShortsPipeline({
+      analyzeScenes,
+      analyzeContentCrops,
     config: context.config,
     store: context.store,
     openRouter,
@@ -580,6 +602,18 @@ test('a correction invalidates exports created before it', async () => {
   }
 });
 
+function downgradePayloadsToV2Layout(db: DatabaseSync): void {
+  db.exec(`
+    UPDATE jobs SET payload_json = json_set(
+      json_remove(payload_json, '$.sceneTrack', '$.sceneAnalysis', '$.sceneAnalysisError'),
+      '$.layoutProfileSnapshot.version', 2,
+      '$.layoutProfileSnapshot.defaultSpeed', json_extract(payload_json, '$.creatorProfileSnapshot.render.defaultSpeed'),
+      '$.layoutProfileSnapshot.creatorId', json_extract(payload_json, '$.creatorProfileSnapshot.id')
+    );
+  `);
+  db.exec(`UPDATE exports SET payload_json = json_remove(payload_json, '$.sceneTrack', '$.layoutProfileSnapshot')`);
+}
+
 test('a version-2 database migrates payloads to transcriptRevision 0 and unknown versions throw', async () => {
   const context = await makeContext();
   const dbPath = join(context.rootDir, 'shorts.sqlite');
@@ -591,10 +625,11 @@ test('a version-2 database migrates payloads to transcriptRevision 0 and unknown
     const legacy = new DatabaseSync(dbPath);
     legacy.exec("UPDATE jobs SET payload_json = json_remove(payload_json, '$.transcriptRevision')");
     legacy.exec("UPDATE exports SET payload_json = json_remove(payload_json, '$.transcriptRevision')");
+    downgradePayloadsToV2Layout(legacy);
     legacy.exec('PRAGMA user_version = 2');
     legacy.close();
 
-    const migrated = await ShortsStore.open(dbPath);
+    const migrated = await ShortsStore.open(dbPath, { manifestPath: repoManifestPath });
     try {
       const job = migrated.getJob(seeded.jobId);
       assert.ok(job);
@@ -652,17 +687,24 @@ test('publish returns the in-flight publication, conflicts once posted, and forc
   }
 });
 
-test('publish is rejected for a render-only creator', async () => {
+test('unconnected Mix rejects publish and schedule without creating attempts', async () => {
   const context = await makeContext();
   try {
     const seeded = seedReadyJob(context.store, CREATOR_B, context.rootDir);
     const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
     const detail = await context.service.getShort(seeded.shortId);
-    assert.ok(detail.platforms.every((platform) => !platform.available && platform.reason !== null));
+    assert.ok(detail.platforms.every((platform) => !platform.available && platform.reason === 'Account not connected in Mallary'));
+    assert.ok(detail.platforms.every((platform) => !platform.canSchedule));
     await assert.rejects(
       context.service.publish(exportRecord.id, { platforms: ['instagram'], force: false, scheduledAt: null }),
       isStudioErrorWithCode('invalid'),
     );
+    await assert.rejects(
+      context.service.publish(exportRecord.id, { platforms: ['tiktok'], force: false, scheduledAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() }),
+      (error: unknown) => error instanceof StudioError && error.code === 'invalid' && error.message === 'Account not connected in Mallary',
+    );
+    assert.equal(context.store.listPublicationsForShort(seeded.shortId).length, 0);
+    assert.equal(queuedTasks(context.dbPath, 'publish_short_video').length, 0);
   } finally {
     await cleanup(context);
   }
@@ -738,6 +780,8 @@ test('a failed replan keeps the job ready with its shorts and offers retry', asy
     const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
     context.service.replan(seeded.jobId);
     const pipeline = new ShortsPipeline({
+      analyzeScenes,
+      analyzeContentCrops,
       config: testConfig(context.rootDir),
       store: context.store,
       openRouter: failingPlanner,
@@ -758,7 +802,7 @@ test('a failed replan keeps the job ready with its shorts and offers retry', asy
   }
 });
 
-test('planShorts runs at the layout snapshot speed and passes it to every planner call', async () => {
+test('planShorts runs at the creator render speed and passes it to every planner call', async () => {
   const longWords: TranscriptWord[] = Array.from({ length: 60 }, (_, index) => ({
     id: `w_${String(index + 1).padStart(6, '0')}`,
     text: `palavra${index + 1}`,
@@ -807,6 +851,8 @@ test('planShorts runs at the layout snapshot speed and passes it to every planne
     const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir, longWords);
     context.service.replan(seeded.jobId);
     const pipeline = new ShortsPipeline({
+      analyzeScenes,
+      analyzeContentCrops,
       config: testConfig(context.rootDir),
       store: context.store,
       openRouter: planner,
@@ -816,7 +862,7 @@ test('planShorts runs at the layout snapshot speed and passes it to every planne
     assert.equal(await pipeline.runNext('ingest'), true);
     const storedJob = context.store.getJob(seeded.jobId);
     assert.equal(storedJob?.status, 'ready');
-    const expectedSpeed = storedJob!.layoutProfileSnapshot.defaultSpeed;
+    const expectedSpeed = storedJob!.creatorProfileSnapshot.render.defaultSpeed;
     const shorts = context.store.listShortsForJob(seeded.jobId);
     assert.equal(shorts.length, 1);
     assert.equal(shorts[0]?.edit.speed, expectedSpeed);
@@ -1138,6 +1184,7 @@ test('a publication still unresolved 60 minutes after submission becomes unconfi
       publishShortVideo: async () => PUBLISH_RESULT,
       checkPublication: async () => checkState,
       cancelScheduled: async () => {},
+      canPublish: () => true,
     };
     const pipeline = pipelineFor(context, publisher);
     const publication = seedSubmittedPublication(context.store, seeded, exportRecord.id, {
@@ -1355,7 +1402,7 @@ test('v3 migration marks unverified published publications submitted and queues 
     }));
     db.close();
   }
-  const store = await ShortsStore.open(dbPath);
+  const store = await ShortsStore.open(dbPath, { manifestPath: repoManifestPath });
   try {
     const verified = store.getPublication('pub_remote');
     assert.ok(verified);
@@ -1397,7 +1444,7 @@ test('v3 migration marks unverified published publications submitted and queues 
     if (typeof row !== 'object' || row === null || !('user_version' in row) || typeof row.user_version !== 'number') {
       throw new Error('Database did not report a user_version');
     }
-    assert.equal(row.user_version, 7);
+    assert.equal(row.user_version, 8);
   } finally {
     db.close();
     await rm(dir, { recursive: true, force: true });
@@ -1965,11 +2012,11 @@ test('the store migrates a v4 database by adding the host framing fields', async
   const db = new DatabaseSync(dbPath);
   db.exec('CREATE TABLE jobs (id TEXT PRIMARY KEY, status TEXT NOT NULL, updated_at TEXT NOT NULL, payload_json TEXT NOT NULL)');
   db.exec('CREATE TABLE exports (id TEXT PRIMARY KEY, job_id TEXT NOT NULL, short_id TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, payload_json TEXT NOT NULL)');
-  db.exec(`INSERT INTO jobs(id, status, updated_at, payload_json) VALUES('job_old', 'ready', '${nowIso()}', '{"id":"job_old","transcriptRevision":2}')`);
+  db.exec(`INSERT INTO jobs(id, status, updated_at, payload_json) VALUES('job_old', 'ready', '${nowIso()}', '{"id":"job_old","transcriptRevision":2,"layoutProfileSnapshot":{"version":2,"creatorId":"creator_a","defaultSpeed":1}}')`);
   db.exec(`INSERT INTO exports(id, job_id, short_id, status, created_at, payload_json) VALUES('export_old', 'job_old', 'short_old', 'ready', '${nowIso()}', '{"id":"export_old","editRevision":1,"transcriptRevision":0}')`);
   db.exec('PRAGMA user_version = 4');
   db.close();
-  const store = await ShortsStore.open(dbPath);
+  const store = await ShortsStore.open(dbPath, { manifestPath: repoManifestPath });
   try {
     const job = store.getJob('job_old');
     assert.ok(job);
@@ -2273,7 +2320,11 @@ test('publish rejects schedule times outside the lead window', async () => {
 });
 
 test('publish rejects scheduling for platforms without a scheduling provider', async () => {
-  const context = await makeContext(copyWriter(), undefined, { MALLARY_AI_API_TOKEN: undefined, ...bufferChannelConfig() });
+  const context = await makeContext(
+    copyWriter(),
+    { ...fakePublisher(), canPublish: ({ scheduled }) => !scheduled },
+    { MALLARY_AI_API_TOKEN: undefined, ...bufferChannelConfig() },
+  );
   try {
     const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
     const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
@@ -2331,8 +2382,9 @@ test('listScheduledPosts returns upcoming scheduled posts ordered by time with s
       scheduledFor: new Date(base + 5 * 24 * 60 * 60 * 1000).toISOString(),
     });
 
-    const posts = context.service.listScheduledPosts();
+    const posts = await context.service.listScheduledPosts();
     assert.deepEqual(posts.map((post) => post.publicationId), [sooner.id, middle.id, later.id]);
+    assert.deepEqual(posts.map((post) => post.accountId), ['account_a', 'account_a', 'account_a']);
     assert.deepEqual(posts[0], {
       publicationId: sooner.id,
       jobId: seeded.jobId,
@@ -2341,8 +2393,9 @@ test('listScheduledPosts returns upcoming scheduled posts ordered by time with s
       platform: 'tiktok',
       status: 'queued',
       scheduledFor: sooner.scheduledFor,
-      timeZone: 'America/Sao_Paulo',
       provider: null,
+      accountId: 'account_a',
+      timeZone: 'America/Sao_Paulo',
     });
   } finally {
     await cleanup(context);
@@ -2373,7 +2426,7 @@ test('startup backfills the check task for scheduled publications at the schedul
   }
 });
 
-test('a version-5 database gains scheduledFor on publications and lands on version 7', async () => {
+test('a version-5 database gains scheduledFor on publications and lands on version 8', async () => {
   const context = await makeContext();
   try {
     const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir);
@@ -2381,6 +2434,7 @@ test('a version-5 database gains scheduledFor on publications and lands on versi
     const dbPath = context.dbPath;
 
     const legacy = new DatabaseSync(dbPath);
+    downgradePayloadsToV2Layout(legacy);
     legacy.exec('PRAGMA user_version = 5');
     const payload = JSON.stringify({
       id: 'pub_legacy',
@@ -2404,7 +2458,7 @@ test('a version-5 database gains scheduledFor on publications and lands on versi
       .run('pub_legacy', exportRecord.id, seeded.shortId, 'tiktok', 'submitted', nowIso(), payload);
     legacy.close();
 
-    const migrated = await ShortsStore.open(dbPath);
+    const migrated = await ShortsStore.open(dbPath, { manifestPath: repoManifestPath });
     try {
       const record = migrated.getPublication('pub_legacy');
       assert.ok(record);
@@ -2415,7 +2469,7 @@ test('a version-5 database gains scheduledFor on publications and lands on versi
     const versionDb = new DatabaseSync(dbPath);
     const versionRow = versionDb.prepare('PRAGMA user_version').get();
     versionDb.close();
-    assert.ok(typeof versionRow === 'object' && versionRow !== null && 'user_version' in versionRow && versionRow.user_version === 7);
+    assert.ok(typeof versionRow === 'object' && versionRow !== null && 'user_version' in versionRow && versionRow.user_version === 8);
   } finally {
     await cleanup(context);
   }
@@ -2430,10 +2484,11 @@ test('a version-4 database with current payloads gains scheduledFor on publicati
     const publication = seedSubmittedPublication(context.store, seeded, exportRecord.id);
     const legacy = new DatabaseSync(dbPath);
     legacy.exec("UPDATE publications SET payload_json = json_remove(payload_json, '$.scheduledFor')");
+    downgradePayloadsToV2Layout(legacy);
     legacy.exec('PRAGMA user_version = 4');
     legacy.close();
 
-    const migrated = await ShortsStore.open(dbPath);
+    const migrated = await ShortsStore.open(dbPath, { manifestPath: repoManifestPath });
     try {
       const record = migrated.getPublication(publication.id);
       assert.ok(record);
@@ -2706,7 +2761,7 @@ test('a scheduled post accepted without job ids becomes unconfirmed with the Mal
   }
 });
 
-test('a v6 database migrates to v7 adding the schedule to job snapshots', async () => {
+test('a v6 database migrates to v8 moving capacity from creator snapshots to accounts', async () => {
   const rootDir = await mkdtemp(join(tmpdir(), 'store-v6-'));
   try {
     const dbPath = join(rootDir, 'shorts.sqlite');
@@ -2717,16 +2772,28 @@ test('a v6 database migrates to v7 adding the schedule to job snapshots', async 
       id: 'job_old',
       status: 'ready',
       creatorProfileId: 'creator_a',
-      creatorProfileSnapshot: { id: 'creator_a', displayName: 'Creator A', schedule: null },
+      creatorProfileSnapshot: { id: 'creator_a', displayName: 'Creator A', schedule: { timeZone: 'America/Sao_Paulo', slots: ['12:00', '19:00', '21:00'] } },
+      layoutProfileSnapshot: { version: 2, creatorId: 'creator_a', defaultSpeed: 1.25 },
     });
     legacy.prepare("INSERT INTO jobs(id, status, updated_at, payload_json) VALUES('job_old', 'ready', '2026-10-17T10:00:00.000Z', ?)").run(legacyPayload);
     legacy.close();
 
-    const store = await ShortsStore.open(dbPath);
+    const store = await ShortsStore.open(dbPath, { manifestPath: repoManifestPath });
     try {
       const migrated = store.getJob('job_old');
       assert.ok(migrated);
-      assert.deepEqual(migrated.creatorProfileSnapshot.schedule, { timeZone: 'America/Sao_Paulo', slots: ['12:00', '19:00', '21:00'] });
+      assert.equal(migrated.creatorProfileSnapshot.accountId, null);
+      assert.equal('schedule' in migrated.creatorProfileSnapshot, false);
+      assert.equal('publish' in migrated.creatorProfileSnapshot, false);
+      assert.equal(migrated.creatorProfileSnapshot.render.defaultSpeed, 1.25);
+      assert.equal(migrated.creatorProfileSnapshot.render.scene, null);
+      assert.equal(migrated.layoutProfileSnapshot.version, 3);
+      assert.equal(migrated.layoutProfileSnapshot.strategy, 'fixed');
+      assert.equal('defaultSpeed' in migrated.layoutProfileSnapshot, false);
+      assert.equal('creatorId' in migrated.layoutProfileSnapshot, false);
+      assert.equal(migrated.sceneTrack, null);
+      assert.equal(migrated.sceneAnalysis, 'none');
+      assert.equal(migrated.sceneAnalysisError, null);
     } finally {
       store.close();
     }
@@ -2750,6 +2817,117 @@ test('autopilot video records upsert and list newest first', async () => {
     assert.equal(updated?.lastRetryAt, '2026-10-17T13:00:00.000Z');
     assert.equal(context.store.getAutopilotVideo('filipe_boni', 'missing'), null);
     assert.deepEqual(context.store.listAutopilotVideos('other_creator'), []);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+async function writeManifest(context: TestContext, accounts: PublishingAccount[], creators: CreatorProfile[]): Promise<void> {
+  await writeFile(join(context.rootDir, 'creator-profiles.json'), JSON.stringify({
+    version: 3,
+    defaultCreatorId: 'creator_a',
+    accounts,
+    creators,
+  }));
+}
+
+function slotAt(dayOffsetDays: number, hour: number, minute: number): string {
+  const parts = zonedDateParts(new Date(Date.now() + dayOffsetDays * 24 * 60 * 60 * 1000), 'America/Sao_Paulo');
+  return zonedTimeToUtc({ year: parts.year, month: parts.month, day: parts.day, hour, minute, timeZone: 'America/Sao_Paulo' }).toISOString();
+}
+
+test('scheduled requests share account spacing and daily cap across creators', async () => {
+  const context = await makeContext();
+  try {
+    const shared: PublishingAccount = { ...ACCOUNT_A, id: 'account_shared', displayName: 'Shared', mallaryProfileId: 'mallary_shared' };
+    const other: PublishingAccount = { ...ACCOUNT_A, id: 'account_other', displayName: 'Other', mallaryProfileId: 'mallary_other' };
+    const creatorC: CreatorProfile = { ...CREATOR_B, id: 'creator_c', displayName: 'Creator C', accountId: 'account_other' };
+    const creatorBShared: CreatorProfile = { ...CREATOR_B, accountId: 'account_shared' };
+    await writeManifest(context, [shared, other], [{ ...CREATOR_A, accountId: 'account_shared' }, creatorBShared, creatorC]);
+
+    const a = seedReadyJob(context.store, { ...CREATOR_A, accountId: 'account_shared' }, context.rootDir, undefined, { jobId: 'job_a', shortId: 'short_a' });
+    const b = seedReadyJob(context.store, creatorBShared, context.rootDir, undefined, { jobId: 'job_b', shortId: 'short_b' });
+    const c = seedReadyJob(context.store, creatorC, context.rootDir, undefined, { jobId: 'job_c', shortId: 'short_c' });
+    const exportA = seedReadyExport(context.store, a, context.rootDir, 'export_a');
+    const exportB = seedReadyExport(context.store, b, context.rootDir, 'export_b');
+    const exportC = seedReadyExport(context.store, c, context.rootDir, 'export_c');
+
+    const [queuedA] = await context.service.publish(exportA.id, { platforms: ['tiktok'], force: false, scheduledAt: slotAt(35, 10, 0) });
+    await assert.rejects(
+      context.service.publish(exportB.id, { platforms: ['tiktok'], force: false, scheduledAt: slotAt(35, 10, 30) }),
+      (error: unknown) => error instanceof StudioError && error.code === 'conflict' && /at least 2 h away/.test(error.message),
+    );
+    const [queuedB] = await context.service.publish(exportB.id, { platforms: ['tiktok'], force: false, scheduledAt: slotAt(35, 13, 0) });
+    const [queuedC] = await context.service.publish(exportC.id, { platforms: ['tiktok'], force: false, scheduledAt: slotAt(35, 10, 0) });
+
+    const posts = await context.service.listScheduledPosts();
+    assert.deepEqual(posts.map((post) => post.publicationId).sort(), [queuedA.id, queuedB.id, queuedC.id].sort());
+    const accountByPublication = new Map(posts.map((post) => [post.publicationId, post.accountId] as const));
+    assert.equal(accountByPublication.get(queuedA.id), 'account_shared');
+    assert.equal(accountByPublication.get(queuedB.id), 'account_shared');
+    assert.equal(accountByPublication.get(queuedC.id), 'account_other');
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('the per-account daily cap blocks a second post on the same day but not the next day', async () => {
+  const context = await makeContext();
+  try {
+    const capped: PublishingAccount = { ...ACCOUNT_A, id: 'account_capped', displayName: 'Capped', mallaryProfileId: 'mallary_capped', schedule: { timeZone: 'America/Sao_Paulo', slots: ['12:00'] } };
+    const creatorBCapped: CreatorProfile = { ...CREATOR_B, accountId: 'account_capped' };
+    await writeManifest(context, [capped], [{ ...CREATOR_A, accountId: 'account_capped' }, creatorBCapped]);
+
+    const a = seedReadyJob(context.store, { ...CREATOR_A, accountId: 'account_capped' }, context.rootDir, undefined, { jobId: 'job_a', shortId: 'short_a' });
+    const b = seedReadyJob(context.store, creatorBCapped, context.rootDir, undefined, { jobId: 'job_b', shortId: 'short_b' });
+    const exportA = seedReadyExport(context.store, a, context.rootDir, 'export_a');
+    const exportB = seedReadyExport(context.store, b, context.rootDir, 'export_b');
+
+    await context.service.publish(exportA.id, { platforms: ['tiktok'], force: false, scheduledAt: slotAt(35, 10, 0) });
+    await assert.rejects(
+      context.service.publish(exportB.id, { platforms: ['tiktok'], force: false, scheduledAt: slotAt(35, 18, 0) }),
+      (error: unknown) => error instanceof StudioError
+        && error.code === 'conflict'
+        && error.message === 'This account already has its daily posting limit scheduled for that day.',
+    );
+    const [nextDay] = await context.service.publish(exportB.id, { platforms: ['tiktok'], force: false, scheduledAt: slotAt(36, 10, 0) });
+    assert.equal(nextDay.scheduledFor, slotAt(36, 10, 0));
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('simultaneous scheduled requests cannot reserve the same account slot', async () => {
+  const context = await makeContext();
+  try {
+    const shared: PublishingAccount = { ...ACCOUNT_A, id: 'account_shared', displayName: 'Shared', mallaryProfileId: 'mallary_shared' };
+    const creatorBShared: CreatorProfile = { ...CREATOR_B, accountId: 'account_shared' };
+    await writeManifest(context, [shared], [{ ...CREATOR_A, accountId: 'account_shared' }, creatorBShared]);
+
+    const a = seedReadyJob(context.store, { ...CREATOR_A, accountId: 'account_shared' }, context.rootDir, undefined, { jobId: 'job_a', shortId: 'short_a' });
+    const b = seedReadyJob(context.store, creatorBShared, context.rootDir, undefined, { jobId: 'job_b', shortId: 'short_b' });
+    const exportA = seedReadyExport(context.store, a, context.rootDir, 'export_a');
+    const exportB = seedReadyExport(context.store, b, context.rootDir, 'export_b');
+
+    const settled = await Promise.allSettled([
+      context.service.publish(exportA.id, { platforms: ['tiktok'], force: false, scheduledAt: slotAt(35, 10, 0) }),
+      context.service.publish(exportB.id, { platforms: ['tiktok'], force: false, scheduledAt: slotAt(35, 10, 0) }),
+    ]);
+    const fulfilled = settled.filter((entry) => entry.status === 'fulfilled');
+    const rejectedResult = settled.find((entry): entry is PromiseRejectedResult => entry.status === 'rejected');
+    assert.equal(fulfilled.length, 1);
+    assert.ok(rejectedResult);
+    assert.ok(rejectedResult.reason instanceof StudioError);
+    const conflict = rejectedResult.reason as StudioError;
+    assert.equal(conflict.code, 'conflict');
+    assert.ok(/at least 2 h away/.test(conflict.message));
+
+    const reserved = [
+      ...context.store.listPublicationsForShort(a.shortId),
+      ...context.store.listPublicationsForShort(b.shortId),
+    ];
+    assert.equal(reserved.length, 1);
+    assert.equal(reserved[0]?.scheduledFor, slotAt(35, 10, 0));
   } finally {
     await cleanup(context);
   }

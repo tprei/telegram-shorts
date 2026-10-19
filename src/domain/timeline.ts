@@ -1,16 +1,18 @@
-import type { LayoutProfile, PxRect } from './layout.js';
+import type { Composition, LayoutProfile, NormRect, PanelFill, PxRect, ScenesLayoutProfile } from './layout.js';
 import type { CropKeyframe, ShortEdit } from './edit.js';
 import { keptWordIndices } from './edit.js';
-import type { HostFraming, TranscriptWord } from './model.js';
+import type { HostFraming, SceneSegment, SceneTrack, TranscriptWord } from './model.js';
 import { formatCaptionWord, wrapHook, wrapWords } from './text.js';
 import { contentSourceCrop, hostSourceCrop, normToPx, panelCanvasRect, toEvenPxRect } from './geometry.js';
+import { captionY, chooseStackSplit, compositionPanels, contentFocus, FLASH_OUTPUT_SECONDS, type CompositionPlacement } from './composition.js';
+import { defaultComposition, SCENE_EPSILON } from './scene.js';
 
 export interface TimelinePanelPlacement {
   panelId: string;
   role: 'content' | 'host';
   source: PxRect;
   canvas: PxRect;
-  fill: 'cover' | 'blur';
+  fill: PanelFill;
 }
 
 export interface TimelineClip {
@@ -21,6 +23,9 @@ export interface TimelineClip {
   outputEnd: number;
   joinsPrevious: boolean;
   zoom: number;
+  composition: Composition | null;
+  sceneStartSeconds: number | null;
+  captionCenterY: number;
   panels: TimelinePanelPlacement[];
 }
 
@@ -35,12 +40,14 @@ export interface CaptionCue {
   lines: CaptionWord[][];
   outputStart: number;
   outputEnd: number;
+  centerY: number;
 }
 
 export interface TimelineHook {
   lines: string[];
   canvas: PxRect;
   sizePx: number;
+  textCenterY: number;
 }
 
 export interface TimelineEndCardLine {
@@ -83,10 +90,12 @@ export interface Timeline {
   cues: CaptionCue[];
   hook: TimelineHook | null;
   endCard: TimelineEndCard | null;
+  stackSplit: number | null;
 }
 
 export const CLIP_PAD_IN_SECONDS = 0.08;
 export const CLIP_PAD_OUT_SECONDS = 0.12;
+export const MIN_SCENE_PIECE_SECONDS = 0.05;
 export const CROP_SPLIT_MARGIN_SECONDS = 0.3;
 export const HOST_BLUR_SIGMA_PX = 30;
 export const HOST_BLUR_DARKEN = 0.6;
@@ -96,7 +105,6 @@ export const END_CARD_THUMBNAIL_WIDTH_PX = 900;
 export const END_CARD_THUMBNAIL_CENTER_Y = 560;
 export const END_CARD_TITLE_CENTER_Y = 1200;
 export const END_CARD_LINK_TEXT = 'Link na descrição';
-export const END_CARD_LINK_CENTER_Y = 1700;
 export const END_CARD_LINK_SIZE_PX = 44;
 export const END_CARD_TITLE_MAX_CHARS_PER_LINE = 22;
 export const END_CARD_TITLE_MAX_LINES = 3;
@@ -168,15 +176,38 @@ export function outputDurationSeconds(edit: ShortEdit, words: TranscriptWord[], 
   );
 }
 
-export function buildTimeline(input: {
+function clipRatio(clip: TimelineClip): number {
+  return (clip.outputEnd - clip.outputStart) / (clip.sourceEnd - clip.sourceStart);
+}
+
+interface ScenePiece {
+  sourceStart: number;
+  sourceEnd: number;
+  joinsPrevious: boolean;
+  segment: SceneSegment;
+  focus: NormRect | null;
+  composition: Composition;
+}
+
+export interface TimelineInput {
   edit: ShortEdit;
   words: TranscriptWord[];
   layout: LayoutProfile;
   title: string;
   source: { width: number; height: number; durationSeconds: number };
   hostFraming: HostFraming | null;
-}): Timeline {
-  const { edit, words, layout, source } = input;
+  sceneTrack: SceneTrack | null;
+}
+
+export function buildTimeline(input: TimelineInput): Timeline {
+  if (input.layout.strategy === 'scenes') {
+    return buildScenesTimeline(input, input.layout);
+  }
+  return buildFixedTimeline(input, input.layout);
+}
+
+function buildFixedTimeline(input: TimelineInput, layout: Extract<LayoutProfile, { strategy: 'fixed' }>): Timeline {
+  const { edit, words, source } = input;
   const fps = layout.canvas.fps;
   const baseClips = computeSourceClips(edit, words, source.durationSeconds);
   const cropTimes = edit.crops.map((crop) => crop.sourceSeconds).sort((left, right) => left - right);
@@ -212,6 +243,9 @@ export function buildTimeline(input: {
       outputEnd,
       joinsPrevious: clip.joinsPrevious,
       zoom: 1,
+      composition: null,
+      sceneStartSeconds: null,
+      captionCenterY: layout.captions.centerY,
       panels: [],
     });
     outputStart = outputEnd;
@@ -238,12 +272,23 @@ export function buildTimeline(input: {
       const canvasRect = panelCanvasRect(panel, layout.canvas);
       const aspect = canvasRect.w / canvasRect.h;
       if (panel.role === 'content') {
+        const insetWidth = layout.canvas.width - 2 * layout.safeArea.side * layout.canvas.width;
+        const insetsSides = layout.safeArea.side > 0 && canvasRect.x <= 0 && canvasRect.x + canvasRect.w >= layout.canvas.width;
+        if (insetsSides) {
+          return {
+            panelId: panel.id,
+            role: panel.role,
+            source: contentSourceCrop(panel, focus ? focus.focus : null, source, insetWidth / canvasRect.h),
+            canvas: canvasRect,
+            fill: 'contain' as const,
+          };
+        }
         return {
           panelId: panel.id,
           role: panel.role,
           source: contentSourceCrop(panel, focus ? focus.focus : null, source, aspect),
           canvas: canvasRect,
-          fill: 'cover',
+          fill: 'cover' as const,
         };
       }
       const crop = hostSourceCrop(panel, clip.zoom, source, aspect, input.hostFraming === null ? null : input.hostFraming.headBox);
@@ -269,6 +314,201 @@ export function buildTimeline(input: {
     cues,
     hook,
     endCard: edit.endCard.enabled ? buildEndCard(input.title, layout, endCardAudio(clips, edit.speed, source.durationSeconds)) : null,
+    stackSplit: null,
+  };
+}
+
+function buildScenesTimeline(input: TimelineInput, layout: ScenesLayoutProfile): Timeline {
+  const { edit, words, source } = input;
+  const fps = layout.canvas.fps;
+  if (input.sceneTrack === null) {
+    throw new Error('Scene analysis is required before composing this short.');
+  }
+  const track = input.sceneTrack;
+  const baseClips = computeSourceClips(edit, words, source.durationSeconds);
+  const sortedCrops = [...edit.crops].sort((left, right) => left.sourceSeconds - right.sourceSeconds);
+  const pieces: ScenePiece[] = [];
+  for (const clip of baseClips) {
+    const overlaps = track.segments.filter(
+      (segment) => Math.min(segment.endSeconds, clip.sourceEnd) - Math.max(segment.startSeconds, clip.sourceStart) > SCENE_EPSILON,
+    );
+    if (overlaps.length === 0) {
+      throw new Error('Scene analysis is required before composing this short.');
+    }
+    const boundaries = new Set<number>([clip.sourceStart, clip.sourceEnd]);
+    for (const segment of overlaps) {
+      if (segment.startSeconds > clip.sourceStart && segment.startSeconds < clip.sourceEnd) {
+        boundaries.add(segment.startSeconds);
+      }
+      if (segment.endSeconds > clip.sourceStart && segment.endSeconds < clip.sourceEnd) {
+        boundaries.add(segment.endSeconds);
+      }
+    }
+    const ordered = [...boundaries].sort((left, right) => left - right);
+    const clipPieces: ScenePiece[] = [];
+    for (let index = 0; index < ordered.length - 1; index += 1) {
+      const pieceStart = ordered[index]!;
+      const pieceEnd = ordered[index + 1]!;
+      const segment = overlaps.find((candidate) => pieceStart >= candidate.startSeconds && pieceStart < candidate.endSeconds);
+      if (!segment) {
+        throw new Error(`Scene track does not cover source ${pieceStart}s of this short.`);
+      }
+      const segmentCrops = sortedCrops.filter(
+        (crop) => crop.sourceSeconds >= segment.startSeconds && crop.sourceSeconds < segment.endSeconds,
+      );
+      const cropTimes = segmentCrops
+        .map((crop) => crop.sourceSeconds)
+        .filter((t) => t > pieceStart && t < pieceEnd);
+      const inner = [pieceStart, ...cropTimes, pieceEnd];
+      for (let sub = 0; sub < inner.length - 1; sub += 1) {
+        const subStart = inner[sub]!;
+        const subEnd = inner[sub + 1]!;
+        let keyframe: CropKeyframe | null = null;
+        for (const crop of segmentCrops) {
+          if (crop.sourceSeconds > subStart) {
+            break;
+          }
+          keyframe = crop;
+        }
+        const override = edit.layout.overrides.find((entry) => entry.sourceSeconds === segment.startSeconds);
+        clipPieces.push({
+          sourceStart: subStart,
+          sourceEnd: subEnd,
+          joinsPrevious: index === 0 ? clip.joinsPrevious : true,
+          segment,
+          focus: keyframe === null ? null : contentFocus(segment, keyframe.focus),
+          composition: override !== undefined ? override.composition : defaultComposition(segment),
+        });
+      }
+    }
+    const merged: ScenePiece[] = [];
+    for (const piece of clipPieces) {
+      const previous = merged[merged.length - 1];
+      if (previous !== undefined && piece.sourceEnd - piece.sourceStart < MIN_SCENE_PIECE_SECONDS) {
+        previous.sourceEnd = piece.sourceEnd;
+        continue;
+      }
+      merged.push(piece);
+    }
+    const leading = merged[0];
+    if (leading !== undefined && merged.length > 1 && leading.sourceEnd - leading.sourceStart < MIN_SCENE_PIECE_SECONDS) {
+      merged.shift();
+      const next = merged[0];
+      if (next !== undefined) {
+        next.sourceStart = leading.sourceStart;
+      }
+    }
+    pieces.push(...merged);
+  }
+  interface Retained {
+    clip: TimelineClip;
+    piece: ScenePiece;
+  }
+  const retained: Retained[] = [];
+  let cumulative = 0;
+  let previousTarget = 0;
+  for (const piece of pieces) {
+    cumulative += piece.sourceEnd - piece.sourceStart;
+    const target = Math.round((cumulative / edit.speed) * fps);
+    const frames = target - previousTarget;
+    if (frames < 1) {
+      continue;
+    }
+    retained.push({
+      clip: {
+        index: retained.length,
+        sourceStart: piece.sourceStart,
+        sourceEnd: piece.sourceEnd,
+        outputStart: previousTarget / fps,
+        outputEnd: target / fps,
+        joinsPrevious: piece.joinsPrevious,
+        zoom: 1,
+        composition: piece.composition,
+        sceneStartSeconds: piece.segment.startSeconds,
+        captionCenterY: 0,
+        panels: [],
+      },
+      piece,
+    });
+    previousTarget = target;
+  }
+  let zoomed = false;
+  for (const [index, entry] of retained.entries()) {
+    if (index > 0 && !entry.clip.joinsPrevious) {
+      zoomed = !zoomed;
+    }
+    entry.clip.zoom = edit.zoom.enabled && zoomed ? edit.zoom.strength : 1;
+  }
+  const outputBySegment = new Map<number, number>();
+  for (const entry of retained) {
+    const key = entry.piece.segment.startSeconds;
+    outputBySegment.set(key, (outputBySegment.get(key) ?? 0) + entry.clip.outputEnd - entry.clip.outputStart);
+  }
+  const flashSegments = new Set<number>();
+  for (const [key, total] of outputBySegment) {
+    if (total < FLASH_OUTPUT_SECONDS) {
+      flashSegments.add(key);
+    }
+  }
+  const stackSpans = retained
+    .filter((entry) => !flashSegments.has(entry.piece.segment.startSeconds) && entry.clip.composition === 'stack')
+    .map((entry) => ({
+      segment: entry.piece.segment,
+      composition: 'stack' as const,
+      focus: entry.piece.focus,
+      outputSeconds: entry.clip.outputEnd - entry.clip.outputStart,
+      zoom: entry.clip.zoom,
+    }));
+  const split = edit.layout.split ?? chooseStackSplit({ spans: stackSpans, layout, source: { width: source.width, height: source.height } });
+  let lastDisplayed: { composition: Composition; panels: CompositionPlacement[]; captionCenterY: number } | null = null;
+  for (const entry of retained) {
+    const clip = entry.clip;
+    if (flashSegments.has(entry.piece.segment.startSeconds)) {
+      if (lastDisplayed !== null) {
+        clip.composition = lastDisplayed.composition;
+        clip.panels = lastDisplayed.panels.map((panel) => ({ ...panel }));
+        clip.captionCenterY = lastDisplayed.captionCenterY;
+      } else {
+        clip.panels = compositionPanels({
+          segment: entry.piece.segment,
+          composition: entry.piece.composition,
+          focus: entry.piece.focus,
+          source,
+          layout,
+          split,
+          zoom: clip.zoom,
+        });
+        clip.captionCenterY = captionY(layout, clip.composition, split);
+      }
+      continue;
+    }
+    clip.panels = compositionPanels({
+      segment: entry.piece.segment,
+      composition: entry.piece.composition,
+      focus: entry.piece.focus,
+      source,
+      layout,
+      split,
+      zoom: clip.zoom,
+    });
+    clip.captionCenterY = captionY(layout, clip.composition, split);
+    lastDisplayed = { composition: entry.piece.composition, panels: clip.panels, captionCenterY: clip.captionCenterY };
+  }
+  const clips = retained.map((entry) => entry.clip);
+  const cues: CaptionCue[] = [];
+  if (edit.captions.enabled) {
+    buildCaptionCues(cues, clips, edit, words, layout);
+  }
+  const hook = fitHook(edit, layout);
+  return {
+    canvas: { width: layout.canvas.width, height: layout.canvas.height, fps },
+    speed: edit.speed,
+    durationSeconds: previousTarget / fps,
+    clips,
+    cues,
+    hook,
+    endCard: edit.endCard.enabled ? buildEndCard(input.title, layout, endCardAudio(clips, edit.speed, source.durationSeconds)) : null,
+    stackSplit: split,
   };
 }
 
@@ -296,7 +536,14 @@ function fitHook(edit: ShortEdit, layout: LayoutProfile): TimelineHook | null {
       break;
     }
   }
-  return { lines, canvas, sizePx: chosenSize };
+  const safeTopPx = layout.safeArea.top * layout.canvas.height;
+  const blockHeight = lines.length * 1.12 * chosenSize;
+  return {
+    lines,
+    canvas,
+    sizePx: chosenSize,
+    textCenterY: Math.round(Math.max((Math.max(canvas.y, safeTopPx) + canvas.y + canvas.h) / 2, safeTopPx + blockHeight / 2)),
+  };
 }
 
 function endCardAudio(clips: TimelineClip[], speed: number, sourceDurationSeconds: number): TimelineEndCardAudio | null {
@@ -350,7 +597,7 @@ function buildEndCard(title: string, layout: LayoutProfile, audio: TimelineEndCa
     link: {
       text: END_CARD_LINK_TEXT,
       centerX: width / 2,
-      centerY: END_CARD_LINK_CENTER_Y,
+      centerY: Math.round(Math.min(1700, layout.canvas.height * (1 - layout.safeArea.bottom) - 2 * END_CARD_LINK_SIZE_PX)),
       sizePx: END_CARD_LINK_SIZE_PX,
     },
     textOutlinePx: END_CARD_TEXT_OUTLINE_PX,
@@ -392,6 +639,7 @@ function buildCaptionCues(cues: CaptionCue[], clips: TimelineClip[], edit: Short
       lines,
       outputStart: current[0]!.outputStart,
       outputEnd: current[current.length - 1]!.outputEnd,
+      centerY: 0,
     });
     current = [];
   };
@@ -418,6 +666,13 @@ function buildCaptionCues(cues: CaptionCue[], clips: TimelineClip[], edit: Short
     const lastWord = lastLine[lastLine.length - 1]!;
     cue.outputEnd = Math.min(lastWord.outputEnd + CUE_TAIL_SECONDS, next ? next.outputStart : Number.POSITIVE_INFINITY);
   }
+  for (const cue of cues) {
+    const clip = clipForOutput(clips, cue.outputStart);
+    if (!clip) {
+      throw new Error(`No timeline clip covers output ${cue.outputStart}s.`);
+    }
+    cue.centerY = clip.captionCenterY;
+  }
 }
 
 function clipForTime(clips: TimelineClip[], timeSeconds: number): TimelineClip | undefined {
@@ -431,8 +686,22 @@ function clipForTime(clips: TimelineClip[], timeSeconds: number): TimelineClip |
   return result;
 }
 
+function clipForOutput(clips: TimelineClip[], outputSeconds: number): TimelineClip | undefined {
+  let result: TimelineClip | undefined;
+  for (const clip of clips) {
+    if (clip.outputStart > outputSeconds) {
+      break;
+    }
+    result = clip;
+  }
+  return result;
+}
+
 function mapToOutput(clip: TimelineClip, timeSeconds: number, speed: number): number {
-  return Math.min(clip.outputEnd, Math.max(clip.outputStart, clip.outputStart + (timeSeconds - clip.sourceStart) / speed));
+  const offset = clip.sceneStartSeconds === null
+    ? (timeSeconds - clip.sourceStart) / speed
+    : (timeSeconds - clip.sourceStart) * clipRatio(clip);
+  return Math.min(clip.outputEnd, Math.max(clip.outputStart, clip.outputStart + offset));
 }
 
 const CUE_BREAK_PUNCTUATION = ['.', '!', '?', '…'];
@@ -445,7 +714,10 @@ export function outputToSource(timeline: Timeline, outputSeconds: number): { cli
   const output = Math.min(Math.max(outputSeconds, 0), timeline.durationSeconds);
   for (const clip of timeline.clips) {
     if (output < clip.outputEnd) {
-      return { clipIndex: clip.index, sourceSeconds: clip.sourceStart + (output - clip.outputStart) * timeline.speed };
+      const sourceSeconds = clip.sceneStartSeconds === null
+        ? clip.sourceStart + (output - clip.outputStart) * timeline.speed
+        : clip.sourceStart + (output - clip.outputStart) / clipRatio(clip);
+      return { clipIndex: clip.index, sourceSeconds };
     }
   }
   const last = timeline.clips[timeline.clips.length - 1];
@@ -458,7 +730,9 @@ export function outputToSource(timeline: Timeline, outputSeconds: number): { cli
 export function sourceToOutput(timeline: Timeline, sourceSeconds: number): number | null {
   for (const clip of timeline.clips) {
     if (sourceSeconds >= clip.sourceStart && sourceSeconds < clip.sourceEnd) {
-      return clip.outputStart + (sourceSeconds - clip.sourceStart) / timeline.speed;
+      return clip.sceneStartSeconds === null
+        ? clip.outputStart + (sourceSeconds - clip.sourceStart) / timeline.speed
+        : clip.outputStart + (sourceSeconds - clip.sourceStart) * clipRatio(clip);
     }
   }
   return null;

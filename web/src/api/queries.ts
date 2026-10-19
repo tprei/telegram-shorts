@@ -15,7 +15,7 @@ import type {
   UpdateShortMetaRequest,
   PublishRequest,
 } from '@api';
-import type { CropAnalysisStatus, ExportStatus, JobStatus, PublicationStatus } from '@domain/model';
+import type { CropAnalysisStatus, ExportStatus, JobStatus, PublicationStatus, SceneAnalysisStatus } from '@domain/model';
 import * as api from './client';
 
 export const queryKeys = {
@@ -37,6 +37,10 @@ const ACTIVE_JOB_STATUSES: Partial<Record<JobStatus, true>> = {
   downloading: true,
   transcribing: true,
   planning: true,
+};
+const ACTIVE_SCENE_STATUSES: Partial<Record<SceneAnalysisStatus, true>> = {
+  queued: true,
+  running: true,
 };
 const ACTIVE_CROP_STATUSES: Partial<Record<CropAnalysisStatus, true>> = {
   queued: true,
@@ -92,7 +96,10 @@ export function useJobQuery(jobId: string, options: { enabled?: boolean } = {}) 
       const job = query.state.data;
       if (job === undefined) return false;
       const shortActive = job.shorts.some(shortIsActive);
-      return ACTIVE_JOB_STATUSES[job.status] === true || shortActive ? POLL_INTERVAL_MS : false;
+      const sceneActive = ACTIVE_SCENE_STATUSES[job.sceneAnalysis.status] === true;
+      return ACTIVE_JOB_STATUSES[job.status] === true || shortActive || sceneActive
+        ? POLL_INTERVAL_MS
+        : false;
     },
   });
 }
@@ -121,7 +128,8 @@ export function useShortQuery(shortId: string, options: { enabled?: boolean } = 
         (exportRecord) => ACTIVE_EXPORT_STATUSES[exportRecord.status] === true,
       );
       const cropActive = ACTIVE_CROP_STATUSES[detail.short.cropAnalysis] === true;
-      return cropActive || exportActive || publicationActive ? POLL_INTERVAL_MS : false;
+      const sceneActive = ACTIVE_SCENE_STATUSES[detail.job.sceneAnalysis.status] === true;
+      return cropActive || exportActive || publicationActive || sceneActive ? POLL_INTERVAL_MS : false;
     },
   });
 }
@@ -329,6 +337,21 @@ export function useChooseSpeakerMutation(jobId: string) {
 
 export function useReplanMutation(jobId: string) {
   return useJobDetailMutation<void>(jobId, () => api.replan(jobId));
+}
+
+export function useAnalyzeScenesMutation(jobId: string) {
+  const queryClient = useQueryClient();
+  return useMutation<JobDetailDto, Error, void>({
+    mutationFn: () => api.analyzeScenes(jobId),
+    onSuccess: (job) => {
+      queryClient.setQueryData(queryKeys.job(jobId), job);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.job(jobId) });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.jobs });
+      for (const short of job.shorts) {
+        void queryClient.invalidateQueries({ queryKey: queryKeys.short(short.id) });
+      }
+    },
+  });
 }
 
 export function useCreateManualShortMutation(jobId: string) {

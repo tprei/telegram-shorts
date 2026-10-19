@@ -156,7 +156,12 @@ class FakeStudioApi implements StudioApi {
     return jobDetailDto(jobId);
   }
 
-  createManualShort(jobId: string, request: CreateManualShortRequest): ShortDetailDto {
+  analyzeScenes(jobId: string): JobDetailDto {
+    this.note('analyzeScenes', [jobId]);
+    return jobDetailDto(jobId);
+  }
+
+  async createManualShort(jobId: string, request: CreateManualShortRequest): Promise<ShortDetailDto> {
     this.note('createManualShort', [jobId, request]);
     return shortDetailDto(jobId, 's1');
   }
@@ -216,7 +221,7 @@ class FakeStudioApi implements StudioApi {
     return [publicationDto(exportId)];
   }
 
-  listScheduledPosts(): ScheduledPostDto[] {
+  async listScheduledPosts(): Promise<ScheduledPostDto[]> {
     this.note('listScheduledPosts', []);
     return [scheduledPostDto()];
   }
@@ -257,7 +262,7 @@ class FakeAutopilotApi implements AutopilotApi {
 }
 
 function creatorDto(id: string, isDefault = false): CreatorDto {
-  return { id, displayName: `Creator ${id}`, isDefault };
+  return { id, displayName: `Creator ${id}`, isDefault, accountId: 'cortes_do_boni' };
 }
 
 function jobSummaryDto(id: string): JobSummaryDto {
@@ -271,6 +276,7 @@ function jobSummaryDto(id: string): JobSummaryDto {
     error: null,
     creator: { id: 'filipe_boni', displayName: 'Filipe Boni' },
     shortCounts: { active: 2, rejected: 1, exported: 1 },
+    sceneAnalysis: { status: 'none', error: null },
     createdAt: '2026-10-16T10:00:00.000Z',
     updatedAt: '2026-10-16T11:00:00.000Z',
   };
@@ -342,8 +348,17 @@ function shortDetailDto(jobId: string, id: string): ShortDetailDto {
       media: { width: 1920, height: 1080, fps: 60, durationSeconds: 180, videoUrl: `/media/jobs/${jobId}/source` },
       layout: layoutProfile,
       hostFraming: null,
+      sceneTrack: null,
+      sceneAnalysis: { status: 'none', error: null },
       fontUrl: '/fonts/Montserrat-ExtraBold.ttf',
-      schedule: { timeZone: 'America/Sao_Paulo', slots: ['12:00', '19:00', '21:00'] },
+      account: {
+        id: 'cortes_do_boni',
+        displayName: 'Cortes do Boni',
+        schedule: { timeZone: 'America/Sao_Paulo', slots: ['12:00', '19:00', '21:00'] },
+        platforms: ['instagram', 'tiktok', 'youtube_shorts'],
+        connected: true,
+      },
+      takenSlots: [],
     },
     exports: [exportDto(id)],
     publications: [],
@@ -379,6 +394,7 @@ function scheduledPostDto(): ScheduledPostDto {
     status: 'scheduled',
     scheduledFor: '2026-10-25T19:00:00.000Z',
     provider: 'mallary',
+    accountId: 'cortes_do_boni',
     timeZone: 'America/Sao_Paulo',
   };
 }
@@ -425,16 +441,16 @@ function makeEdit(): ShortEdit {
     crops: [],
     zoom: { enabled: true, strength: 1.12 },
     endCard: { enabled: false },
+    layout: { split: null, overrides: [] },
   };
 }
 
 const layoutProfile: LayoutProfile = {
-  version: 2,
-  creatorId: 'filipe_boni',
+  version: 3,
+  strategy: 'fixed',
   layoutId: 'screen-top-host-bottom-v2',
   canvas: { width: 1080, height: 1920, fps: 30 },
   background: '#101010',
-  defaultSpeed: 1.1,
   font: { family: 'Montserrat ExtraBold', file: 'assets/fonts/Montserrat-ExtraBold.ttf', assSizeScale: 1.562 },
   panels: [
     { id: 'screen', role: 'content', sourceRect: { x: 0, y: 0, w: 0.632, h: 1 }, canvasRect: { x: 0, y: 0.1146, w: 1, h: 0.4375 } },
@@ -462,6 +478,7 @@ const layoutProfile: LayoutProfile = {
     maxLines: 2,
     centerY: 0.5521,
   },
+  safeArea: { top: 0.135, bottom: 0.17, side: 0.055 },
 };
 
 async function bytesOf(res: Response): Promise<Uint8Array> {
@@ -703,6 +720,7 @@ test('every StudioApi route dispatches with parsed bodies', async () => {
     ['/api/shorts/s1/copy', { method: 'PUT', body: JSON.stringify({ copy: { line1: 'First line', line2: 'Second line', hashtags: ['#shorts'] } }) }, 'updatePublishCopy', ['s1', { copy: { line1: 'First line', line2: 'Second line', hashtags: ['#shorts'] } }]],
     ['/api/exports/e1/publish', { method: 'POST', body: JSON.stringify({ platforms: ['instagram'], force: false, scheduledAt: null }) }, 'publish', ['e1', { platforms: ['instagram'], force: false, scheduledAt: null }]],
     ['/api/jobs/j1/host-framing/analyze', { method: 'POST' }, 'analyzeHostFraming', ['j1']],
+    ['/api/jobs/j1/scenes/analyze', { method: 'POST' }, 'analyzeScenes', ['j1']],
     ['/api/schedule', {}, 'listScheduledPosts', []],
     ['/api/publications/pub_9/cancel', { method: 'POST' }, 'cancelPublication', ['pub_9']],
   ];
@@ -866,4 +884,54 @@ test('POST /api/publications/:publicationId/cancel returns the short detail', as
   assert.equal(res.status, 200);
   assert.deepEqual(await res.json(), shortDetailDto('j1', 's1'));
   assert.deepEqual(api.calls, [{ method: 'cancelPublication', args: ['pub_9'] }]);
+});
+
+test('scene edits and rerun errors are visible through HTTP', async () => {
+  const api = new FakeStudioApi();
+  const app = buildApp({ api });
+
+  const validEdit: ShortEdit = {
+    ...makeEdit(),
+    layout: {
+      split: 0.5,
+      overrides: [{ sourceSeconds: 10.0, composition: 'content' }],
+    },
+  };
+  const saveRes = await app.request('/api/shorts/s1/edit', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ edit: validEdit, baseRevision: 1 }),
+  });
+  assert.equal(saveRes.status, 200);
+  const saveBody: ShortDetailDto = await saveRes.json();
+  assert.equal(saveBody.job.id, 'j1');
+  assert.equal(saveBody.job.account?.id, 'cortes_do_boni');
+
+  const badEdit = {
+    ...makeEdit(),
+    layout: {
+      split: 0.85,
+      overrides: [],
+    },
+  };
+  const badRes = await app.request('/api/shorts/s1/edit', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ edit: badEdit, baseRevision: 1 }),
+  });
+  assert.equal(badRes.status, 400);
+  const badBody: { error: string; code: string } = await badRes.json();
+  assert.equal(badBody.code, 'invalid');
+
+  api.error = new StudioError('conflict', 'Job has no media to analyze.');
+  const rerunErrRes = await app.request('/api/jobs/j1/scenes/analyze', { method: 'POST' });
+  assert.equal(rerunErrRes.status, 409);
+  assert.deepEqual(await rerunErrRes.json(), { error: 'Job has no media to analyze.', code: 'conflict' });
+
+  api.error = null;
+  const rerunOkRes = await app.request('/api/jobs/j1/scenes/analyze', { method: 'POST' });
+  assert.equal(rerunOkRes.status, 200);
+  const rerunBody: JobDetailDto = await rerunOkRes.json();
+  assert.equal(rerunBody.id, 'j1');
+  assert.equal(rerunBody.sceneAnalysis.status, 'none');
 });
