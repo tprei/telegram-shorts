@@ -22,7 +22,7 @@
     },
     {
       "id": "mix",
-      "displayName": "Mix",
+      "displayName": "Patriota Cortes",
       "schedule": {
         "timeZone": "America/Sao_Paulo",
         "slots": [
@@ -32,10 +32,9 @@
         ]
       },
       "platforms": [
-        "instagram",
-        "tiktok"
+        "instagram"
       ],
-      "mallaryProfileId": null,
+      "mallaryProfileId": "mJjNF5k6f9h",
       "buffer": false
     }
   ],
@@ -96,8 +95,7 @@
         "channelUrl": "https://www.youtube.com/channel/UC3gQ9lIiPQj7frT5CE5QyRA/videos",
         "shortsPerVideo": 2,
         "platforms": [
-          "instagram",
-          "tiktok"
+          "instagram"
         ],
         "reviewWindowHours": 3,
         "bookingHorizonHours": 24,
@@ -123,8 +121,7 @@
         "channelUrl": "https://www.youtube.com/channel/UCOKSOW5uJHdW7Edz37mvAFw/videos",
         "shortsPerVideo": 2,
         "platforms": [
-          "instagram",
-          "tiktok"
+          "instagram"
         ],
         "reviewWindowHours": 3,
         "bookingHorizonHours": 24,
@@ -150,8 +147,7 @@
         "channelUrl": "https://www.youtube.com/channel/UCqbz_4hrf2D58UFBOleuFnQ/videos",
         "shortsPerVideo": 2,
         "platforms": [
-          "instagram",
-          "tiktok"
+          "instagram"
         ],
         "reviewWindowHours": 3,
         "bookingHorizonHours": 24,
@@ -177,8 +173,7 @@
         "channelUrl": "https://www.youtube.com/channel/UCRLEkZpNRoZQBG8kUTBD8vQ/videos",
         "shortsPerVideo": 2,
         "platforms": [
-          "instagram",
-          "tiktok"
+          "instagram"
         ],
         "reviewWindowHours": 3,
         "bookingHorizonHours": 24,

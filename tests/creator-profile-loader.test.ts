@@ -106,7 +106,8 @@ test('seven creators share reusable v3 styles and resolve two accounts', async (
   assert.ok(mixAccount);
   assert.equal(mixAccount.id, 'mix');
   assert.equal(mixAccount.buffer, false);
-  assert.equal(mixAccount.mallaryProfileId, null);
+  assert.equal(mixAccount.mallaryProfileId, 'mJjNF5k6f9h');
+  assert.deepEqual(mixAccount.platforms, ['instagram']);
 
   for (const creatorId of expectedIds) {
     const resolved = await repo.resolveCreatorProfile({ requestedId: creatorId });
