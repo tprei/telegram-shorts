@@ -1,7 +1,9 @@
 import { stat, writeFile } from 'node:fs/promises';
 import { join, relative } from 'node:path';
-import type { LayoutProfile } from '../domain/layout.js';
+import sharp from 'sharp';
+import type { LayoutProfile, PxRect } from '../domain/layout.js';
 import { containForeground } from '../domain/composition.js';
+import type { CoverBrand } from '../domain/model.js';
 import type { Timeline, TimelineClip, TimelineEndCard, TimelinePanelPlacement } from '../domain/timeline.js';
 import { HOST_BLUR_DARKEN, HOST_BLUR_SIGMA_PX } from '../domain/timeline.js';
 import { buildEndCardAss, buildExportAss } from './ass.js';
@@ -339,6 +341,125 @@ export async function renderCoverImage(input: { imagePath: string; outputPath: s
 
 export function buildSubtitlesFilterArg(assPath: string, fontsDir: string): string {
   return `ass=filename=${escapeFiltergraphValue(assPath)}:fontsdir=${escapeFiltergraphValue(fontsDir)}`;
+}
+
+const BRAND_CANVAS_REFERENCE_WIDTH = 1080;
+const BRAND_FONT_FAMILY = 'Montserrat ExtraBold';
+const BRAND_TITLE_SIZE_PX = 64;
+const BRAND_TITLE_WRAP_MARGIN_PX = 140;
+const BRAND_TITLE_PADDING_PX = 36;
+const BRAND_BAND_TOP_PX = 380;
+const BRAND_BAND_PADDING_PX = 72;
+const BRAND_FLAG_TOP_PX = 276;
+const BRAND_FLAG_WIDTH_PX = 120;
+const BRAND_FLAG_HEIGHT_PX = 84;
+const BRAND_FIRST_STRIPE_HEIGHT_PX = 18;
+const BRAND_STRIPE_HEIGHT_PX = 12;
+const BRAND_FOREGROUND_PORTRAIT_WIDTH_PX = 720;
+const BRAND_FOREGROUND_WIDTH_PX = 1000;
+const BRAND_FOREGROUND_BORDER_PX = 8;
+const BRAND_FOREGROUND_TOP_GAP_PX = 40;
+const BRAND_FOREGROUND_BOTTOM_LIMIT_PX = 1660;
+const FLAG_GREEN = '#009C3B';
+const FLAG_YELLOW = '#FFDF00';
+const FLAG_BLUE = '#002776';
+
+export async function renderBrandedCover(input: {
+  framePath: string;
+  crop: PxRect;
+  portrait: boolean;
+  title: string;
+  brand: CoverBrand;
+  fontFile: string;
+  outputPath: string;
+  width: number;
+  height: number;
+}): Promise<void> {
+  await ensureParent(input.outputPath);
+  const scale = input.width / BRAND_CANVAS_REFERENCE_WIDTH;
+  const px = (value: number): number => Math.round(value * scale);
+  const background = await sharp(input.framePath)
+    .resize(input.width, input.height, { fit: 'cover' })
+    .blur(28)
+    .modulate({ brightness: 0.45 })
+    .toBuffer();
+  const text = await sharp({
+    text: {
+      text: `<span foreground="${input.brand.textColor}">${escapePangoMarkup(input.title.toUpperCase())}</span>`,
+      font: `${BRAND_FONT_FAMILY} ${px(BRAND_TITLE_SIZE_PX)}`,
+      fontfile: input.fontFile,
+      width: input.width - px(BRAND_TITLE_WRAP_MARGIN_PX),
+      align: 'center',
+      rgba: true,
+      dpi: 72,
+      spacing: 6,
+      wrap: 'word',
+    },
+  }).png().toBuffer();
+  const textMeta = await sharp(text).metadata();
+  const textWidth = requireDefined(textMeta.width, 'sharp text metadata has no width');
+  const textHeight = requireDefined(textMeta.height, 'sharp text metadata has no height');
+  const bandTop = px(BRAND_BAND_TOP_PX);
+  const bandHeight = textHeight + px(BRAND_BAND_PADDING_PX);
+  const stripes: string[] = [];
+  let stripeY = bandTop + bandHeight;
+  for (const [index, color] of input.brand.stripeColors.entries()) {
+    const height = index === 0 ? px(BRAND_FIRST_STRIPE_HEIGHT_PX) : px(BRAND_STRIPE_HEIGHT_PX);
+    stripes.push(`<rect x="0" y="${stripeY}" width="${input.width}" height="${height}" fill="${color}"/>`);
+    stripeY += height;
+  }
+  const stripesBottom = stripeY;
+  const flagWidth = px(BRAND_FLAG_WIDTH_PX);
+  const flagHeight = px(BRAND_FLAG_HEIGHT_PX);
+  const flag = `<g transform="translate(${Math.round((input.width - flagWidth) / 2)},${px(BRAND_FLAG_TOP_PX)}) scale(${scale})"><rect width="${BRAND_FLAG_WIDTH_PX}" height="${BRAND_FLAG_HEIGHT_PX}" rx="6" fill="${FLAG_GREEN}" stroke="#FFFFFF" stroke-width="3"/><polygon points="60,8 112,42 60,76 8,42" fill="${FLAG_YELLOW}"/><circle cx="60" cy="42" r="20" fill="${FLAG_BLUE}"/><path d="M41,38 Q60,32 79,46" stroke="#FFFFFF" stroke-width="4" fill="none"/></g>`;
+  const overlay = `<svg width="${input.width}" height="${input.height}" xmlns="http://www.w3.org/2000/svg"><rect x="0" y="${bandTop}" width="${input.width}" height="${bandHeight}" fill="${input.brand.bandColor}"/>${stripes.join('')}${flag}</svg>`;
+  const border = px(BRAND_FOREGROUND_BORDER_PX);
+  const centerTop = stripesBottom + px(BRAND_FOREGROUND_TOP_GAP_PX);
+  const centerBottom = px(BRAND_FOREGROUND_BOTTOM_LIMIT_PX);
+  const availableHeight = centerBottom - centerTop;
+  let displayWidth = px(input.portrait ? BRAND_FOREGROUND_PORTRAIT_WIDTH_PX : BRAND_FOREGROUND_WIDTH_PX);
+  let displayHeight = (displayWidth * input.crop.h) / input.crop.w;
+  if (displayHeight + 2 * border > availableHeight) {
+    displayHeight = availableHeight - 2 * border;
+    displayWidth = (displayHeight * input.crop.w) / input.crop.h;
+  }
+  const foreground = await sharp(input.framePath)
+    .extract({ left: input.crop.x, top: input.crop.y, width: input.crop.w, height: input.crop.h })
+    .resize(Math.max(2, Math.round(displayWidth - 2 * border)), Math.max(2, Math.round(displayHeight - 2 * border)), { fit: 'cover' })
+    .extend({ top: border, bottom: border, left: border, right: border, background: input.brand.accentColor })
+    .png().toBuffer();
+  const foregroundMeta = await sharp(foreground).metadata();
+  const foregroundWidth = requireDefined(foregroundMeta.width, 'sharp foreground metadata has no width');
+  const foregroundHeight = requireDefined(foregroundMeta.height, 'sharp foreground metadata has no height');
+  await sharp(background)
+    .composite([
+      { input: Buffer.from(overlay), left: 0, top: 0 },
+      { input: text, left: Math.round((input.width - textWidth) / 2), top: bandTop + px(BRAND_TITLE_PADDING_PX) },
+      { input: foreground, left: Math.round((input.width - foregroundWidth) / 2), top: Math.round(centerTop + (availableHeight - foregroundHeight) / 2) },
+    ])
+    .jpeg({ quality: 88 })
+    .toFile(input.outputPath);
+  try {
+    await stat(input.outputPath);
+  } catch {
+    throw new Error(`sharp wrote no branded cover to ${input.outputPath}`);
+  }
+}
+
+function requireDefined<T>(value: T | undefined, message: string): T {
+  if (value === undefined) {
+    throw new Error(message);
+  }
+  return value;
+}
+
+function escapePangoMarkup(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/'/g, '&#39;')
+    .replace(/"/g, '&quot;');
 }
 
 function escapeFiltergraphValue(value: string): string {

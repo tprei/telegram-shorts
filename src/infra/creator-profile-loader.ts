@@ -6,7 +6,7 @@ import { EDIT_LIMITS } from '../domain/edit.js';
 import type { LayoutProfile } from '../domain/layout.js';
 import type { CreatorProfile, CreatorProfileManifest, PublishingAccount, ShortVideoPlatform } from '../domain/model.js';
 import { SCHEDULE_LIMITS } from '../domain/schedule.js';
-import { loadLayoutProfile } from './layout.js';
+import { loadLayoutProfile, HexColorSchema } from './layout.js';
 import { assertPublicYouTubeUrl } from './youtube.js';
 
 const SLOT_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -65,6 +65,14 @@ const CreatorAutopilotConfigSchema = z
   })
   .refine((config) => config.bookingHorizonHours > config.reviewWindowHours, { message: 'bookingHorizonHours must be greater than reviewWindowHours' });
 
+const CoverBrandSchema = z.strictObject({
+  bandColor: HexColorSchema,
+  textColor: HexColorSchema,
+  accentColor: HexColorSchema,
+  stripeColors: z.array(HexColorSchema).max(3),
+  emblem: z.enum(['brazil_flag']).nullable(),
+});
+
 const PublishingAccountSchema = z.strictObject({
   id: z.string().min(1),
   displayName: z.string().min(1),
@@ -73,6 +81,7 @@ const PublishingAccountSchema = z.strictObject({
     .refine((p) => new Set(p).size === p.length, { message: 'Duplicate account platform' }),
   mallaryProfileId: z.string().min(1).nullable(),
   buffer: z.boolean(),
+  cover: CoverBrandSchema.nullable(),
 });
 
 const CreatorProfileSchema = z.strictObject({

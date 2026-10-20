@@ -5,10 +5,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { buildEndCardAss, buildExportAss } from '../src/infra/ass.js';
-import { buildSubtitlesFilterArg, extractFrame, renderCoverImage, renderShortExport } from '../src/infra/render.js';
+import { buildSubtitlesFilterArg, extractFrame, renderBrandedCover, renderCoverImage, renderShortExport } from '../src/infra/render.js';
 import { runProcess } from '../src/infra/process.js';
 import { buildTimeline } from '../src/domain/timeline.js';
-import type { SceneSegment } from '../src/domain/model.js';
+import type { CoverBrand, SceneSegment } from '../src/domain/model.js';
 import type { LayoutProfile, PxRect } from '../src/domain/layout.js';
 import type { CaptionCue, CaptionWord, ShortEdit, Timeline, TimelineEndCard, TimelinePanelPlacement, TranscriptWord } from '../src/domain/timeline.js';
 
@@ -328,6 +328,84 @@ test('cover image centers the sharp thumbnail over a blurred full-bleed copy', {
   assert.ok(foregroundRight.b > 200 && foregroundRight.r < 60, `foreground right ${JSON.stringify(foregroundRight)}`);
   const backgroundEdge = pixel(530, 200);
   assert.ok(backgroundEdge.r > 60 && backgroundEdge.b > 60, `background is blurred across the edge ${JSON.stringify(backgroundEdge)}`);
+});
+
+test('branded cover draws band, stripes, title and the accent-bordered foreground', { timeout: 60_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'render-brand-'));
+  const framePath = join(dir, 'frame.jpg');
+  await runProcess('ffmpeg', ['-y', '-f', 'lavfi', '-i', 'color=c=red:s=1280x720,format=rgb24', '-frames:v', '1', framePath]);
+  const brand: CoverBrand = {
+    bandColor: '#009C3B',
+    textColor: '#FFFFFF',
+    accentColor: '#FFDF00',
+    stripeColors: ['#FFDF00', '#002776'],
+    emblem: 'brazil_flag',
+  };
+  const coverPath = join(dir, 'cover.jpg');
+  await renderBrandedCover({
+    framePath,
+    crop: { x: 0, y: 0, w: 1280, h: 720 },
+    portrait: false,
+    title: 'Banco Master infla o Flow',
+    brand,
+    fontFile: join(import.meta.dirname, '..', 'assets', 'fonts', 'Montserrat-ExtraBold.ttf'),
+    outputPath: coverPath,
+    width: 1080,
+    height: 1920,
+  });
+  const rawPath = join(dir, 'cover.rgb');
+  await runProcess('ffmpeg', ['-y', '-i', coverPath, '-f', 'rawvideo', '-pix_fmt', 'rgb24', rawPath]);
+  const pixels = await readFile(rawPath);
+  assert.equal(pixels.length, 1080 * 1920 * 3);
+  const pixel = (x: number, y: number): { r: number; g: number; b: number } => ({
+    r: pixels[(y * 1080 + x) * 3]!,
+    g: pixels[(y * 1080 + x) * 3 + 1]!,
+    b: pixels[(y * 1080 + x) * 3 + 2]!,
+  });
+  const isBandGreen = (p: { r: number; g: number; b: number }): boolean => p.r < 100 && p.g > 110 && p.b < 110;
+  const isStripeYellow = (p: { r: number; g: number; b: number }): boolean => p.r > 190 && p.g > 150 && p.b < 110;
+  const isStripeBlue = (p: { r: number; g: number; b: number }): boolean => p.r < 70 && p.g < 90 && p.b > 70;
+  const bandSample = pixel(20, 430);
+  assert.ok(isBandGreen(bandSample), `band background ${JSON.stringify(bandSample)} is not the band color`);
+
+  let whiteTextPixels = 0;
+  for (let y = 380; y < 720; y += 1) {
+    for (let x = 70; x < 1010; x += 4) {
+      const p = pixel(x, y);
+      if (p.r > 180 && p.g > 180 && p.b > 180) {
+        whiteTextPixels += 1;
+      }
+    }
+  }
+  assert.ok(whiteTextPixels > 50, `band holds no text (${whiteTextPixels} white pixels)`);
+
+  let bandBottom = -1;
+  for (let y = 420; y < 900; y += 1) {
+    if (!isBandGreen(pixel(20, y))) {
+      bandBottom = y;
+      break;
+    }
+  }
+  assert.ok(bandBottom > 380, `band bottom ${bandBottom} not found below the band top`);
+  const firstStripe = pixel(20, bandBottom + 9);
+  assert.ok(isStripeYellow(firstStripe), `first stripe ${JSON.stringify(firstStripe)} is not yellow`);
+  const secondStripe = pixel(20, bandBottom + 24);
+  assert.ok(isStripeBlue(secondStripe), `second stripe ${JSON.stringify(secondStripe)} is not blue`);
+
+  const stripesBottom = bandBottom + 18 + 12;
+  const centerTop = stripesBottom + 40;
+  let borderY = -1;
+  for (let y = centerTop; y < 1660; y += 1) {
+    if (isStripeYellow(pixel(44, y))) {
+      borderY = y;
+      break;
+    }
+  }
+  assert.ok(borderY >= centerTop, `accent border ${borderY} not found below the stripes`);
+  const borderWidth = pixel(44, borderY + 8);
+  assert.ok(isStripeYellow(borderWidth), `accent border ${JSON.stringify(borderWidth)} is not solid below its top edge`);
+  const outsideForeground = pixel(20, Math.min(1650, borderY + 100));
+  assert.ok(!isStripeYellow(outsideForeground), 'accent color leaks outside the foreground border');
 });
 
 test('extractFrame throws when ffmpeg exits without writing the frame', { timeout: 60_000 }, async () => {

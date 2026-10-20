@@ -260,6 +260,16 @@ export interface PostingSchedule {
   slots: string[];
 }
 
+export type CoverEmblem = 'brazil_flag';
+
+export interface CoverBrand {
+  bandColor: string;
+  textColor: string;
+  accentColor: string;
+  stripeColors: string[];
+  emblem: CoverEmblem | null;
+}
+
 export interface PublishingAccount {
   id: string;
   displayName: string;
@@ -267,6 +277,7 @@ export interface PublishingAccount {
   platforms: ShortVideoPlatform[];
   mallaryProfileId: string | null;
   buffer: boolean;
+  cover: CoverBrand | null;
 }
 
 export interface CreatorSceneConfig {

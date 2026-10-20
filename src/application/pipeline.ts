@@ -1,15 +1,16 @@
 import { mkdir, writeFile } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { z } from 'zod';
 import { createInitialEdit, keptWordIndices, normalizeSceneEdit, replaceAutoCrops, type CropKeyframe, type ShortEdit } from '../domain/edit.js';
 import { publicationStartedAt, QUEUE_LANES, type ExportRecord, type HostFraming, type JobRecord, type PublicationRecord, type PublicationStatus, type PublishingAccount, type QueueLane, type QueueTask, type SceneSegment, type SceneTrack, type ShortRecord, type SourceMedia, type TranscriptWord } from '../domain/model.js';
 import { computeSourceClips, buildTimeline, type SourceClip } from '../domain/timeline.js';
+import { chooseCoverFrame } from '../domain/cover.js';
 import { buildSentences, detectStrongSpeakers } from '../domain/policies.js';
 import { contentPanelOf, hostPanelOf, type ContentPanel } from '../domain/layout.js';
 import { blockContinuesPrevious, blockOnScreenSeconds, buildPlannedShorts, diagnoseCandidatePlan, fallbackSemanticBlocks, materializeSemanticBlocks, semanticBlocksAreUsable, type PlanningPace } from '../domain/semantic.js';
 import { pickPublishingProfile, type CreatorProfileRepository } from '../infra/creator-profile-loader.js';
 import { buildPublishMessage } from '../infra/mallary.js';
-import { extractFrame, renderCoverImage, renderShortExport } from '../infra/render.js';
+import { extractFrame, renderBrandedCover, renderCoverImage, renderShortExport } from '../infra/render.js';
 import { transcribeSource } from '../infra/transcript.js';
 import { analyzeContentCrops, detectHostHead, type AnalyzeContentCropsFunction } from '../infra/vision.js';
 import { documentCropSpans } from '../domain/scene.js';
@@ -599,23 +600,54 @@ export class ShortsPipeline {
   }
 
   private async renderExportCover(job: JobRecord, media: SourceMedia, record: ExportRecord, workDir: string): Promise<string> {
-    let imagePath = media.thumbnailPath;
-    if (imagePath === null) {
-      const firstClip = computeSourceClips(record.edit, job.transcriptWords, media.durationSeconds)[0];
-      if (firstClip === undefined) {
-        throw new Error(`Export ${record.id} has no clips to take a cover frame from.`);
-      }
-      const clipLength = firstClip.sourceEnd - firstClip.sourceStart;
-      imagePath = join(workDir, 'cover-source.jpg');
-      await extractFrame({
-        videoPath: media.videoPath,
-        seconds: firstClip.sourceStart + Math.min(2, Math.max(0.3, clipLength / 3)),
-        width: media.width,
-        outputPath: imagePath,
-      });
-    }
+    const manifest = await this.deps.profiles.getManifest();
+    const brand = pickPublishingProfile(manifest, job.creatorProfileId).account?.cover ?? null;
     const coverPath = join(workDir, 'cover.jpg');
-    await renderCoverImage({ imagePath, outputPath: coverPath, width: record.layoutProfileSnapshot.canvas.width, height: record.layoutProfileSnapshot.canvas.height });
+    if (brand === null) {
+      let imagePath = media.thumbnailPath;
+      if (imagePath === null) {
+        const firstClip = computeSourceClips(record.edit, job.transcriptWords, media.durationSeconds)[0];
+        if (firstClip === undefined) {
+          throw new Error(`Export ${record.id} has no clips to take a cover frame from.`);
+        }
+        const clipLength = firstClip.sourceEnd - firstClip.sourceStart;
+        imagePath = join(workDir, 'cover-source.jpg');
+        await extractFrame({
+          videoPath: media.videoPath,
+          seconds: firstClip.sourceStart + Math.min(2, Math.max(0.3, clipLength / 3)),
+          width: media.width,
+          outputPath: imagePath,
+        });
+      }
+      await renderCoverImage({ imagePath, outputPath: coverPath, width: record.layoutProfileSnapshot.canvas.width, height: record.layoutProfileSnapshot.canvas.height });
+      return coverPath;
+    }
+    const choice = chooseCoverFrame({
+      clips: computeSourceClips(record.edit, job.transcriptWords, media.durationSeconds),
+      layout: record.layoutProfileSnapshot,
+      sceneTrack: record.sceneTrack,
+      hostFraming: record.hostFraming,
+      source: { width: media.width, height: media.height },
+    });
+    const framePath = join(workDir, 'cover-frame.jpg');
+    await extractFrame({
+      videoPath: media.videoPath,
+      seconds: choice.sourceSeconds,
+      width: media.width,
+      outputPath: framePath,
+    });
+    const hookText = record.edit.hook.text.trim();
+    await renderBrandedCover({
+      framePath,
+      crop: choice.crop,
+      portrait: choice.portrait,
+      title: record.edit.hook.enabled && hookText.length > 0 ? hookText : record.title,
+      brand,
+      fontFile: join(this.deps.config.fontsDir, basename(record.layoutProfileSnapshot.font.file)),
+      outputPath: coverPath,
+      width: record.layoutProfileSnapshot.canvas.width,
+      height: record.layoutProfileSnapshot.canvas.height,
+    });
     return coverPath;
   }
 

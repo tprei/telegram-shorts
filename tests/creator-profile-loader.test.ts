@@ -40,6 +40,7 @@ function defaultAccounts(): unknown[] {
       platforms: ['instagram', 'tiktok', 'youtube_shorts'],
       mallaryProfileId: 'S83DPA58Wwx',
       buffer: true,
+      cover: null,
     },
     {
       id: 'mix',
@@ -48,6 +49,7 @@ function defaultAccounts(): unknown[] {
       platforms: ['instagram', 'tiktok'],
       mallaryProfileId: null,
       buffer: false,
+      cover: null,
     },
   ];
 }
@@ -101,6 +103,7 @@ test('seven creators share reusable v3 styles and resolve two accounts', async (
   assert.equal(boniAccount.id, 'cortes_do_boni');
   assert.equal(boniAccount.buffer, true);
   assert.equal(boniAccount.mallaryProfileId, 'S83DPA58Wwx');
+  assert.equal(boniAccount.cover, null);
 
   const mixAccount = manifest.accounts.find((account) => account.id === 'mix');
   assert.ok(mixAccount);
@@ -108,6 +111,13 @@ test('seven creators share reusable v3 styles and resolve two accounts', async (
   assert.equal(mixAccount.buffer, false);
   assert.equal(mixAccount.mallaryProfileId, 'mJjNF5k6f9h');
   assert.deepEqual(mixAccount.platforms, ['instagram']);
+  assert.deepEqual(mixAccount.cover, {
+    bandColor: '#009C3B',
+    textColor: '#FFFFFF',
+    accentColor: '#FFDF00',
+    stripeColors: ['#FFDF00', '#002776'],
+    emblem: 'brazil_flag',
+  });
 
   for (const creatorId of expectedIds) {
     const resolved = await repo.resolveCreatorProfile({ requestedId: creatorId });
@@ -202,6 +212,7 @@ test('invalid account references and duplicate Buffer owners are rejected', asyn
       platforms: ['instagram'],
       mallaryProfileId: 'prof_1',
       buffer: true,
+      cover: null,
     },
     {
       id: 'account_2',
@@ -210,6 +221,7 @@ test('invalid account references and duplicate Buffer owners are rejected', asyn
       platforms: ['instagram'],
       mallaryProfileId: 'prof_2',
       buffer: true,
+      cover: null,
     },
   ];
   const duplicateBuffer = await manifestRepo(t, [creatorEntry({ accountId: 'account_1' })], twoBufferAccounts);
@@ -223,6 +235,7 @@ test('invalid account references and duplicate Buffer owners are rejected', asyn
       platforms: ['instagram'],
       mallaryProfileId: 'same_mallary_id',
       buffer: true,
+      cover: null,
     },
     {
       id: 'account_2',
@@ -231,6 +244,7 @@ test('invalid account references and duplicate Buffer owners are rejected', asyn
       platforms: ['instagram'],
       mallaryProfileId: 'same_mallary_id',
       buffer: false,
+      cover: null,
     },
   ];
   const duplicateMallary = await manifestRepo(t, [creatorEntry({ accountId: 'account_1' })], duplicateMallaryAccounts);
@@ -244,6 +258,7 @@ test('invalid account references and duplicate Buffer owners are rejected', asyn
       platforms: ['instagram'],
       mallaryProfileId: 'p1',
       buffer: false,
+      cover: null,
     },
     {
       id: 'account_1',
@@ -252,6 +267,7 @@ test('invalid account references and duplicate Buffer owners are rejected', asyn
       platforms: ['instagram'],
       mallaryProfileId: 'p2',
       buffer: false,
+      cover: null,
     },
   ];
   const duplicateAccounts = await manifestRepo(t, [creatorEntry({ accountId: 'account_1' })], duplicateAccountIds);
@@ -315,6 +331,7 @@ test('account schedules preserve timezone and spacing validation', async (t) => 
       platforms: ['instagram'],
       mallaryProfileId: null,
       buffer: false,
+      cover: null,
     },
   ];
   const badZone = await manifestRepo(t, [creatorEntry({ accountId: 'account_bad' })], badZoneAccount);
@@ -328,6 +345,7 @@ test('account schedules preserve timezone and spacing validation', async (t) => 
       platforms: ['instagram'],
       mallaryProfileId: null,
       buffer: false,
+      cover: null,
     },
   ];
   const unsorted = await manifestRepo(t, [creatorEntry({ accountId: 'account_unsorted' })], unsortedSlotsAccount);
@@ -341,6 +359,7 @@ test('account schedules preserve timezone and spacing validation', async (t) => 
       platforms: ['instagram'],
       mallaryProfileId: null,
       buffer: false,
+      cover: null,
     },
   ];
   const tooClose = await manifestRepo(t, [creatorEntry({ accountId: 'account_close' })], tooCloseSlotsAccount);
@@ -354,6 +373,7 @@ test('account schedules preserve timezone and spacing validation', async (t) => 
       platforms: ['instagram'],
       mallaryProfileId: null,
       buffer: false,
+      cover: null,
     },
   ];
   const duplicate = await manifestRepo(t, [creatorEntry({ accountId: 'account_dup' })], duplicateSlotsAccount);

@@ -126,6 +126,7 @@ const MIX_ACCOUNT: PublishingAccount = {
   platforms: ['instagram', 'tiktok'],
   mallaryProfileId: null,
   buffer: false,
+  cover: null,
 };
 
 let accountPublicationCounter = 0;

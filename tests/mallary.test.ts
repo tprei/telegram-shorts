@@ -16,6 +16,7 @@ const TEST_ACCOUNT: PublishingAccount = {
   platforms: ['instagram', 'tiktok', 'youtube_shorts'],
   mallaryProfileId: 'test_profile_id',
   buffer: false,
+  cover: null,
 };
 
 interface FakeMallary {
@@ -496,6 +497,7 @@ test('one Mallary client alternates account profile IDs without cross-posting', 
           platforms: ['instagram', 'tiktok', 'youtube_shorts'],
           mallaryProfileId: 'profile_a',
           buffer: false,
+          cover: null,
         };
         const accountB: PublishingAccount = {
           id: 'acc_b',
@@ -504,6 +506,7 @@ test('one Mallary client alternates account profile IDs without cross-posting', 
           platforms: ['instagram', 'tiktok', 'youtube_shorts'],
           mallaryProfileId: 'profile_b',
           buffer: false,
+          cover: null,
         };
 
         await client.publishShortVideo({
@@ -564,6 +567,7 @@ test('disconnected Mallary account fails before media upload', async () => {
     platforms: ['instagram', 'tiktok'],
     mallaryProfileId: null,
     buffer: false,
+    cover: null,
   };
 
   await assert.rejects(

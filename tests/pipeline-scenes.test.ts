@@ -149,6 +149,7 @@ async function makeTestSetup(): Promise<TestSetup> {
         platforms: ['instagram', 'tiktok'],
         mallaryProfileId: 'mix-prof-id',
         buffer: false,
+        cover: null,
       },
     ],
     creators: [

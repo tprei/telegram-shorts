@@ -30,6 +30,7 @@ const ACCOUNT_A: PublishingAccount = {
   platforms: ['instagram', 'tiktok', 'youtube_shorts'],
   mallaryProfileId: 'mallary_a',
   buffer: true,
+  cover: null,
 };
 
 const AUTOPILOT_CONFIG = {
@@ -796,6 +797,7 @@ test('two creators on Mix share slots and Boni books independently', async () =>
     platforms: ['instagram', 'tiktok'],
     mallaryProfileId: 'mix_mallary_id',
     buffer: false,
+    cover: null,
   };
   const boniAccount: PublishingAccount = {
     id: 'cortes_do_boni',
@@ -804,6 +806,7 @@ test('two creators on Mix share slots and Boni books independently', async () =>
     platforms: ['instagram', 'tiktok', 'youtube_shorts'],
     mallaryProfileId: 'boni_mallary_id',
     buffer: true,
+    cover: null,
   };
   const creatorMix1: CreatorProfile = {
     id: 'creator_mix_1',
@@ -902,6 +905,7 @@ test('unconnected account keeps new autopilots off and reports connection reason
     platforms: ['instagram', 'tiktok'],
     mallaryProfileId: null,
     buffer: false,
+    cover: null,
   };
   const mixCreator: CreatorProfile = {
     id: 'creator_mix_unconn',

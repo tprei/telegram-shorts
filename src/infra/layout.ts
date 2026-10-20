@@ -3,7 +3,7 @@ import { resolve } from 'node:path';
 import { z } from 'zod';
 import type { LayoutProfile } from '../domain/layout.js';
 
-const HexColorSchema = z.string().regex(/^#[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?$/, 'Expected #RRGGBB or #RRGGBBAA color');
+export const HexColorSchema = z.string().regex(/^#[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?$/, 'Expected #RRGGBB or #RRGGBBAA color');
 
 const NormPointSchema = z.strictObject({
   x: z.number().min(0).max(1),

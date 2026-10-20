@@ -13,6 +13,7 @@ const BONI_ACCOUNT: PublishingAccount = {
   platforms: ['instagram', 'tiktok', 'youtube_shorts'],
   mallaryProfileId: 'S83DPA58Wwx',
   buffer: true,
+  cover: null,
 };
 
 const MIX_ACCOUNT: PublishingAccount = {
@@ -22,6 +23,7 @@ const MIX_ACCOUNT: PublishingAccount = {
   platforms: ['instagram', 'tiktok'],
   mallaryProfileId: 'mix_mallary_id',
   buffer: false,
+  cover: null,
 };
 
 test('Buffer Instagram reels omit rejected custom video thumbnails', async () => {

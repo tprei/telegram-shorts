@@ -18,7 +18,8 @@
         "tiktok"
       ],
       "mallaryProfileId": "S83DPA58Wwx",
-      "buffer": true
+      "buffer": true,
+      "cover": null
     },
     {
       "id": "mix",
@@ -35,7 +36,17 @@
         "instagram"
       ],
       "mallaryProfileId": "mJjNF5k6f9h",
-      "buffer": false
+      "buffer": false,
+      "cover": {
+        "bandColor": "#009C3B",
+        "textColor": "#FFFFFF",
+        "accentColor": "#FFDF00",
+        "stripeColors": [
+          "#FFDF00",
+          "#002776"
+        ],
+        "emblem": "brazil_flag"
+      }
     }
   ],
   "creators": [

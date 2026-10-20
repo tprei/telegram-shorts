@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -12,7 +12,7 @@ import { mallaryCooldownKey } from '../src/application/platforms.js';
 import { createInitialEdit, type ShortEdit, type WordRange } from '../src/domain/edit.js';
 import { buildSentences } from '../src/domain/policies.js';
 import type { LayoutProfile } from '../src/domain/layout.js';
-import { QUEUE_LANES, type AutopilotVideoRecord, type CreatorProfile, type ExportRecord, type JobRecord, type PublicationRecord, type PublishCopyResponse, type PublishingAccount, type RevisionIntent, type ShortRecord, type TranscriptWord } from '../src/domain/model.js';
+import { QUEUE_LANES, type AutopilotVideoRecord, type CoverBrand, type CreatorProfile, type ExportRecord, type JobRecord, type PublicationRecord, type PublishCopyResponse, type PublishingAccount, type RevisionIntent, type ShortRecord, type TranscriptWord } from '../src/domain/model.js';
 import { zonedDateParts, zonedTimeToUtc } from '../src/domain/schedule.js';
 import { acquireStudioLock } from '../src/infra/studio-lock.js';
 import { ShortsStore } from '../src/infra/db.js';
@@ -35,6 +35,15 @@ const ACCOUNT_A: PublishingAccount = {
   platforms: ['instagram', 'tiktok', 'youtube_shorts'],
   mallaryProfileId: 'mallary_account_a',
   buffer: false,
+  cover: null,
+};
+
+const COVER_BRAND: CoverBrand = {
+  bandColor: '#009C3B',
+  textColor: '#FFFFFF',
+  accentColor: '#FFDF00',
+  stripeColors: ['#FFDF00', '#002776'],
+  emblem: 'brazil_flag',
 };
 
 const ACCOUNT_B: PublishingAccount = {
@@ -44,6 +53,7 @@ const ACCOUNT_B: PublishingAccount = {
   platforms: ['instagram', 'tiktok', 'youtube_shorts'],
   mallaryProfileId: null,
   buffer: false,
+  cover: null,
 };
 
 const CREATOR_A: CreatorProfile = {
@@ -1678,6 +1688,85 @@ test('an export stays ready without a cover when the cover render throws', { tim
     assert.equal(exported.status, 'ready');
     assert.equal(exported.coverPath, null);
     assert.ok(exported.artifactPath);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+async function exportWithCoverManifest(context: TestContext, manifestAccounts: PublishingAccount[]): Promise<string> {
+  await writeFile(join(context.rootDir, 'creator-profiles.json'), JSON.stringify({
+    version: 3,
+    defaultCreatorId: 'creator_a',
+    accounts: manifestAccounts,
+    creators: [CREATOR_A, CREATOR_B],
+  }));
+  const words = transcriptWords().slice(0, 4);
+  const seeded = seedReadyJob(context.store, CREATOR_A, context.rootDir, words);
+  const job = context.store.getJob(seeded.jobId);
+  assert.ok(job?.media);
+  await runProcess('ffmpeg', [
+    '-y',
+    '-f', 'lavfi', '-i', 'color=c=red:s=1920x1080:rate=30',
+    '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
+    '-t', String(job.media.durationSeconds),
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-pix_fmt', 'yuv420p',
+    '-ac', '2', '-c:a', 'aac', '-b:a', '96k',
+    join(context.rootDir, 'source.mp4'),
+  ]);
+  const exportRecord = seedReadyExport(context.store, seeded, context.rootDir);
+  exportRecord.status = 'queued';
+  exportRecord.edit = { ...exportRecord.edit, endCard: { enabled: false } };
+  context.store.updateExport(exportRecord);
+  context.store.enqueueTask(seeded.jobId, 'export_short', { exportId: exportRecord.id });
+  const pipeline = pipelineFor(context, fakePublisher());
+  assert.equal(await pipeline.runNext('output'), true);
+  const exported = context.store.getExport(exportRecord.id);
+  assert.ok(exported);
+  assert.equal(exported.status, 'ready');
+  assert.ok(exported.coverPath);
+  return exported.coverPath;
+}
+
+async function coverPixels(context: TestContext, coverPath: string): Promise<{ pixel(x: number, y: number): { r: number; g: number; b: number } }> {
+  const rawPath = join(context.rootDir, 'cover-check.rgb');
+  await runProcess('ffmpeg', ['-y', '-i', coverPath, '-f', 'rawvideo', '-pix_fmt', 'rgb24', rawPath]);
+  const pixels = await readFile(rawPath);
+  assert.equal(pixels.length, 1080 * 1920 * 3);
+  return {
+    pixel(x: number, y: number): { r: number; g: number; b: number } {
+      return {
+        r: pixels[(y * 1080 + x) * 3]!,
+        g: pixels[(y * 1080 + x) * 3 + 1]!,
+        b: pixels[(y * 1080 + x) * 3 + 2]!,
+      };
+    },
+  };
+}
+
+test('a cover-branded account renders a branded export cover', { timeout: 180_000 }, async () => {
+  const context = await makeContext(undefined, undefined, {
+    fontsDir: join(import.meta.dirname, '..', 'assets', 'fonts'),
+  });
+  try {
+    const brandedAccount: PublishingAccount = { ...ACCOUNT_A, cover: COVER_BRAND };
+    const coverPath = await exportWithCoverManifest(context, [brandedAccount, ACCOUNT_B]);
+    const { pixel } = await coverPixels(context, coverPath);
+    const band = pixel(20, 430);
+    assert.ok(band.r < 100 && band.g > 110 && band.b < 110, `branded cover band ${JSON.stringify(band)} is not the band color`);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('an account without a cover brand keeps the plain export cover', { timeout: 180_000 }, async () => {
+  const context = await makeContext(undefined, undefined, {
+    fontsDir: join(import.meta.dirname, '..', 'assets', 'fonts'),
+  });
+  try {
+    const coverPath = await exportWithCoverManifest(context, [ACCOUNT_A, ACCOUNT_B]);
+    const { pixel } = await coverPixels(context, coverPath);
+    const background = pixel(20, 430);
+    assert.ok(background.r > 150 && background.g < 90, `plain cover ${JSON.stringify(background)} lost the blurred source background`);
   } finally {
     await cleanup(context);
   }
