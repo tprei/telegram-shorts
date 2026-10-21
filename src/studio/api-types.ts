@@ -318,6 +318,7 @@ export interface AutopilotVideoDto {
   jobId: string | null;
   jobStatus: JobStatus | null;
   detectedAt: string;
+  reason: string | null;
   shorts: AutopilotShortDto[];
 }
 

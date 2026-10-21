@@ -424,6 +424,59 @@ test('locator falls back to local sentence matching when model returns empty ids
   }
 });
 
+test('identifyHostSpeaker sends the editorial settings and returns the chosen speaker', async () => {
+  const fetchStub = installFetch(() => JSON.stringify({ speaker_id: 'speaker_0', reason: 'Fala com o chat em primeira pessoa.' }));
+  try {
+    const client = new OpenRouterClient(baseConfig);
+    const choice = await client.identifyHostSpeaker({
+      creatorName: 'Creator A',
+      hostDescription: null,
+      videoTitle: 'Título do vídeo',
+      speakers: [
+        { speakerId: 'speaker_0', totalSeconds: 247, samples: ['Lula abriu os sigilos porque é corrupto.'] },
+        { speakerId: 'speaker_8', totalSeconds: 266, samples: ['Você sabia que se alguém te convidar hoje para ir trabalhar no garimpo…'] },
+      ],
+    });
+    assert.deepEqual(choice, { speakerId: 'speaker_0', reason: 'Fala com o chat em primeira pessoa.' });
+    assert.equal(fetchStub.calls.length, 1);
+    const request = fetchStub.calls[0]!;
+    assert.deepEqual(request.body.reasoning, { effort: 'max' });
+    assert.equal(request.body.max_tokens, 128000);
+    assert.equal(request.body.response_format.json_schema.name, 'host_speaker_choice');
+    assert.deepEqual(JSON.parse(userTextOf(request)), {
+      creator_name: 'Creator A',
+      host_description: null,
+      video_title: 'Título do vídeo',
+      speakers: [
+        { speaker_id: 'speaker_0', total_seconds: 247, samples: ['Lula abriu os sigilos porque é corrupto.'] },
+        { speaker_id: 'speaker_8', total_seconds: 266, samples: ['Você sabia que se alguém te convidar hoje para ir trabalhar no garimpo…'] },
+      ],
+    });
+  } finally {
+    fetchStub.restore();
+  }
+});
+
+test('host speaker identifier rejects a speaker_id outside the given speakers', async () => {
+  const fetchStub = installFetch(() => JSON.stringify({ speaker_id: 'speaker_9', reason: 'motivo qualquer' }));
+  try {
+    const client = new OpenRouterClient(baseConfig);
+    await assert.rejects(client.identifyHostSpeaker({
+      creatorName: 'Creator A',
+      hostDescription: null,
+      videoTitle: null,
+      speakers: [
+        { speakerId: 'speaker_0', totalSeconds: 247, samples: ['Falo com o chat.'] },
+        { speakerId: 'speaker_1', totalSeconds: 281, samples: ['Trecho reagido.'] },
+      ],
+    }));
+    assert.equal(fetchStub.calls.length, 2);
+    assert.equal(fetchStub.calls[1]!.body.response_format.json_schema.name, 'host_speaker_choice');
+  } finally {
+    fetchStub.restore();
+  }
+});
+
 test('planCandidates inherits hook_text and payoff from the source opportunity', async () => {
   const fetchStub = installFetch(() => JSON.stringify({
     candidates: [{

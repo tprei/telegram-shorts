@@ -167,7 +167,7 @@ function AutopilotCard({ status, pending, onToggle, onCheckNow }: AutopilotCardP
                 <time dateTime={video.detectedAt}>{relativeTime(video.detectedAt)}</time>
               </div>
               {video.shorts.length === 0 ? (
-                <p className="autopilot-video-pending">{video.jobStatus === 'failed' ? 'This video needs attention. Open it to see what happened.' : 'Finding the strongest moments…'}</p>
+                <p className="autopilot-video-pending">{video.jobStatus === 'failed' ? 'This video needs attention. Open it to see what happened.' : video.reason ?? 'Finding the strongest moments…'}</p>
               ) : (
                 <ul className="autopilot-shorts">
                   {video.shorts.map((short) => (

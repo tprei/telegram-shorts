@@ -31,7 +31,7 @@ const HOUR_MS = 3_600_000;
 const ACTION_BACKOFF_MS = 10 * 60_000;
 const ACTION_MAX_FAILURES = 3;
 
-type ActionName = 'copy' | 'export' | 'publish';
+type ActionName = 'copy' | 'export' | 'publish' | 'speaker';
 
 interface ActionFailure {
   count: number;
@@ -114,6 +114,7 @@ export class Autopilot implements AutopilotApi {
   private async tickCreator(profile: CreatorProfile, config: CreatorAutopilotConfig, account: PublishingAccount, manifest: CreatorProfileManifest): Promise<void> {
     await this.runStep(`Autopilot check failed for ${profile.id}`, () => this.checkChannel(profile, config));
     await this.runStep(`Autopilot retry failed for ${profile.id}`, () => this.retryFailedJobs(profile));
+    await this.runStep(`Autopilot speaker choice failed for ${profile.id}`, () => this.chooseHostSpeakers(profile));
     if (!this.readState(profile.id).enabled) {
       return;
     }
@@ -234,6 +235,23 @@ export class Autopilot implements AutopilotApi {
     }
   }
 
+  private async chooseHostSpeakers(profile: CreatorProfile): Promise<void> {
+    const now = this.deps.now();
+    for (const video of this.deps.store.listAutopilotVideos(profile.id)) {
+      if (video.status !== 'tracked' || video.jobId === null) {
+        continue;
+      }
+      const job = this.deps.store.getJob(video.jobId);
+      if (!job || job.status !== 'awaiting_speaker') {
+        continue;
+      }
+      if (this.actionBlocked(job.id, 'speaker', now)) {
+        continue;
+      }
+      await this.runAction(job.id, 'speaker', () => this.deps.service.autoChooseSpeaker(job.id), now);
+    }
+  }
+
   private async prepareShorts(profile: CreatorProfile, config: CreatorAutopilotConfig, account: PublishingAccount): Promise<void> {
     const now = this.deps.now();
     const accountConnected = account.mallaryProfileId !== null;
@@ -252,13 +270,13 @@ export class Autopilot implements AutopilotApi {
     }
   }
 
-  private async runAction(shortId: string, action: 'copy' | 'export', run: () => Promise<unknown>, now: Date): Promise<void> {
+  private async runAction(id: string, action: 'copy' | 'export' | 'speaker', run: () => Promise<unknown>, now: Date): Promise<void> {
     try {
       await run();
-      this.actionFailures.delete(`${shortId}:${action}`);
+      this.actionFailures.delete(`${id}:${action}`);
     } catch (error) {
-      logError(`Autopilot ${action} failed for ${shortId}`, error);
-      this.recordActionFailure(shortId, action, error, now);
+      logError(`Autopilot ${action} failed for ${id}`, error);
+      this.recordActionFailure(id, action, error, now);
     }
   }
 
@@ -427,6 +445,7 @@ export class Autopilot implements AutopilotApi {
         jobId: video.jobId,
         jobStatus: job?.status ?? null,
         detectedAt: video.detectedAt,
+        reason: job !== null && job.status === 'awaiting_speaker' ? this.speakerActionReason(job.id) : null,
         shorts: job === null ? [] : this.plan(video, job, config, this.deps.now(), accountConnected).map((plan) => this.shortDto(plan)),
       });
     }
@@ -486,6 +505,17 @@ export class Autopilot implements AutopilotApi {
       }
     }
     return null;
+  }
+
+  private speakerActionReason(jobId: string): string | null {
+    const failure = this.actionFailures.get(`${jobId}:speaker`);
+    if (failure === undefined) {
+      return null;
+    }
+    if (failure.count >= ACTION_MAX_FAILURES) {
+      return `Gave up after ${ACTION_MAX_FAILURES} failures: ${failure.lastError}`;
+    }
+    return failure.lastError;
   }
 
   private lastActionError(plan: AutopilotShortPlan): string | null {

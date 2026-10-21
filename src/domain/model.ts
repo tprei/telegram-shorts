@@ -424,6 +424,18 @@ export const TranscriptSpanLocateSchema = z.strictObject({
 
 export type TranscriptSpanLocate = z.infer<typeof TranscriptSpanLocateSchema>;
 
+export const HostSpeakerChoiceResponseSchema = z.strictObject({
+  speaker_id: z.string().min(1),
+  reason: z.string().min(1),
+});
+
+export type HostSpeakerChoiceResponse = z.infer<typeof HostSpeakerChoiceResponseSchema>;
+
+export interface HostSpeakerChoice {
+  speakerId: string;
+  reason: string;
+}
+
 export const PublishCopyResponseSchema = z.strictObject({
   line_1: sanitizedText({ max: 180 }),
   line_2: sanitizedText({ max: 180 }),

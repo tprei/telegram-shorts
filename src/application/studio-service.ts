@@ -33,6 +33,7 @@ import {
   type ShortRecord,
   type ShortVideoPlatform,
   type SourceMedia,
+  type TranscriptSentence,
 } from '../domain/model.js';
 import { contentPanelOf, hostPanelOf } from '../domain/layout.js';
 import { documentCropSpans, freezeSceneTrack } from '../domain/scene.js';
@@ -266,6 +267,33 @@ export class StudioService implements StudioApi, StudioMediaResolver {
     this.deps.store.updateJob(job);
     this.deps.store.enqueueTask(job.id, 'plan_shorts', {});
     return this.getJob(job.id);
+  }
+
+  async autoChooseSpeaker(jobId: string): Promise<JobDetailDto> {
+    const job = this.requireJob(jobId);
+    if (job.status !== 'awaiting_speaker') {
+      throw new StudioError('conflict', 'Job is not waiting for a speaker choice.');
+    }
+    const choice = await this.deps.openRouter.identifyHostSpeaker({
+      creatorName: job.creatorProfileSnapshot.displayName,
+      hostDescription: job.creatorProfileSnapshot.render.scene?.hostDescription ?? null,
+      videoTitle: job.sourceTitle,
+      speakers: job.strongSpeakers.map((speaker) => ({
+        speakerId: speaker.speakerId,
+        totalSeconds: speaker.totalSeconds,
+        samples: spreadSpeakerSamples(speaker.sampleSentences),
+      })),
+    });
+    const current = this.requireJob(jobId);
+    if (current.status !== 'awaiting_speaker') {
+      return this.getJob(jobId);
+    }
+    const detail = this.chooseSpeaker(jobId, { speakerId: choice.speakerId });
+    this.deps.store.appendAction(job.id, 'autopilot_speaker_chosen', {
+      speakerId: choice.speakerId,
+      reason: choice.reason,
+    });
+    return detail;
   }
 
   replan(jobId: string): JobDetailDto {
@@ -1245,4 +1273,17 @@ export class StudioService implements StudioApi, StudioMediaResolver {
       connected: account.mallaryProfileId !== null,
     };
   }
+}
+
+const HOST_SPEAKER_MAX_SAMPLES = 6;
+
+function spreadSpeakerSamples(sentences: TranscriptSentence[]): string[] {
+  if (sentences.length <= HOST_SPEAKER_MAX_SAMPLES) {
+    return sentences.map((sentence) => sentence.text);
+  }
+  const indexes = new Set<number>();
+  for (let slot = 0; slot < HOST_SPEAKER_MAX_SAMPLES; slot += 1) {
+    indexes.add(Math.round((slot * (sentences.length - 1)) / (HOST_SPEAKER_MAX_SAMPLES - 1)));
+  }
+  return [...indexes].sort((a, b) => a - b).map((index) => sentences[index].text);
 }

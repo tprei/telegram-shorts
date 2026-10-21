@@ -2,7 +2,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 
 import type { AppConfig, ReasoningEffort } from './env.js';
 import { isTransientNetworkError } from './instagram-publisher.js';
-import { HookSuggestionsResponse, HookSuggestionsResponseSchema, OpportunityPlanResponse, OpportunityPlanResponseSchema, PlannedCandidateResponse, PlannedCandidateResponseSchema, PublishCopyResponse, PublishCopyResponseSchema, RevisionIntent, RevisionIntentSchema, SemanticBlockKind, SemanticBlockResponseSet, SemanticBlockResponseSetSchema, TranscriptSentence, TranscriptSpanLocate, TranscriptSpanLocateSchema } from '../domain/model.js';
+import { HookSuggestionsResponse, HookSuggestionsResponseSchema, HostSpeakerChoice, HostSpeakerChoiceResponse, HostSpeakerChoiceResponseSchema, OpportunityPlanResponse, OpportunityPlanResponseSchema, PlannedCandidateResponse, PlannedCandidateResponseSchema, PublishCopyResponse, PublishCopyResponseSchema, RevisionIntent, RevisionIntentSchema, SemanticBlockKind, SemanticBlockResponseSet, SemanticBlockResponseSetSchema, TranscriptSentence, TranscriptSpanLocate, TranscriptSpanLocateSchema } from '../domain/model.js';
 import { logError } from './util.js';
 import { MAX_SHORT_SPANS, SHORT_DURATION } from '../domain/semantic.js';
 
@@ -189,6 +189,18 @@ const STRUCTURED_OUTPUT_SCHEMAS = {
         why: { type: 'string', minLength: 1 },
       },
       required: ['start_sentence_id', 'end_sentence_id', 'why'],
+    },
+  },
+  hostSpeaker: {
+    name: 'host_speaker_choice',
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        speaker_id: { type: 'string', minLength: 1 },
+        reason: { type: 'string', minLength: 1 },
+      },
+      required: ['speaker_id', 'reason'],
     },
   },
 } as const;
@@ -440,6 +452,41 @@ export class OpenRouterClient {
       parse: (value) => parseLocatedSpan(value, input.query, input.sentences),
     });
   }
+
+  async identifyHostSpeaker(input: {
+    creatorName: string;
+    hostDescription: string | null;
+    videoTitle: string | null;
+    speakers: Array<{ speakerId: string; totalSeconds: number; samples: string[] }>;
+  }): Promise<HostSpeakerChoice> {
+    const response = await requestStructuredJson<HostSpeakerChoiceResponse>(this.config, {
+      title: 'host-speaker-identifier',
+      system: [
+        'Você identifica o apresentador titular do canal em um vídeo do YouTube com vários falantes.',
+        'Um dos falantes é o apresentador do canal; os outros são convidados, entrevistadores ou trechos de vídeos de terceiros que o apresentador está reagindo ou citando.',
+        'Identifique o apresentador pelo que ele diz: fala em primeira pessoa, conversa com "o chat" ou com a audiência, comenta os assuntos, reage aos vídeos alheios e apresenta ou introduz os trechos.',
+        'O tempo de fala sozinho não decide: o trecho reagido pode ser o mais longo do vídeo.',
+        'host_description, quando não for nulo, descreve o apresentador segundo o próprio criador do canal.',
+        'Escolha apenas um speaker_id da lista recebida e explique a escolha em reason.',
+        'Retorne apenas JSON válido com speaker_id e reason.',
+      ].join(' '),
+      userText: JSON.stringify({
+        creator_name: input.creatorName,
+        host_description: input.hostDescription,
+        video_title: input.videoTitle,
+        speakers: input.speakers.map((speaker) => ({
+          speaker_id: speaker.speakerId,
+          total_seconds: speaker.totalSeconds,
+          samples: speaker.samples,
+        })),
+      }),
+      reasoning: this.reasoning,
+      temperature: EDITORIAL_TEMPERATURE,
+      responseFormat: STRUCTURED_OUTPUT_SCHEMAS.hostSpeaker,
+      parse: (value) => parseHostSpeakerChoice(value, input.speakers),
+    });
+    return { speakerId: response.speaker_id, reason: response.reason };
+  }
 }
 
 export async function requestStructuredJson<T>(config: AppConfig, input: {
@@ -596,6 +643,15 @@ function parseLocatedSpan(raw: unknown, query: string, sentences: TranscriptSent
     return fallback;
   }
   throw parsed.error;
+}
+
+function parseHostSpeakerChoice(raw: unknown, speakers: Array<{ speakerId: string }>): HostSpeakerChoiceResponse {
+  return HostSpeakerChoiceResponseSchema
+    .refine(
+      (choice) => speakers.some((speaker) => speaker.speakerId === choice.speaker_id),
+      { message: 'speaker_id precisa ser um dos falantes recebidos' },
+    )
+    .parse(raw);
 }
 
 function normalizeSemanticBlockPayload(raw: unknown, sentences: TranscriptSentence[]): unknown {

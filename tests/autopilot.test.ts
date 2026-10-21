@@ -10,7 +10,7 @@ import { createInitialEdit, type ShortEdit, type WordRange } from '../src/domain
 import { buildSentences } from '../src/domain/policies.js';
 import type { LayoutProfile } from '../src/domain/layout.js';
 import { zonedDateParts, zonedTimeToUtc, type PostingSchedule } from '../src/domain/schedule.js';
-import type { AutopilotVideoRecord, CreatorProfile, ExportRecord, JobRecord, PublicationRecord, PublishingAccount, ShortRecord, TranscriptWord } from '../src/domain/model.js';
+import type { AutopilotVideoRecord, CreatorProfile, ExportRecord, JobRecord, PublicationRecord, PublishingAccount, ShortRecord, TranscriptSentence, TranscriptWord } from '../src/domain/model.js';
 import { ShortsStore } from '../src/infra/db.js';
 import type { AppConfig } from '../src/infra/env.js';
 import { CreatorProfileRepository } from '../src/infra/creator-profile-loader.js';
@@ -188,6 +188,12 @@ interface TestContext {
   copyCalls: () => number;
   setGate: (gate: Promise<void>) => void;
   enteredCheck: () => Promise<void>;
+  speakerCalls: () => number;
+  speakerInputs: () => Array<Parameters<OpenRouterClient['identifyHostSpeaker']>[0]>;
+  setSpeakerChoice: (choice: { speakerId: string; reason: string }) => void;
+  setSpeakerError: (error: Error | null) => void;
+  setSpeakerGate: (gate: Promise<void>) => void;
+  enteredSpeaker: () => Promise<void>;
 }
 
 async function makeContext(options: { accounts?: PublishingAccount[]; creators?: CreatorProfile[] } = {}): Promise<TestContext> {
@@ -207,11 +213,26 @@ async function makeContext(options: { accounts?: PublishingAccount[]; creators?:
   }));
   const store = await ShortsStore.open(join(rootDir, 'shorts.sqlite'));
   const profiles = new CreatorProfileRepository({ rootDir, manifestPath: join(rootDir, 'creator-profiles.json') });
+  let speakerCalls = 0;
+  let speakerChoice: { speakerId: string; reason: string } = { speakerId: 'speaker_0', reason: 'Apresentador conversa com o chat em primeira pessoa.' };
+  let speakerError: Error | null = null;
+  const speakerInputs: Array<Parameters<OpenRouterClient['identifyHostSpeaker']>[0]> = [];
   const openRouter = {
     copyCalls: 0,
     async writePublishCopy() {
       this.copyCalls += 1;
       throw new Error('schema mismatch');
+    },
+    async identifyHostSpeaker(input: Parameters<OpenRouterClient['identifyHostSpeaker']>[0]) {
+      speakerCalls += 1;
+      speakerInputs.push(input);
+      enteredSpeaker.resolve();
+      enteredSpeaker = Promise.withResolvers<void>();
+      await speakerGate;
+      if (speakerError !== null) {
+        throw speakerError;
+      }
+      return speakerChoice;
     },
   } as OpenRouterClient & { copyCalls: number };
   const service = new StudioService({
@@ -226,6 +247,8 @@ async function makeContext(options: { accounts?: PublishingAccount[]; creators?:
   let current = Math.floor(Date.now() / HOUR_MS) * HOUR_MS;
   let gate: Promise<void> = Promise.resolve();
   let entered = Promise.withResolvers<void>();
+  let speakerGate: Promise<void> = Promise.resolve();
+  let enteredSpeaker = Promise.withResolvers<void>();
   const autopilot = new Autopilot({
     store,
     service,
@@ -255,6 +278,18 @@ async function makeContext(options: { accounts?: PublishingAccount[]; creators?:
       gate = next;
     },
     enteredCheck: () => entered.promise,
+    speakerCalls: () => speakerCalls,
+    speakerInputs: () => speakerInputs,
+    setSpeakerChoice: (choice) => {
+      speakerChoice = choice;
+    },
+    setSpeakerError: (error) => {
+      speakerError = error;
+    },
+    setSpeakerGate: (next) => {
+      speakerGate = next;
+    },
+    enteredSpeaker: () => enteredSpeaker.promise,
   };
 }
 
@@ -322,6 +357,34 @@ function seedReadyShort(store: ShortsStore, creator: CreatorProfile, rootDir: st
   };
   store.createExport(exportRecord);
   return { jobId: job.id, shortId: short.id, exportId: exportRecord.id };
+}
+
+function speakerSentence(index: number, speakerId: string, text: string): TranscriptSentence {
+  return {
+    id: `s_${index}`,
+    index,
+    speakerId,
+    startWord: index,
+    endWord: index,
+    startSeconds: index * 0.6,
+    endSeconds: index * 0.6 + 0.5,
+    text,
+  };
+}
+
+function twoStrongSpeakers() {
+  return [
+    {
+      speakerId: 'speaker_0',
+      totalSeconds: 247,
+      sampleSentences: [speakerSentence(0, 'speaker_0', 'Lula abriu os sigilos porque é corrupto, e eu vou provar isso para o chat.')],
+    },
+    {
+      speakerId: 'speaker_1',
+      totalSeconds: 266,
+      sampleSentences: [speakerSentence(1, 'speaker_1', 'Você sabia que se alguém te convidar hoje para ir trabalhar no garimpo…')],
+    },
+  ];
 }
 
 function seedTrackedVideo(store: ShortsStore, videoId: string, jobId: string, detectedAt: Date, creatorId: string = CREATOR.id): AutopilotVideoRecord {
@@ -728,6 +791,146 @@ test('a failing copy generation backs off and gives up after three failures', as
     const entry = status?.videos[0]?.shorts[0];
     assert.equal(entry?.state, 'skipped');
     assert.equal(entry?.reason, 'Gave up after 3 failures: Error: schema mismatch');
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('autopilot picks the model-chosen host speaker even when another speaker talks longer', async () => {
+  const context = await makeContext();
+  try {
+    await enableAutopilot(context);
+    await context.autopilot.tick();
+    const job = jobRecord(CREATOR, context.rootDir, 'vidhost0001', {
+      status: 'awaiting_speaker',
+      chosenSpeakerId: null,
+      strongSpeakers: [
+        {
+          speakerId: 'speaker_0',
+          totalSeconds: 247,
+          sampleSentences: Array.from({ length: 7 }, (_, index) => speakerSentence(index, 'speaker_0', `Fala do apresentador ${index}.`)),
+        },
+        {
+          speakerId: 'speaker_1',
+          totalSeconds: 266,
+          sampleSentences: [speakerSentence(7, 'speaker_1', 'Trecho reagido do vídeo de outra pessoa.')],
+        },
+      ],
+    });
+    context.store.createJob(job);
+    seedTrackedVideo(context.store, 'vidhost0001', job.id, context.clock());
+    await context.autopilot.tick();
+    assert.equal(context.speakerCalls(), 1);
+    const inputs = context.speakerInputs();
+    assert.equal(inputs.length, 1);
+    assert.deepEqual(inputs[0], {
+      creatorName: 'Creator A',
+      hostDescription: null,
+      videoTitle: 'Video vidhost0001',
+      speakers: [
+        {
+          speakerId: 'speaker_0',
+          totalSeconds: 247,
+          samples: ['Fala do apresentador 0.', 'Fala do apresentador 1.', 'Fala do apresentador 2.', 'Fala do apresentador 4.', 'Fala do apresentador 5.', 'Fala do apresentador 6.'],
+        },
+        {
+          speakerId: 'speaker_1',
+          totalSeconds: 266,
+          samples: ['Trecho reagido do vídeo de outra pessoa.'],
+        },
+      ],
+    });
+    const stored = context.store.getJob(job.id);
+    assert.ok(stored);
+    assert.equal(stored.status, 'planning');
+    assert.equal(stored.chosenSpeakerId, 'speaker_0');
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('a job outside autopilot tracking keeps waiting for a human speaker choice', async () => {
+  const context = await makeContext();
+  try {
+    await enableAutopilot(context);
+    await context.autopilot.tick();
+    const job = jobRecord(CREATOR, context.rootDir, 'vidmanspk01', {
+      status: 'awaiting_speaker',
+      chosenSpeakerId: null,
+      strongSpeakers: twoStrongSpeakers(),
+    });
+    context.store.createJob(job);
+    await context.autopilot.tick();
+    assert.equal(context.speakerCalls(), 0);
+    const stored = context.store.getJob(job.id);
+    assert.ok(stored);
+    assert.equal(stored.status, 'awaiting_speaker');
+    assert.equal(stored.chosenSpeakerId, null);
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('a human speaker choice made during the model call is not overridden', async () => {
+  const context = await makeContext();
+  try {
+    await enableAutopilot(context);
+    await context.autopilot.tick();
+    const job = jobRecord(CREATOR, context.rootDir, 'vidrace0001', {
+      status: 'awaiting_speaker',
+      chosenSpeakerId: null,
+      strongSpeakers: twoStrongSpeakers(),
+    });
+    context.store.createJob(job);
+    seedTrackedVideo(context.store, 'vidrace0001', job.id, context.clock());
+    const { promise: gate, resolve: release } = Promise.withResolvers<void>();
+    context.setSpeakerGate(gate);
+    const ticking = context.autopilot.tick();
+    await context.enteredSpeaker();
+    context.service.chooseSpeaker(job.id, { speakerId: 'speaker_1' });
+    release();
+    await ticking;
+    const stored = context.store.getJob(job.id);
+    assert.ok(stored);
+    assert.equal(stored.status, 'planning');
+    assert.equal(stored.chosenSpeakerId, 'speaker_1');
+  } finally {
+    await cleanup(context);
+  }
+});
+
+test('a failing speaker choice backs off and gives up after three failures', async () => {
+  const context = await makeContext();
+  try {
+    await enableAutopilot(context);
+    await context.autopilot.tick();
+    const job = jobRecord(CREATOR, context.rootDir, 'vidspkf0001', {
+      status: 'awaiting_speaker',
+      chosenSpeakerId: null,
+      strongSpeakers: twoStrongSpeakers(),
+    });
+    context.store.createJob(job);
+    seedTrackedVideo(context.store, 'vidspkf0001', job.id, context.clock());
+    context.setSpeakerError(new Error('schema mismatch'));
+    await context.autopilot.tick();
+    assert.equal(context.speakerCalls(), 1);
+    context.advanceMinutes(5);
+    await context.autopilot.tick();
+    assert.equal(context.speakerCalls(), 1);
+    context.advanceMinutes(6);
+    await context.autopilot.tick();
+    assert.equal(context.speakerCalls(), 2);
+    context.advanceMinutes(10);
+    await context.autopilot.tick();
+    assert.equal(context.speakerCalls(), 3);
+    context.advanceMinutes(10);
+    await context.autopilot.tick();
+    assert.equal(context.speakerCalls(), 3);
+    const [status] = await context.autopilot.list();
+    assert.equal(status?.videos[0]?.reason, 'Gave up after 3 failures: Error: schema mismatch');
+    const stored = context.store.getJob(job.id);
+    assert.ok(stored);
+    assert.equal(stored.status, 'awaiting_speaker');
   } finally {
     await cleanup(context);
   }
