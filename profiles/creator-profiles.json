@@ -206,6 +206,21 @@
           "hints": "Entrevista de podcast com duas pessoas e câmeras alternadas: close do Raul, close do entrevistador (homem de barba cheia em outro cenário) e plano aberto da mesa com os dois. O apresentador é sempre o Raul. Quando só o entrevistador aparece, marque host_visible=false e o quadro inteiro como conteúdo person, com subject na cabeça e ombros do entrevistador. QR code no alto à esquerda e logotipo Flow no alto à direita são overlays."
         }
       }
+    },
+    {
+      "id": "raul_sena",
+      "displayName": "Raul Sena (Investidor Sardinha)",
+      "enabled": true,
+      "accountId": "mix",
+      "render": {
+        "layoutPath": "profiles/mix_layout.json",
+        "layoutId": "mix-scenes-v3",
+        "defaultSpeed": 1.25,
+        "scene": {
+          "hostDescription": "Raul Sena (Investidor Sardinha): homem jovem de cabelo escuro ondulado e volumoso, barba curta, camiseta preta, falando sozinho para a câmera no próprio canal.",
+          "hints": "Vídeo solo do Raul, sem entrevistador. Ele aparece em close falando para a câmera, às vezes em tela cheia, às vezes ao lado de imagens, gráficos, manchetes ou trechos de debates e telejornais. Quem aparece nesses trechos (políticos, apresentadores) é conteúdo, nunca o apresentador. Textos grandes sobrepostos, logotipos e marcas d'água são overlays."
+        }
+      }
     }
   ]
 }

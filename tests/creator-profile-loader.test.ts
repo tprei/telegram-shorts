@@ -86,16 +86,16 @@ async function manifestRepo(
   return new CreatorProfileRepository({ rootDir: dir, manifestPath });
 }
 
-test('seven creators share reusable v3 styles and resolve two accounts', async () => {
+test('eight creators share reusable v3 styles and resolve two accounts', async () => {
   const repo = new CreatorProfileRepository({ rootDir, manifestPath: 'profiles/creator-profiles.json' });
   const manifest = await repo.getManifest();
 
   assert.equal(manifest.version, 3);
   assert.equal(manifest.defaultCreatorId, 'filipe_boni');
   assert.equal(manifest.accounts.length, 2);
-  assert.equal(manifest.creators.length, 7);
+  assert.equal(manifest.creators.length, 8);
 
-  const expectedIds = ['filipe_boni', 'jones_manoel', 'samuel_borelli', 'jose_kobori', 'gustavo_gaiofato', 'gustavo_machado', 'raul_sena_flow'];
+  const expectedIds = ['filipe_boni', 'jones_manoel', 'samuel_borelli', 'jose_kobori', 'gustavo_gaiofato', 'gustavo_machado', 'raul_sena_flow', 'raul_sena'];
   assert.deepEqual(manifest.creators.map((creator) => creator.id), expectedIds);
 
   const boniAccount = manifest.accounts.find((account) => account.id === 'cortes_do_boni');
@@ -139,7 +139,7 @@ test('seven creators share reusable v3 styles and resolve two accounts', async (
   assert.ok(boniResolved.profile);
   assert.equal(boniResolved.account?.id, 'cortes_do_boni');
 
-  const mixCreatorIds = ['samuel_borelli', 'jose_kobori', 'gustavo_gaiofato', 'gustavo_machado', 'raul_sena_flow'];
+  const mixCreatorIds = ['samuel_borelli', 'jose_kobori', 'gustavo_gaiofato', 'gustavo_machado', 'raul_sena_flow', 'raul_sena'];
   for (const creatorId of mixCreatorIds) {
     const mixResolved = await repo.resolvePublishingProfile(creatorId);
     assert.ok(mixResolved.profile);
