@@ -982,3 +982,13 @@ Deliberately left out: deduping manual `createJob` by video id. The operator re-
 ## Mix accounts and scene layouts (follow-up, 2026-10-19)
 
 See [Mix accounts and scene layouts — implementation plan](2026-10-19-mix-scene-layouts.md) for the manifest/layout v3 cutover, shared pure-domain scene composition, account-scoped publishing and scheduling, one v8 stored-shape migration, editor interaction contract, and six implementation slices. That plan supersedes the creator-owned schedule/publish fields and global Mallary profile configuration described above; Boni and Jones fixed-layout output remains unchanged. Camera edges use averaged gradients from up to eight evenly spaced cluster members, a ±1.2% search radius, and the 2× median acceptance rule.
+
+## Deployment (2026-10-23)
+
+The studio runs on the mini (`mini-1`, Tailscale `100.112.197.0`, WSL2 Ubuntu 24.04, user `mbn`), not on the operator's PC. The PC's `work/shorts/shorts.sqlite` is a stale pre-move copy with every autopilot disabled; the mini's database is the only live one.
+
+- **Code:** `/home/mbn/telegram-shorts`, a clone of `main`. Deploy with `git pull && pnpm install --frozen-lockfile && pnpm build:web`, then `systemctl --user restart shorts-studio` once the queue holds only `check_publication` tasks. Node 24.18 comes from fnm; pnpm 11.5.2 and yt-dlp live in `~/.local/bin`. `.env` is mode 600 and sets `SHORTS_YTDLP_JS_RUNTIME=node`.
+- **Supervision:** systemd user unit `~/.config/systemd/user/shorts-studio.service` with `Restart=always` and lingering enabled. The Windows task `wsl-minions-autostart` starts WSL at boot, so the studio comes back after a power cut without anyone logging in.
+- **Logs:** stdout and stderr append to `work/shorts/studio.log`. The `journalctl --user` view stays empty because `mbn` cannot read the journal.
+- **Tern:** session `shorts-studio` on the mini has tab `studio log` (`tail -F` of the log) and tab `studio shell` in the repo. Tern sessions do not survive a WSL restart; run `studio-tern` (`~/.local/bin`) on the mini to recreate them.
+- **UI:** the server binds `127.0.0.1` only and has no authentication. The tailnet policy allows only SSH (port 22) from the PC to `tag:minions`, so the PC reaches the UI through an SSH tunnel: Windows scheduled task `ShortsStudioTunnel` runs `%LOCALAPPDATA%\ShortsStudio\tunnel.ps1` at logon, which keeps `ssh.exe -L 127.0.0.1:4310:127.0.0.1:4310 mbn@100.112.197.0` alive. With WSL `networkingMode=mirrored`, Windows cannot reach ports opened inside WSL but WSL reaches Windows ports, so this one Windows-side tunnel serves Windows browsers, Tern browser blocks and WSL at `http://localhost:4310`.
