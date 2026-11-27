@@ -1,0 +1,18 @@
+version = 1
+
+[worker]
+memory_mb = 4096
+max = 1
+
+[setup]
+inputs = ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"]
+# Later steps get a PATH without npm's global bin, so pnpm is linked into /usr/local/bin
+run = ['npm i -g pnpm@11.5.2', 'sudo ln -sf "$(npm prefix -g)/bin/pnpm" /usr/local/bin/pnpm', 'pnpm install --frozen-lockfile']
+
+[tasks.check]
+run = "pnpm typecheck"
+timeout = "10m"
+
+[tasks.build]
+run = "pnpm build:web"
+timeout = "10m"
