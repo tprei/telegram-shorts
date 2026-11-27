@@ -9,9 +9,18 @@ inputs = ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"]
 # Later steps get a PATH without npm's global bin, so pnpm is linked into /usr/local/bin
 run = ['npm i -g pnpm@11.5.2', 'sudo ln -sf "$(npm prefix -g)/bin/pnpm" /usr/local/bin/pnpm', 'pnpm install --frozen-lockfile']
 
+[warm]
+run = [
+  "pnpm exec tsc -p tsconfig.json --noEmit --incremental --tsBuildInfoFile node_modules/.cache/tsc/root.tsbuildinfo",
+  "pnpm exec tsc -p web/tsconfig.json --noEmit --incremental --tsBuildInfoFile node_modules/.cache/tsc/web.tsbuildinfo",
+]
+
 [tasks.check]
-run = "pnpm typecheck"
 timeout = "10m"
+
+[tasks.check.parallel]
+root = "pnpm exec tsc -p tsconfig.json --noEmit --incremental --tsBuildInfoFile node_modules/.cache/tsc/root.tsbuildinfo"
+web = "pnpm exec tsc -p web/tsconfig.json --noEmit --incremental --tsBuildInfoFile node_modules/.cache/tsc/web.tsbuildinfo"
 
 [tasks.build]
 run = "pnpm build:web"
